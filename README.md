@@ -1,4 +1,4 @@
-# Ufin-A-Wii-U-Jellyfin-client
+# Ufin - A Wii U Jellyfin client
 WIP jellyfin client for the Nintendo Wii U
 
 -------------------------------------------
@@ -20,9 +20,12 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 
 ## Goals
 
-- 1080p TV interface
+- In app config
+- login screen
+- TV interface
 - Wii U-style UI
 - GamePad media controls
+- 480p60 software playback
 - 720p30 H.264/AAC software playback
 - 1080p60 hardware playback if possible
 - Eventually, direct play where possible
