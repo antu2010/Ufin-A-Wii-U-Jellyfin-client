@@ -1,0 +1,3 @@
+/home/antu/dev/ufin/build/CMakeFiles/ufin.dir
+/home/antu/dev/ufin/build/CMakeFiles/edit_cache.dir
+/home/antu/dev/ufin/build/CMakeFiles/rebuild_cache.dir
