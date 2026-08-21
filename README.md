@@ -40,5 +40,4 @@ Contributions and help are welcome, if any experienced developer wants to add so
 
 ## Credits
 
-Credits
 Huge credit to https://github.com/GaryOderNichts/FFmpeg-wiiu for his work on FFmpeg for Wii U. Ufin uses this work for its Wii U FFmpeg backend.
