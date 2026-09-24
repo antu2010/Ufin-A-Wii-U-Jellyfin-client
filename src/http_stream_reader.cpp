@@ -1,4 +1,5 @@
 #include "http_stream_reader.h"
+#include "ufin_log.h"
 
 #include <sys/socket.h>
 #include <sys/select.h>

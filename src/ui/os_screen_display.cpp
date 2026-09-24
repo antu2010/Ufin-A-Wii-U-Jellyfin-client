@@ -1,5 +1,6 @@
 #include "os_screen_display.h"
 #include "grid_probe.h"
+#include "../ufin_log.h"
 
 #include <coreinit/cache.h>
 #include <coreinit/debug.h>
@@ -133,6 +134,18 @@ void OSScreenDisplay::flip() {
     DCFlushRange(drcBuffer_, drcSize_);
     OSScreenFlipBuffersEx(SCREEN_TV);
     OSScreenFlipBuffersEx(SCREEN_DRC);
+}
+
+void OSScreenDisplay::hide() {
+    if (!active_) return;
+    OSScreenEnableEx(SCREEN_TV, FALSE);
+    OSScreenEnableEx(SCREEN_DRC, FALSE);
+}
+
+void OSScreenDisplay::show() {
+    if (!active_) return;
+    OSScreenEnableEx(SCREEN_TV, TRUE);
+    OSScreenEnableEx(SCREEN_DRC, TRUE);
 }
 
 void OSScreenDisplay::shutdown() {

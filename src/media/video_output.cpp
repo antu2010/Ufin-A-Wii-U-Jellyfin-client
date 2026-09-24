@@ -1,5 +1,6 @@
 #include "video_output.h"
 #include "shaders/nv12_video_shader.h"
+#include "../ufin_log.h"
 
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <coreinit/debug.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/memory.h>
+#include <gx2/display.h>
 #include <gx2/draw.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
@@ -19,6 +21,30 @@
 static const uint32_t QUAD_VERTEX_COUNT = 4;
 static const uint32_t QUAD_VERTEX_STRIDE = sizeof(float) * 4; // x, y, u, v
 static const uint32_t QUAD_BYTES = QUAD_VERTEX_COUNT * QUAD_VERTEX_STRIDE;
+
+static bool s_gx2ContextReady = false;
+
+bool VideoOutput::initGX2Context() {
+    if (s_gx2ContextReady) return true;
+    if (!WHBGfxInit()) {
+        OSReport("Ufin: WHBGfxInit failed\n");
+        return false;
+    }
+    // Kept hidden until a VideoOutput session's init() below turns it on
+    // -- OSScreen is what should be visible right after this call, since
+    // it runs before OSScreenDisplay::init() at app start.
+    GX2SetTVEnable(FALSE);
+    GX2SetDRCEnable(FALSE);
+    s_gx2ContextReady = true;
+    OSReport("Ufin: GX2 context initialised (persistent for app lifetime)\n");
+    return true;
+}
+
+void VideoOutput::shutdownGX2Context() {
+    if (!s_gx2ContextReady) return;
+    WHBGfxShutdown();
+    s_gx2ContextReady = false;
+}
 
 VideoOutput::VideoOutput() {}
 
@@ -232,12 +258,18 @@ bool VideoOutput::init(int width, int height, double displayAspect) {
         return false;
     }
 
-    if (!WHBGfxInit()) {
-        snprintf(last_error_, sizeof(last_error_), "WHBGfxInit failed");
-        OSReport("Ufin: WHBGfxInit failed\n");
+    if (!s_gx2ContextReady) {
+        // Programmer error, not a runtime condition -- initGX2Context()
+        // must have already been called once near the top of main().
+        snprintf(last_error_, sizeof(last_error_), "GX2 context not initialised");
+        OSReport("Ufin: VideoOutput::init called before initGX2Context()\n");
         return false;
     }
-    gfx_initialized_ = true;
+
+    // The context itself is already up (see initGX2Context()); just turn
+    // its output back on for this session.
+    GX2SetTVEnable(TRUE);
+    GX2SetDRCEnable(TRUE);
 
     // What WHBGfx actually created for each screen -- depends on the
     // TV's scan mode (480p/720p/1080p) and aspect setting.
@@ -251,6 +283,7 @@ bool VideoOutput::init(int width, int height, double displayAspect) {
              drc_height_);
 
     if (!loadShader()) return false;
+    gfx_initialized_ = true; // shader_ now needs WHBGfxFreeShaderGroup() in shutdown()
 
     // Single-channel textures: put the one channel in R and hard-wire
     // G/B to 0 and A to 1 (the shader reads .r / .rg only).
@@ -276,15 +309,21 @@ bool VideoOutput::init(int width, int height, double displayAspect) {
 }
 
 void VideoOutput::drawQuad(int readIndex, const void* quad, uint32_t targetWidth, uint32_t targetHeight) {
-    // GX2's fixed-function state (blend, culling, depth test, viewport,
-    // scissor) isn't reset to sane defaults automatically -- set all of
-    // it explicitly every draw (as CafeMP does).
+    // GX2's fixed-function state (blend, culling, depth test, alpha test,
+    // viewport, scissor) isn't reset to sane defaults automatically -- set
+    // all of it explicitly every draw (as CafeMP does). On real hardware
+    // this state is whatever the environment/loader left behind before
+    // handing off to us; Cemu's GX2 model doesn't reproduce that leftover
+    // state, which is why a missing reset here can look fine on Cemu and
+    // render nothing (alpha-tested away) on a real console. Alpha test in
+    // particular was missing -- add it alongside the rest.
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 0xFF, FALSE, TRUE);
     GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO,
                         GX2_BLEND_COMBINE_MODE_ADD, FALSE,
                         GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
     GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
     GX2SetDepthOnlyControl(FALSE, FALSE, GX2_COMPARE_FUNC_ALWAYS);
+    GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
     GX2SetViewport(0, 0, (float)targetWidth, (float)targetHeight, 0.0f, 1.0f);
     GX2SetScissor(0, 0, targetWidth, targetHeight);
 
@@ -371,7 +410,13 @@ void VideoOutput::shutdown() {
     if (drc_quad_) { MEMFreeToDefaultHeap(drc_quad_); drc_quad_ = nullptr; }
     if (gfx_initialized_) {
         WHBGfxFreeShaderGroup(&shader_);
-        WHBGfxShutdown();
         gfx_initialized_ = false;
+    }
+    // Hide output again (context itself stays alive for the whole app --
+    // see initGX2Context()/shutdownGX2Context()) so OSScreen can safely
+    // come back via OSScreenDisplay::show().
+    if (s_gx2ContextReady) {
+        GX2SetTVEnable(FALSE);
+        GX2SetDRCEnable(FALSE);
     }
 }

@@ -46,6 +46,19 @@ public:
     VideoOutput();
     ~VideoOutput();
 
+    // Brings up the GX2 context for the whole app's lifetime. Call this
+    // exactly once, near the top of main(), BEFORE OSScreenDisplay::init()
+    // ever runs -- and shutdownGX2Context() exactly once, at the very end,
+    // AFTER the final OSScreenDisplay::shutdown(). Leaves TV/DRC output
+    // disabled (GX2SetTVEnable/DRCEnable FALSE) so OSScreen alone drives
+    // the display until a VideoOutput instance's init() below re-enables
+    // it. See the big comment in os_screen_display.h for why this exists:
+    // tearing the whole GX2 context down and rebuilding it per playback
+    // session (the original design) left GX2 computing correct frames
+    // that real hardware never actually scanned out.
+    static bool initGX2Context();
+    static void shutdownGX2Context();
+
     // width/height must match the decoded frames (Decoder::videoWidth()/
     // videoHeight()). displayAspect is the aspect ratio the picture
     // should be *shown* at -- normally width/height, but Jellyfin is

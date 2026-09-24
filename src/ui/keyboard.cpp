@@ -1,9 +1,11 @@
 #include "keyboard.h"
 #include "../text_utf.h"
+#include "../ufin_log.h"
 
 #include <coreinit/debug.h>
 #include <coreinit/filesystem.h>
 #include <coreinit/memdefaultheap.h>
+#include <gx2/display.h>
 #include <nn/swkbd.h>
 #include <vpad/input.h>
 #include <whb/gfx.h>
@@ -15,10 +17,18 @@ bool promptKeyboard(const char16_t* hint, std::string& out, std::string& error) 
     out.clear();
     error.clear();
 
-    if (!WHBGfxInit()) {
-        error = "WHBGfxInit failed";
-        return false;
-    }
+    // GX2's context is already up for the whole app's lifetime (see
+    // VideoOutput::initGX2Context(), called once near the top of main())
+    // -- just turn its output on for this session, the same way
+    // VideoOutput::init() does. Do NOT call WHBGfxInit()/WHBGfxShutdown()
+    // here: that used to tear down and rebuild the shared GX2 context
+    // just for the keyboard, which both duplicated video_output.cpp's
+    // real bug (see os_screen_display.h) and, worse, would kill the
+    // context out from under any VideoOutput instance relying on it
+    // still being alive.
+    GX2SetTVEnable(TRUE);
+    GX2SetDRCEnable(TRUE);
+
     FSInit(); // safe to call again; swkbd loads its data through an FS client
 
     FSClient* fsClient = (FSClient*)MEMAllocFromDefaultHeap(sizeof(FSClient));
@@ -26,7 +36,8 @@ bool promptKeyboard(const char16_t* hint, std::string& out, std::string& error) 
     if (!fsClient || !workMemory) {
         if (fsClient) MEMFreeToDefaultHeap(fsClient);
         if (workMemory) MEMFreeToDefaultHeap(workMemory);
-        WHBGfxShutdown();
+        GX2SetTVEnable(FALSE);
+        GX2SetDRCEnable(FALSE);
         error = "not enough memory for the keyboard";
         return false;
     }
@@ -97,7 +108,8 @@ bool promptKeyboard(const char16_t* hint, std::string& out, std::string& error) 
     FSDelClient(fsClient, FS_ERROR_FLAG_NONE);
     MEMFreeToDefaultHeap(fsClient);
     MEMFreeToDefaultHeap(workMemory);
-    WHBGfxShutdown();
+    GX2SetTVEnable(FALSE);
+    GX2SetDRCEnable(FALSE);
 
     OSReport("Ufin: keyboard %s (%u bytes)\n", confirmed ? "confirmed" : "cancelled", (unsigned)out.size());
     return confirmed;

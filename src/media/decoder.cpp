@@ -1,4 +1,5 @@
 #include "decoder.h"
+#include "../ufin_log.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>

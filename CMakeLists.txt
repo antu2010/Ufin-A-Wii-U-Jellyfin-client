@@ -24,6 +24,7 @@ link_directories("$ENV{DEVKITPRO}/portlibs/wiiu/lib")
 
 add_executable(ufin
     src/main.cpp
+    src/ufin_log.cpp
     src/config_loader.cpp
     src/http_client.cpp
     src/http_stream_reader.cpp

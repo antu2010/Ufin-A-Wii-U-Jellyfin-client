@@ -33,10 +33,15 @@ struct QueuedVideoFrame {
 
 class FrameQueue {
 public:
-    // Decoded 1280x720 NV12 frames are ~1.4 MB each, so this is ~8 MB of
-    // buffering -- enough to absorb decode jitter without letting the
-    // decode thread run away from the render thread.
-    static const size_t MAX_SIZE = 6;
+    // Decoded 1280x720 NV12 frames are ~1.4 MB each. The old MAX_SIZE=6
+    // (~8 MB, ~0.25s at 24-30fps) turned out to give real Wi-Fi barely any
+    // slack to absorb a network hiccup before the render loop ran dry --
+    // even though up to 24 MB of *compressed* packets (Decoder's own
+    // MAX_BUFFERED_PACKET_BYTES, tens of seconds of data) could already be
+    // sitting buffered upstream of the decoder. 24 frames (~34 MB, ~0.8-1s
+    // of decoded buffer) lets a brief stall get absorbed instead of
+    // draining the queue and stalling playback.
+    static const size_t MAX_SIZE = 24;
 
     // Blocks while the queue is full, which naturally paces the decode
     // thread to roughly the render thread's consumption rate. Takes

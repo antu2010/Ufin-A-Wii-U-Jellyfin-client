@@ -1,5 +1,6 @@
 #include "player.h"
 #include "../seek.h"
+#include "../ufin_log.h"
 #include "http_stream_io.h"
 #include "decoder.h"
 #include "video_output.h"
@@ -22,7 +23,10 @@ static const double LATE_FRAME_DROP_SECONDS = 0.20;
 // How far the decode thread may run ahead of audio playback before it
 // pauses. Bounds memory and, since the container interleaves audio and
 // video, indirectly bounds how far ahead video decoding gets too.
-static const double MAX_AUDIO_AHEAD_SECONDS = 1.5;
+// Raised from 1.5s: decoded audio is cheap (~192 KB/s for 48kHz stereo
+// PCM), and 1.5s left almost no cushion against a real Wi-Fi hiccup
+// before playback audibly stalled.
+static const double MAX_AUDIO_AHEAD_SECONDS = 4.0;
 
 // Cap on compressed packets read ahead of decoding (see the decode
 // thread). At 2.5 Mbit/s this is over a minute of stream -- far more

@@ -5,6 +5,9 @@
 // display over with GX2 for its duration.
 
 #include <whb/proc.h>
+#include <whb/log.h>
+#include <whb/log_module.h>
+#include <whb/log_udp.h>
 #include <vpad/input.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
@@ -20,6 +23,7 @@
 #include <thread>
 
 #include "config.h"
+#include "ufin_log.h"
 #include "jellyfin_client.h"
 #include "config_loader.h"
 #include "item_labels.h"
@@ -163,7 +167,7 @@ struct PlaybackControl {
 // streaming involved. Isolates whether the GX2 path can put anything on
 // screen at all. B exits.
 static void runGx2TestPattern() {
-    display.shutdown();
+    display.hide();
     VideoOutput testOutput;
     if (testOutput.init(1280, 720, 16.0 / 9.0)) {
         bool testDone = false;
@@ -179,7 +183,7 @@ static void runGx2TestPattern() {
         }
         testOutput.shutdown();
     }
-    display.init();
+    display.show();
 }
 
 // Sends Jellyfin's "still playing" progress reports from a background
@@ -292,11 +296,15 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
 
     if (!isAudio) {
         // OSScreen and GX2 both drive the same display hardware; both
-        // active at once caused a hard OSFatal hang on Cemu and real
-        // hardware. Tear OSScreen down for the duration of video
-        // playback and re-create it afterwards. Audio-only playback never
-        // touches GX2, so the Now Playing screen can stay up.
-        display.shutdown();
+        // enabled at once caused a hard OSFatal hang on Cemu and real
+        // hardware. Hide OSScreen for the duration of video playback and
+        // show it again afterwards -- hide()/show() only toggle
+        // OSScreenEnableEx, they don't tear down and rebuild OSScreen or
+        // GX2's context (see the comment in os_screen_display.h for why
+        // that distinction turned out to matter on real hardware). Audio-
+        // only playback never touches GX2, so the Now Playing screen can
+        // stay up.
+        display.hide();
     }
 
     client.reportPlaybackStart(picked.id, ids);
@@ -350,7 +358,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     if (isLive) client.closeLiveStream(ids.liveStreamId);
 
     if (!isAudio) {
-        display.init();
+        display.show();
     }
 
     if (result == PlayResult::Error) {
@@ -389,7 +397,32 @@ static uint32_t withRepeat(const VPADStatus& vpad, RepeatState& rs) {
 }
 
 int main(int argc, char** argv) {
+    // Lets every existing OSReport(...) call in this codebase (video_output.cpp,
+    // player.cpp, etc.) reach a PC over the network -- no serial cable needed.
+    // WHBLogModuleInit() hooks the console log sink so plain OSReport calls get
+    // captured, not just WHBLogPrintf; WHBLogUdpInit() then ships that over UDP
+    // to whatever's listening (Aroma's logging module / notification plugin, or
+    // wut's udplogserver.py, or `nc -ul 4405`) on the console's IP, port 4405.
+    // Harmless to leave in a release build if nothing's listening.
+    WHBLogModuleInit();
+    WHBLogUdpInit();
+    // Also log to a plain file on the SD card (see ufin_log.h) -- UDP
+    // broadcast logging is silently dropped by a lot of home network
+    // setups (firewalls, AP isolation, VLANs), so this is the fallback
+    // that needs no network at all. Pull
+    // sd:/wiiu/apps/ufin/ufin_log.txt off the card after a run.
+    UfinLogOpen();
+
     WHBProcInit();
+
+    // GX2's context lives for the whole app from here on -- see the
+    // comment on VideoOutput::initGX2Context() and the one at the top of
+    // os_screen_display.h for why: tearing GX2 down and rebuilding it for
+    // every playback/keyboard session (the original design) computed
+    // correct frames that real hardware never actually displayed. Must
+    // run before the very first display.init() below.
+    VideoOutput::initGX2Context();
+
     display.init();
 
     UfinConfig cfg;
@@ -478,10 +511,10 @@ int main(int argc, char** argv) {
             } else if (pressed & VPAD_BUTTON_X) {
                 // Search. swkbd draws with GX2, so OSScreen steps aside
                 // like it does for video.
-                display.shutdown();
+                display.hide();
                 std::string term, keyboardError;
                 bool entered = ui::promptKeyboard(u"Search movies, shows and music", term, keyboardError);
-                display.init();
+                display.show();
                 if (entered) {
                     Frame results;
                     results.kind = Frame::Kind::Search;
@@ -538,6 +571,10 @@ int main(int argc, char** argv) {
     }
 
     display.shutdown();
+    VideoOutput::shutdownGX2Context();
     WHBProcShutdown();
+    UfinLogClose();
+    WHBLogUdpDeinit();
+    WHBLogModuleDeinit();
     return 0;
 }
