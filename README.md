@@ -4,7 +4,7 @@ WIP jellyfin client for the Nintendo Wii U
 
 ---
 
-> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware.
+> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware, certain movies can still crash the console the issue is being investigated.
 
 # Jellyfin Wii U
 
