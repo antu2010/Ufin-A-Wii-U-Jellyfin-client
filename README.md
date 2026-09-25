@@ -59,6 +59,7 @@ Ufin currently relies on Jellyfin server-side transcoding for its known-good vid
 * 480p60 software playback
 * 1080p30 hardware playback if possible
 * Eventually, direct play where possible
+* Wii U Gamepad as a separate player control screen or music visualizer
 
 ## Installation
 
