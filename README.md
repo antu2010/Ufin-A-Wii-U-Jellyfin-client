@@ -4,13 +4,15 @@ WIP jellyfin client for the Nintendo Wii U
 
 ---
 
-> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware. Playback can stutter heavily on poor or congested network connections, but audio/video stays synchronized and resumes from the correct position when the stream catches up or restarts. Ethernet or a clean, fast connection is recommended. Quitting the app may cause the console to hang.
+> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware. Playback can stutter heavily on poor or congested network connections, but audio/video should stay synchronized and resume from the correct position when the stream catches up or restarts. if anyone can test on Ethernet or stable WiFi and report how the playback is in an issue would be appreciated
 
 # Jellyfin Wii U
 
 A native Jellyfin client for the Nintendo Wii U because why not XD.
 
 **Beta development.** Expect bugs, crashes, and probably the occasional Wii U death beep.
+
+> Beta v1.0.0 will be released in the next few days
 
 ## Current status
 
@@ -24,7 +26,6 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 * ✅ Video playback (720p30 H.264 baseline + AAC, transcoded by the server)
 * ✅ Video seeking / stream restart
 * ✅ Pause / resume
-* ✅ Audio and subtitle track selection
 * ✅ Resume / Start over
 * ✅ Watched state and resume bars
 * ✅ Favourites
@@ -44,20 +45,20 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 
 ### Implemented, but not yet fully tested on real hardware
 
+* 🧪 Audio and subtitle track selection
 * 🧪 Quick Connect sign-in
 * 🧪 Live TV
 * 🧪 Wii Remote (+ Nunchuk / Classic Controller)
 * 🧪 Wii U Pro Controller
 
-The GamePad is currently the only controller fully tested on real hardware. The other controller implementations will be tested before the final 1.0 release.
+The GamePad is currently the only controller fully tested on real hardware. The other controller implementations will be tested before the final Beta 1.0 release.
 
 Ufin currently relies on Jellyfin server-side transcoding for its known-good video path. The recommended format is 720p30 H.264 Baseline + AAC.
 
 ## Goals
 
 * 480p60 software playback
-* 720p30 H.264/AAC software playback
-* 1080p60 hardware playback if possible
+* 1080p30 hardware playback if possible
 * Eventually, direct play where possible
 
 ## Installation
@@ -166,9 +167,7 @@ leans on two things:
 
 Debugging aids: all `OSReport` lines are prefixed `Ufin:` (visible over a
 Cemu/serial log, and also written to `sd:/wiiu/apps/ufin/ufin_log.txt` as a
-fallback for networks that drop the UDP log), and pressing **ZR** in the menu
-draws a magenta test picture through the exact same GX2 path with no decoding
-involved.
+fallback for networks that drop the UDP log)
 
 Two fixes were needed to get video actually displaying continuously on real
 hardware (as opposed to Cemu, where the original code already worked):
@@ -252,9 +251,9 @@ Libraries included in `src/vendor/` (licence texts alongside):
 
 ## Contributing
 
-Contributions and help are welcome!
+Contributions and help are welcome!, as i'm not a full programmer yet, i can only maintain and do small features, this project was born as an idea, and it is what it is now thanks to our contributors!
 
-Bug reports, testing feedback, fixes and smaller improvements are all useful, especially from people with real Wii U hardware.
+Bug reports, testing feedback, fixes and smaller improvements are all useful, if you dont own real hardware just let me know and i'll try to test as much as possible.
 
 For **large features, major changes, substantial refactors, or anything that would significantly change the project's architecture**, please contact me first at **[ufin.project@gmail.com](mailto:ufin.project@gmail.com)** so we can discuss it before implementation.
 
