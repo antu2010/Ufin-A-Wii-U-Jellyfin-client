@@ -52,6 +52,14 @@ struct PlayOptions {
     // frames.
     std::function<void(const std::function<void(uint32_t, uint32_t)>&)> presentVideo;
 
+    // Called periodically (a few times a second) while Player is waiting
+    // for the initial buffer to fill, before anything is shown or played
+    // (see PREBUFFER_TARGET_SECONDS in player.cpp). Args are seconds
+    // buffered so far and the target -- e.g. for a "Buffering... 6/15s"
+    // message. Never called for a stream that skips prebuffering (too
+    // short to reach the target).
+    std::function<void(double bufferedSeconds, double targetSeconds)> onBuffering;
+
     // Called about once per display frame whenever no video frame is
     // being shown -- audio-only playback -- so the app can draw its own
     // screen (Now Playing). Should render one frame; it's the loop's

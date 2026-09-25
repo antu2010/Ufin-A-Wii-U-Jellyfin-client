@@ -27,10 +27,44 @@ static const double LATE_FRAME_DROP_SECONDS = 0.20;
 // before playback audibly stalled.
 static const double MAX_AUDIO_AHEAD_SECONDS = 4.0;
 
-// Cap on compressed packets read ahead of decoding (see the decode
-// thread). At 2.5 Mbit/s this is over a minute of stream -- far more
-// than one fragment -- and still a small slice of MEM2.
-static const size_t MAX_BUFFERED_PACKET_BYTES = 24 * 1024 * 1024;
+// How long to wait, buffering, before the very first frame is shown (and
+// before audio starts). Measured in stream time sitting in Decoder's
+// compressed packet queues (see queuedVideoSeconds/queuedAudioSeconds) --
+// NOT decoded frames, which are far too large to hold minutes of (see
+// FrameQueue::MAX_SIZE). This is what actually protects against a Wi-Fi
+// hiccup: once playback starts, there's this many seconds of
+// already-downloaded (if not yet decoded) data to draw from before the
+// decode thread has to touch the network again.
+static const double PREBUFFER_TARGET_SECONDS = 15.0;
+
+// Safety valve: if PREBUFFER_TARGET_SECONDS hasn't been reached after this
+// long, start anyway with whatever's buffered. Covers two cases: a
+// connection so slow it will never sustain real-time playback anyway (no
+// point waiting forever when the user can already tell something's
+// wrong), and a stream whose packets don't carry usable duration
+// metadata, which would otherwise leave queuedVideoSeconds()/
+// queuedAudioSeconds() stuck at 0 and the wait unable to ever end on its
+// own. The user's own Stop button is the other way out, at any time.
+static const double PREBUFFER_MAX_WAIT_SECONDS = 30.0;
+
+// Once buffered-ahead reaches this much, stop reading further ahead of
+// the current playback position -- no point holding more than this in
+// memory. This is a *target*; MAX_BUFFERED_PACKET_BYTES below is the
+// hard ceiling that actually gets hit first on anything but a low
+// bitrate stream (see the comment there).
+static const double MAX_BUFFER_AHEAD_SECONDS = 180.0;
+
+// Cap on compressed packets read ahead of decoding (both streams
+// combined). This is the real memory limit -- MAX_BUFFER_AHEAD_SECONDS
+// above is a time-based target, but a high-bitrate stream will hit this
+// byte ceiling well before 180 seconds of it fits. At 2.5 Mbit/s, 96 MB
+// is a bit over 5 minutes of stream; at 8 Mbit/s it's under 100 seconds.
+// This number trades Wii U MEM2 budget against how deep the buffer can
+// get on higher-bitrate streams -- if this ever needs to come down
+// because MEM2 is tight alongside everything else the app allocates
+// (image cache, ImGui, audio buffers), the prebuffer/look-ahead targets
+// above will simply be satisfied by whichever limit is hit first.
+static const size_t MAX_BUFFERED_PACKET_BYTES = 96 * 1024 * 1024;
 
 static double nowSeconds() {
     return SDL_GetTicks() / 1000.0;
@@ -88,10 +122,8 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
             decoder.close();
             return PlayResult::Error;
         }
-        // Audio-only: nothing to wait for, start playing as soon as data
-        // arrives. With video, start() happens when the first frame is
-        // on screen so the two begin together.
-        if (!hasVideo) audio.start();
+        // Playback starts once the prebuffer phase below is satisfied,
+        // whether or not there's video -- audio.start() is called there.
     }
 
     // Decode runs on its own thread, separate from rendering: the
@@ -138,7 +170,15 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
 
             const bool starved = (audioWanted && !decoder.hasQueuedAudioPackets()) ||
                                  (videoWanted && !decoder.hasQueuedVideoPackets());
-            if (starved && !decoder.demuxFinished() &&
+            // Below the look-ahead target: keep reading even if nothing is
+            // currently starved for packets, so a backlog actually builds
+            // up instead of the network only ever being touched on demand
+            // (which left effectively no cushion against a hiccup -- see
+            // PREBUFFER_TARGET_SECONDS above).
+            const bool belowLookAheadTarget =
+                (hasVideo && decoder.queuedVideoSeconds() < MAX_BUFFER_AHEAD_SECONDS) ||
+                (hasAudio && decoder.queuedAudioSeconds() < MAX_BUFFER_AHEAD_SECONDS);
+            if ((starved || belowLookAheadTarget) && !decoder.demuxFinished() &&
                 decoder.queuedPacketBytes() < MAX_BUFFERED_PACKET_BYTES) {
                 decoder.readPacket(); // blocks on the network
             } else {
@@ -153,6 +193,70 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     });
 
     PlayResult result = PlayResult::Completed;
+
+    // --- Prebuffer: don't show a frame or start audio until both streams
+    // have a real cushion of already-downloaded data, so a playback start
+    // isn't immediately followed by running dry on the first hiccup. The
+    // decode thread above is already running and filling its (small,
+    // bounded) decoded-frame buffers concurrently with this wait, so
+    // there's no extra latency once the target is reached -- frames are
+    // ready to show immediately.
+    //
+    // Short items that never reach the target (a clip shorter than
+    // PREBUFFER_TARGET_SECONDS, or a slow server that would otherwise
+    // make the user wait forever) fall through as soon as the demuxer
+    // reports end of stream or the decode thread finishes.
+    {
+        const double prebufferStart = nowSeconds();
+        bool stoppedDuringPrebuffer = false;
+        while (true) {
+            PlayerCommand cmd = poll();
+            if (cmd.kind == PlayerCommand::Kind::Stop) {
+                stopRequested = true;
+                videoQueue.stop();
+                result = PlayResult::Stopped;
+                stoppedDuringPrebuffer = true;
+                break;
+            }
+            if (cmd.kind == PlayerCommand::Kind::SeekTo) {
+                seek_target_ = cmd.seconds < 0.0 ? 0.0 : cmd.seconds;
+                stopRequested = true;
+                videoQueue.stop();
+                result = PlayResult::SeekRequested;
+                stoppedDuringPrebuffer = true;
+                break;
+            }
+
+            const bool videoReady = !hasVideo || decoder.queuedVideoSeconds() >= PREBUFFER_TARGET_SECONDS;
+            const bool audioReady = !hasAudio || decoder.queuedAudioSeconds() >= PREBUFFER_TARGET_SECONDS;
+            if (videoReady && audioReady) break;
+            // Don't wait forever on a short item or a server that will
+            // never deliver PREBUFFER_TARGET_SECONDS worth (e.g. Live TV
+            // right after tuning, or anything shorter than the target).
+            if (decoder.demuxFinished() || decodeDone) break;
+            if (nowSeconds() - prebufferStart > PREBUFFER_MAX_WAIT_SECONDS) {
+                OSReport("Ufin: prebuffer target not reached after %.0fs -- starting anyway\n",
+                         PREBUFFER_MAX_WAIT_SECONDS);
+                break;
+            }
+
+            if (options.onBuffering) {
+                double buffered = hasVideo ? decoder.queuedVideoSeconds() : decoder.queuedAudioSeconds();
+                if (hasVideo && hasAudio) buffered = std::min(buffered, decoder.queuedAudioSeconds());
+                options.onBuffering(buffered, PREBUFFER_TARGET_SECONDS);
+            }
+            SDL_Delay(50);
+        }
+        if (!stoppedDuringPrebuffer) {
+            OSReport("Ufin: prebuffer done after %.1fs (video=%.1fs audio=%.1fs)\n",
+                     nowSeconds() - prebufferStart, decoder.queuedVideoSeconds(),
+                     hasAudio ? decoder.queuedAudioSeconds() : 0.0);
+            // Audio-only: nothing else to wait for -- start now. With
+            // video, start() happens when the first frame is shown so the
+            // two begin together (see audioNotStartedYet below).
+            if (!hasVideo && hasAudio) audio.start();
+        }
+    }
 
     double nominalFrameDuration = decoder.videoFrameDuration();
     if (!(nominalFrameDuration > 0.0)) nominalFrameDuration = 1.0 / 30.0;
@@ -178,7 +282,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     double pauseStartedAt = NAN;   // wall time the current pause began (video-only clock)
     double lastPausedRedraw = 0.0;
 
-    while (true) {
+    while (!stopRequested) {
         PlayerCommand cmd = poll();
         if (cmd.kind == PlayerCommand::Kind::Stop) {
             stopRequested = true;

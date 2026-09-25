@@ -150,8 +150,17 @@ bool Decoder::readPacket() {
             return false;
         }
         std::deque<AVPacket*>* queue = nullptr;
-        if (packet_->stream_index == video_stream_index_ && video_ctx_) queue = &video_packets_;
-        else if (packet_->stream_index == audio_stream_index_ && audio_ctx_) queue = &audio_packets_;
+        AVRational timeBase{1, 1};
+        double* queuedSeconds = nullptr;
+        if (packet_->stream_index == video_stream_index_ && video_ctx_) {
+            queue = &video_packets_;
+            timeBase = fmt_ctx_->streams[video_stream_index_]->time_base;
+            queuedSeconds = &queued_video_seconds_;
+        } else if (packet_->stream_index == audio_stream_index_ && audio_ctx_) {
+            queue = &audio_packets_;
+            timeBase = fmt_ctx_->streams[audio_stream_index_]->time_base;
+            queuedSeconds = &queued_audio_seconds_;
+        }
         if (!queue) {
             // e.g. a subtitle track we never opened a codec for
             av_packet_unref(packet_);
@@ -164,6 +173,15 @@ bool Decoder::readPacket() {
         }
         av_packet_move_ref(copy, packet_);
         queued_packet_bytes_ += (size_t)copy->size;
+        // Packet duration in stream time -- what fragmented-mp4 sample
+        // deltas give us. A missing/zero duration (some containers don't
+        // always set it) just means this one packet doesn't count toward
+        // the buffered-ahead estimate; it's still queued and decoded
+        // normally, so nothing is lost, the estimate is just briefly
+        // conservative.
+        if (copy->duration > 0) {
+            *queuedSeconds += (double)copy->duration * av_q2d(timeBase);
+        }
         queue->push_back(copy);
         return true;
     }
@@ -203,6 +221,13 @@ bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool
             // Accepted -- or rejected outright, in which case the packet
             // is unusable and dropping it is the only option.
             queued_packet_bytes_ -= (size_t)pkt->size;
+            if (pkt->duration > 0) {
+                AVRational timeBase = isVideo ? fmt_ctx_->streams[video_stream_index_]->time_base
+                                               : fmt_ctx_->streams[audio_stream_index_]->time_base;
+                double& queuedSeconds = isVideo ? queued_video_seconds_ : queued_audio_seconds_;
+                queuedSeconds -= (double)pkt->duration * av_q2d(timeBase);
+                if (queuedSeconds < 0.0) queuedSeconds = 0.0; // clamp against fp drift
+            }
             av_packet_free(&pkt);
             queue.pop_front();
             continue;
@@ -311,6 +336,8 @@ void Decoder::close() {
     video_packets_.clear();
     audio_packets_.clear();
     queued_packet_bytes_ = 0;
+    queued_video_seconds_ = 0.0;
+    queued_audio_seconds_ = 0.0;
     video_drained_ = audio_drained_ = false;
     video_flushed_ = audio_flushed_ = false;
     if (video_ctx_) avcodec_free_context(&video_ctx_);

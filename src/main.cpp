@@ -398,6 +398,16 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     control.player = &player;
     control.lastInteraction = OSGetTime(); // show the HUD at the start
 
+    // Refreshes the busy screen with progress while Player waits out its
+    // initial buffer (see PREBUFFER_TARGET_SECONDS in player.cpp) -- the
+    // one-shot showBusy() call above would otherwise sit frozen for
+    // however long that takes.
+    playOptions.onBuffering = [&](double buffered, double target) {
+        char line[64];
+        snprintf(line, sizeof(line), "Buffering... %.0f / %.0fs", buffered, target);
+        showBusy(isLive ? "Tuning" : "Loading", {title, "", line});
+    };
+
     // Video: every frame is drawn as the underlay of an app frame with
     // the HUD on top. The HUD shows while paused, while a skip is being
     // collected, and for a few seconds after any button press.

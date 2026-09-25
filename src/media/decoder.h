@@ -66,6 +66,16 @@ public:
     bool hasQueuedVideoPackets() const { return !video_packets_.empty(); }
     bool hasQueuedAudioPackets() const { return !audio_packets_.empty(); }
     size_t queuedPacketBytes() const { return queued_packet_bytes_; }
+    // Seconds of stream time currently sitting in each stream's compressed
+    // packet queue, i.e. how far ahead of the decoder the network read
+    // has gotten -- NOT how much has been decoded. This is what a
+    // look-ahead/prebuffer target should be measured against: decoded
+    // frames are far too large to buffer minutes of (see the comment on
+    // per-stream decoding above), but compressed packets are cheap, so
+    // "buffered ahead" means packets sitting here, waiting to be decoded
+    // closer to when they're actually needed.
+    double queuedVideoSeconds() const { return queued_video_seconds_; }
+    double queuedAudioSeconds() const { return queued_audio_seconds_; }
     bool demuxFinished() const { return reachedEof_; }
     // True once the demuxer hit the end and every opened decoder has
     // given back its last frame.
@@ -118,6 +128,8 @@ private:
     std::deque<AVPacket*> video_packets_;
     std::deque<AVPacket*> audio_packets_;
     size_t queued_packet_bytes_ = 0;
+    double queued_video_seconds_ = 0.0;
+    double queued_audio_seconds_ = 0.0;
 
     bool decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
                     bool& drained, bool isVideo, AVFrame** outFrame);
