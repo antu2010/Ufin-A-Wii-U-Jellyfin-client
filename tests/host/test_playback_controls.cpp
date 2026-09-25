@@ -23,6 +23,17 @@ int main() {
     CHECK_NEAR(itemPositionFromStreamTime(2.0, 600, NAN), 602.0, 1e-9);      // before the first timestamp
     CHECK(std::isnan(itemPositionFromStreamTime(NAN, 600, 0)));
 
+    // makePlaySessionId: 32 hex chars, different for every call.
+    {
+        std::string a = makePlaySessionId(1000, 1), b = makePlaySessionId(1000, 2), c = makePlaySessionId(1001, 1);
+        CHECK_EQ((int)a.size(), 32);
+        CHECK(a.find_first_not_of("0123456789abcdef") == std::string::npos);
+        CHECK(a != b);
+        CHECK(a != c);
+        CHECK(b != c);
+        CHECK_STR(makePlaySessionId(1000, 1), a); // deterministic for the same input
+    }
+
     // utf16ToUtf8
     CHECK_STR(utf16ToUtf8(u"matrix"), "matrix");
     CHECK_STR(utf16ToUtf8(u"citt\u00e0"), "citt\xc3\xa0");            // 2-byte
@@ -31,6 +42,11 @@ int main() {
     const char16_t lone[] = {0xD800, u'a', 0};
     CHECK_STR(utf16ToUtf8(lone), "\xef\xbf\xbd" "a");                  // lone surrogate -> U+FFFD
     CHECK_STR(utf16ToUtf8(nullptr), "");
+    CHECK(utf8ToUtf16("abc") == u"abc");
+    CHECK(utf8ToUtf16("citt\xc3\xa0") == u"citt\u00e0");
+    CHECK(utf8ToUtf16("\xf0\x9f\x98\x80") == u"\U0001F600");
+    CHECK(utf8ToUtf16("a\xff" "b") == u"a\uFFFD" u"b");
+    CHECK_STR(utf16ToUtf8(utf8ToUtf16("192.168.1.100:8096").c_str()), "192.168.1.100:8096");
     CHECK_STR(trimSpaces("  star wars  "), "star wars");
     CHECK_STR(trimSpaces("   "), "");
 

@@ -1,5 +1,4 @@
 #include "http_stream_reader.h"
-#include "ufin_log.h"
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -103,6 +102,17 @@ bool HttpStreamReader::readLine(std::string& outLine) {
 
 bool HttpStreamReader::open() {
     OSReport("Ufin: HttpStreamReader::open host=%s port=%d\n", host_.c_str(), port_);
+    {
+        // The request path, with the access token blanked out -- shows
+        // StartTimeTicks / PlaySessionId when diagnosing seeks.
+        std::string shown = path_;
+        size_t k = shown.find("ApiKey=");
+        if (k != std::string::npos) {
+            size_t end = shown.find('&', k);
+            shown.replace(k + 7, (end == std::string::npos ? shown.size() : end) - (k + 7), "***");
+        }
+        OSReport("Ufin: GET %s\n", shown.c_str());
+    }
 
     struct in_addr addr;
     if (!resolveHost(host_, &addr)) {

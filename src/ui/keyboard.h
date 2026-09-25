@@ -1,8 +1,8 @@
 // Wii U software keyboard (nn::swkbd) as a single blocking call.
 //
-// swkbd draws itself with GX2, so -- exactly like video playback -- the
-// caller must shut OSScreen down first and bring it back afterwards
-// (OSScreen and GX2 can't drive the display at the same time).
+// swkbd draws itself with GX2, into the display ui::Gfx already owns;
+// it runs its own frames (TV and GamePad) until the user confirms or
+// cancels.
 #pragma once
 #include <string>
 
@@ -13,5 +13,11 @@ namespace ui {
 // entry; false on cancel, empty input, or if the keyboard couldn't start
 // (then `error` says why).
 bool promptKeyboard(const char16_t* hint, std::string& out, std::string& error);
+
+// Same, starting from `initial` (UTF-8). With `password`, typed text is
+// hidden. With `allowEmpty`, confirming an empty field counts (e.g.
+// clearing a field).
+bool promptKeyboard(const char16_t* hint, const std::string& initial, bool password, bool allowEmpty,
+                    std::string& out, std::string& error);
 
 } // namespace ui

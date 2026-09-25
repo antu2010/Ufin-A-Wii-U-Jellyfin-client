@@ -308,6 +308,19 @@ int main() {
         CHECK(!contains(client.buildVideoStreamUrl("m1").path, "StartTimeTicks"));
         CHECK(contains(client.buildAudioStreamUrl("a1", 1234).path, "&StartTimeTicks=1234"));
         CHECK(!contains(client.buildAudioStreamUrl("a1").path, "StartTimeTicks"));
+        CHECK(contains(client.buildAudioStreamUrl("a1", 5, "ps9").path, "&PlaySessionId=ps9"));
+        CHECK(!contains(client.buildAudioStreamUrl("a1").path, "PlaySessionId"));
+        // Each seek's request carries its own session, so Jellyfin starts a
+        // new transcode instead of replaying the old one from 0:00.
+        VideoStreamOptions s1, s2;
+        s1.startTimeTicks = 0;
+        s1.playSessionId = "aaa";
+        s2.startTimeTicks = 6000000000LL;
+        s2.playSessionId = "bbb";
+        std::string p1 = client.buildVideoStreamUrl("m1", s1).path, p2 = client.buildVideoStreamUrl("m1", s2).path;
+        CHECK(contains(p1, "&PlaySessionId=aaa"));
+        CHECK(contains(p2, "&PlaySessionId=bbb"));
+        CHECK(contains(p2, "&StartTimeTicks=6000000000"));
     }
 
     // Progress carries IsPaused; CanSeek is true except for Live TV.
@@ -322,6 +335,222 @@ int main() {
         reqs = server.requests();
         CHECK(contains(reqs.back().body, "\"IsPaused\":false"));
         CHECK(contains(reqs.back().body, "\"CanSeek\":false"));
+    }
+
+    // Artwork: own Primary image, else the album's, else the series'.
+    {
+        FakeRoute art;
+        art.body = "{\"Items\":["
+            "{\"Id\":\"m1\",\"Type\":\"Movie\",\"ImageTags\":{\"Primary\":\"t1\"}},"
+            "{\"Id\":\"s1\",\"Type\":\"Audio\",\"ImageTags\":{},\"AlbumId\":\"al9\",\"AlbumPrimaryImageTag\":\"t2\"},"
+            "{\"Id\":\"e1\",\"Type\":\"Episode\",\"SeriesId\":\"se4\",\"SeriesPrimaryImageTag\":\"t3\"},"
+            "{\"Id\":\"f1\",\"Type\":\"Folder\"}]}";
+        server.addRoute("/Users/user1/Items", art);
+        CHECK(client.getItems("x", list));
+        CHECK_EQ((int)list.size(), 4);
+        CHECK_STR(list[0].imageItemId, "m1"); CHECK_STR(list[0].imageTag, "t1");
+        CHECK_STR(list[1].imageItemId, "al9"); CHECK_STR(list[1].imageTag, "t2");
+        CHECK_STR(list[2].imageItemId, "se4"); CHECK_STR(list[2].imageTag, "t3");
+        CHECK_STR(list[3].imageItemId, ""); CHECK_STR(list[3].imageTag, "");
+
+        std::string p = client.buildImagePath("m1", "t 1", 96, 90);
+        CHECK_STR(p, "/Items/m1/Images/Primary?maxWidth=96&maxHeight=90&quality=85&format=Jpg&tag=t%201");
+
+        // Binary-safe fetch (JPEG bytes contain NULs).
+        FakeRoute jpg;
+        jpg.contentType = "image/jpeg";
+        jpg.body = std::string("\xff\xd8\x00\x01\x02\x00\xff\xd9", 8);
+        server.addRoute("/Items/m1/Images/Primary", jpg);
+        std::string bytes;
+        CHECK(client.fetchBinary(p, bytes));
+        CHECK_EQ((int)bytes.size(), 8);
+        CHECK(bytes == jpg.body);
+        CHECK(!client.fetchBinary("/Items/none/Images/Primary", bytes));
+    }
+
+    // --- watched / favourites / resume / tracks ---
+    {
+        FakeRoute items;
+        items.body = "{\"Items\":["
+            "{\"Id\":\"m1\",\"Type\":\"Movie\",\"UserData\":{\"PlaybackPositionTicks\":6000000000,"
+            "\"Played\":false,\"IsFavorite\":true,\"PlayedPercentage\":12.5}},"
+            "{\"Id\":\"s1\",\"Type\":\"Series\",\"UserData\":{\"Played\":false,\"UnplayedItemCount\":4}},"
+            "{\"Id\":\"e1\",\"Type\":\"Episode\",\"SeriesId\":\"s1\",\"UserData\":{\"Played\":true}},"
+            "{\"Id\":\"x\",\"Type\":\"Folder\"}]}";
+        server.addRoute("/Users/user1/Items", items);
+        CHECK(client.getItems("p", list));
+        CHECK_EQ((int)list.size(), 4);
+        CHECK_EQ((long long)list[0].positionTicks, 6000000000LL);
+        CHECK(list[0].favorite);
+        CHECK(!list[0].played);
+        CHECK_NEAR(list[0].playedPercentage, 12.5, 1e-9);
+        CHECK_EQ(list[1].unplayedCount, 4);
+        CHECK(list[2].played);
+        CHECK_STR(list[2].seriesId, "s1");
+        CHECK_EQ(list[3].unplayedCount, -1);
+        CHECK(!list[3].favorite);
+
+        // Home rows.
+        FakeRoute resume;
+        resume.body = "{\"Items\":[{\"Id\":\"m1\",\"Type\":\"Movie\"}]}";
+        server.addRoute("/UserItems/Resume", resume);
+        CHECK(client.getResume(list));
+        CHECK_EQ((int)list.size(), 1);
+        CHECK(contains(server.requests().back().path, "userId=user1"));
+        CHECK(contains(server.requests().back().path, "MediaTypes=Video"));
+        server.addRoute("/Shows/NextUp", resume);
+        CHECK(client.getNextUp(list));
+        CHECK(contains(server.requests().back().path, "/Shows/NextUp?userId=user1"));
+        CHECK(!client.getEpisodes("s1", list)); // route not registered yet: 404
+        CHECK(contains(server.requests().back().path, "/Shows/s1/Episodes?userId=user1"));
+        server.addRoute("/Shows/s1/Episodes", resume);
+        CHECK(client.getEpisodes("s1", list));
+        server.addRoute("/Users/user1/Items", resume);
+        CHECK(client.getFavorites(list));
+        CHECK(contains(server.requests().back().path, "Filters=IsFavorite"));
+
+        // Old servers: the pre-10.9 resume route is tried after a 404.
+        JellyfinClient old("127.0.0.1", server.port());
+        old.useSavedLogin("user1", "tok");
+        FakeRoute gone;
+        gone.status = 404;
+        server.addRoute("/UserItems/Resume", gone);
+        server.addRoute("/Users/user1/Items/Resume", resume);
+        CHECK(old.getResume(list));
+        CHECK(contains(server.requests().back().path, "/Users/user1/Items/Resume"));
+
+        // Favourite / watched: POST to set, DELETE to clear.
+        FakeRoute ok;
+        ok.status = 200;
+        server.addRoute("/UserFavoriteItems/m1", ok);
+        CHECK(client.setFavorite("m1", true));
+        CHECK_STR(server.requests().back().method, "POST");
+        CHECK(contains(server.requests().back().path, "/UserFavoriteItems/m1?userId=user1"));
+        CHECK(client.setFavorite("m1", false));
+        CHECK_STR(server.requests().back().method, "DELETE");
+        server.addRoute("/UserPlayedItems/m1", ok);
+        CHECK(client.setPlayed("m1", true));
+        CHECK_STR(server.requests().back().method, "POST");
+        // ...and the legacy route when the new one doesn't exist.
+        server.addRoute("/Users/user1/PlayedItems/m2", ok);
+        CHECK(client.setPlayed("m2", false));
+        CHECK_STR(server.requests().back().method, "DELETE");
+        CHECK(contains(server.requests().back().path, "/Users/user1/PlayedItems/m2"));
+
+        // Tracks from the media source, with defaults.
+        FakeRoute info;
+        info.body = "{\"Id\":\"m5\",\"MediaSources\":[{\"Id\":\"src\",\"DefaultAudioStreamIndex\":2,"
+            "\"DefaultSubtitleStreamIndex\":-1,\"MediaStreams\":["
+            "{\"Type\":\"Video\",\"Index\":0,\"Width\":1920,\"Height\":1080},"
+            "{\"Type\":\"Audio\",\"Index\":1,\"Language\":\"eng\",\"DisplayTitle\":\"English - AAC - Stereo\"},"
+            "{\"Type\":\"Audio\",\"Index\":2,\"Language\":\"ita\",\"DisplayTitle\":\"Italiano - AC3 - 5.1\",\"IsDefault\":true},"
+            "{\"Type\":\"Subtitle\",\"Index\":3,\"Language\":\"ita\",\"DisplayTitle\":\"Italiano - SRT\"}]}]}";
+        server.addRoute("/Users/user1/Items/m5", info);
+        VideoInfo vi;
+        CHECK(client.getVideoInfo("m5", vi));
+        CHECK_EQ((int)vi.audioTracks.size(), 2);
+        CHECK_EQ((int)vi.subtitleTracks.size(), 1);
+        CHECK_STR(vi.audioTracks[1].title, "Italiano - AC3 - 5.1");
+        CHECK_EQ(vi.defaultAudioIndex, 2);
+        CHECK_EQ(vi.defaultSubtitleIndex, -1);
+        CHECK_STR(vi.subtitleTracks[0].language, "ita");
+
+        // Track indices in the stream URL; subtitles burned in.
+        VideoStreamOptions o;
+        CHECK(!contains(client.buildVideoStreamUrl("m5", o).path, "StreamIndex")); // server default
+        o.audioStreamIndex = 2;
+        o.subtitleStreamIndex = 3;
+        std::string p = client.buildVideoStreamUrl("m5", o).path;
+        CHECK(contains(p, "&AudioStreamIndex=2"));
+        CHECK(contains(p, "&SubtitleStreamIndex=3&SubtitleMethod=Encode"));
+        o.subtitleStreamIndex = -1;
+        p = client.buildVideoStreamUrl("m5", o).path;
+        CHECK(contains(p, "&SubtitleStreamIndex=-1"));
+        CHECK(!contains(p, "SubtitleMethod"));
+    }
+
+    // --- signing in without config.json ---
+    {
+        JellyfinClient c2("127.0.0.1", server.port());
+        c2.setDeviceId("ufin-abc");
+
+        // Saved token: accepted when /Users/Me says so.
+        FakeRoute me;
+        me.body = "{\"Id\":\"user7\",\"Name\":\"alex\"}";
+        server.addRoute("/Users/Me", me);
+        c2.useSavedLogin("user7", "savedtok");
+        CHECK(c2.validateLogin());
+        CHECK_STR(c2.userName(), "alex");
+        {
+            auto reqs = server.requests();
+            CHECK(contains(reqs.back().headers, "DeviceId=\"ufin-abc\""));
+            CHECK(contains(reqs.back().headers, "Token=\"savedtok\""));
+        }
+        FakeRoute expired;
+        expired.status = 401;
+        server.addRoute("/Users/Me", expired);
+        CHECK(!c2.validateLogin());
+        CHECK(contains(c2.lastError(), "expired"));
+
+        // Quick Connect: code shown, approved elsewhere, then signed in.
+        FakeRoute init;
+        init.body = "{\"Secret\":\"s3cr3t\",\"Code\":\"123456\",\"Authenticated\":false}";
+        server.addRoute("/QuickConnect/Initiate", init);
+        JellyfinClient::QuickConnectRequest qc;
+        CHECK(c2.quickConnectStart(qc));
+        CHECK_STR(qc.code, "123456");
+        CHECK_STR(qc.secret, "s3cr3t");
+        {
+            auto reqs = server.requests();
+            CHECK_STR(reqs.back().method, "POST");
+            CHECK(!contains(reqs.back().headers, "Token=")); // not signed in yet
+        }
+        FakeRoute waiting;
+        waiting.body = "{\"Authenticated\":false}";
+        server.addRoute("/QuickConnect/Connect", waiting);
+        CHECK(!c2.quickConnectApproved(qc.secret));
+        CHECK_STR(c2.lastError(), "");
+        CHECK(contains(server.requests().back().path, "secret=s3cr3t"));
+        FakeRoute approved;
+        approved.body = "{\"Authenticated\":true}";
+        server.addRoute("/QuickConnect/Connect", approved);
+        CHECK(c2.quickConnectApproved(qc.secret));
+        FakeRoute qcAuth;
+        qcAuth.body = "{\"AccessToken\":\"newtok\",\"User\":{\"Id\":\"user7\",\"Name\":\"alex\"}}";
+        server.addRoute("/Users/AuthenticateWithQuickConnect", qcAuth);
+        CHECK(c2.quickConnectFinish(qc.secret));
+        CHECK_STR(c2.accessToken(), "newtok");
+        CHECK_STR(c2.userId(), "user7");
+        CHECK(contains(server.requests().back().body, "\"Secret\":\"s3cr3t\""));
+
+        // Expired code, and Quick Connect turned off.
+        FakeRoute gone;
+        gone.status = 404;
+        server.addRoute("/QuickConnect/Connect", gone);
+        CHECK(!c2.quickConnectApproved(qc.secret));
+        CHECK(contains(c2.lastError(), "expired"));
+        FakeRoute off;
+        off.status = 401;
+        server.addRoute("/QuickConnect/Initiate", off);
+        CHECK(!c2.quickConnectStart(qc));
+        CHECK(contains(c2.lastError(), "turned off"));
+
+        // Sign out forgets the token and tells the server.
+        FakeRoute ok;
+        ok.status = 204;
+        server.addRoute("/Sessions/Logout", ok);
+        c2.useSavedLogin("user7", "tok");
+        c2.signOut();
+        CHECK_STR(c2.accessToken(), "");
+        CHECK(contains(server.requests().back().path, "/Sessions/Logout"));
+        CHECK(!c2.validateLogin());
+
+        // Password login also reports the user's name.
+        FakeRoute byName;
+        byName.body = "{\"AccessToken\":\"pwtok\",\"User\":{\"Id\":\"u1\",\"Name\":\"Mario\"}}";
+        server.addRoute("/Users/AuthenticateByName", byName);
+        CHECK(c2.authenticate("Mario", "pw"));
+        CHECK_STR(c2.userName(), "Mario");
     }
 
     server.stop();

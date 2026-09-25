@@ -1,8 +1,6 @@
 {
   "host": "192.168.1.43",
-  "port": 8097,
-  "username": "antu2010",
-  "password": "changeme",
-  "video_bitrate": 2500000,
-  "video_profile": "baseline"
+  "port": 8096,
+  "username": "your-user",
+  "password": "your-password"
 }

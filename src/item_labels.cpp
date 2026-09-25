@@ -1,5 +1,5 @@
 #include "item_labels.h"
-#include "ui/screens.h"
+#include "ui/layout.h"
 
 #include <cstdio>
 
@@ -10,6 +10,37 @@ bool isPlayableItem(const JellyfinItem& item) {
 
 bool isLiveTvView(const JellyfinItem& item) {
     return item.collectionType == "livetv";
+}
+
+bool isHomeRow(const JellyfinItem& item) {
+    return item.type == HOME_RESUME || item.type == HOME_NEXT_UP || item.type == HOME_FAVORITES;
+}
+
+JellyfinItem makeHomeRow(const char* type, int count) {
+    JellyfinItem i;
+    i.type = type;
+    i.id = type;
+    i.childCount = count;
+    std::string t = type;
+    i.name = t == HOME_RESUME ? "Continue watching" : t == HOME_NEXT_UP ? "Next up" : "Favourites";
+    return i;
+}
+
+void applyUserState(const JellyfinItem& item, ui::ListEntry& e) {
+    e.favorite = item.favorite;
+    if (item.type == "Series" || item.type == "Season" || item.type == "BoxSet") {
+        e.unplayed = item.unplayedCount > 0 ? item.unplayedCount : -1;
+        e.watched = item.played && item.unplayedCount <= 0;
+    } else {
+        e.watched = item.played;
+        if (!item.played && item.positionTicks > 0 && item.runTimeTicks > 0) {
+            e.progress = (float)((double)item.positionTicks / (double)item.runTimeTicks);
+        }
+    }
+}
+
+bool isShufflableContainer(const JellyfinItem& item) {
+    return item.type == "MusicAlbum" || item.type == "Playlist";
 }
 
 static std::string libraryKind(const std::string& collectionType) {
@@ -67,6 +98,7 @@ std::string itemDisplayName(const JellyfinItem& item) {
 }
 
 std::string itemTag(const JellyfinItem& item) {
+    if (isHomeRow(item)) return item.childCount >= 0 ? std::to_string(item.childCount) : "";
     if (isLibrary(item)) return libraryKind(item.collectionType);
     if (item.type == "Movie" || item.type == "Video" || item.type == "MusicVideo") {
         return joinParts(item.productionYear > 0 ? std::to_string(item.productionYear) : "", duration(item));
@@ -85,7 +117,16 @@ std::string itemTag(const JellyfinItem& item) {
 }
 
 std::string itemDetail(const JellyfinItem& item) {
+    if (item.type == HOME_RESUME) return "Pick up where you left off";
+    if (item.type == HOME_NEXT_UP) return "The next episode of the shows you're watching";
+    if (item.type == HOME_FAVORITES) return "Everything you've marked with a heart (Y)";
     if (isLibrary(item)) return libraryKind(item.collectionType) + " library  -  A: open";
+    if (isPlayableItem(item) && item.type != "TvChannel" && !item.played && item.positionTicks >= 600000000LL) {
+        // Partly watched: say where it resumes.
+        JellyfinItem plain = item;
+        plain.positionTicks = 0;
+        return "Resume at " + ui::formatTime((double)item.positionTicks / 10000000.0) + "  -  " + itemDetail(plain);
+    }
     if (item.type == "TvChannel") {
         std::string what = item.currentProgram.empty() ? "Live channel" : "Now: " + item.currentProgram;
         return joinDetail(what, "A: watch");
@@ -104,4 +145,26 @@ std::string itemDetail(const JellyfinItem& item) {
         return joinDetail(joinDetail(item.name, year), duration(item));
     }
     return joinDetail(item.name, itemTag(item));
+}
+
+ui::Icon itemIcon(const JellyfinItem& item) {
+    if (item.type == HOME_RESUME) return ui::Icon::Resume;
+    if (item.type == HOME_NEXT_UP) return ui::Icon::Series;
+    if (item.type == HOME_FAVORITES) return ui::Icon::Heart;
+    if (isLibrary(item)) {
+        if (item.collectionType == "movies") return ui::Icon::Movie;
+        if (item.collectionType == "tvshows") return ui::Icon::Series;
+        if (item.collectionType == "music") return ui::Icon::Music;
+        if (item.collectionType == "livetv") return ui::Icon::LiveTv;
+        return ui::Icon::Library;
+    }
+    if (item.type == "Movie" || item.type == "Video" || item.type == "MusicVideo") return ui::Icon::Movie;
+    if (item.type == "Series" || item.type == "Season") return ui::Icon::Series;
+    if (item.type == "Episode") return ui::Icon::Episode;
+    if (item.type == "Audio") return ui::Icon::Music;
+    if (item.type == "MusicAlbum" || item.type == "Playlist") return ui::Icon::Album;
+    if (item.type == "MusicArtist") return ui::Icon::Music;
+    if (item.type == "TvChannel") return ui::Icon::Channel;
+    if (item.type == "BoxSet") return ui::Icon::Collection;
+    return ui::Icon::Folder;
 }

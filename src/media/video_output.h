@@ -40,24 +40,18 @@ extern "C" {
 #include <gx2/surface.h>
 
 #include <cstdint>
+#include <functional>
+
+// Draws the video picture into a target of the given size. VideoOutput
+// hands one of these to its presenter, which runs it as the underlay of
+// a whole app frame (ui::Gfx::frame), so the HUD draws on top.
+using VideoDrawFn = std::function<void(uint32_t width, uint32_t height)>;
+using VideoPresenter = std::function<void(const VideoDrawFn& drawVideo)>;
 
 class VideoOutput {
 public:
     VideoOutput();
     ~VideoOutput();
-
-    // Brings up the GX2 context for the whole app's lifetime. Call this
-    // exactly once, near the top of main(), BEFORE OSScreenDisplay::init()
-    // ever runs -- and shutdownGX2Context() exactly once, at the very end,
-    // AFTER the final OSScreenDisplay::shutdown(). Leaves TV/DRC output
-    // disabled (GX2SetTVEnable/DRCEnable FALSE) so OSScreen alone drives
-    // the display until a VideoOutput instance's init() below re-enables
-    // it. See the big comment in os_screen_display.h for why this exists:
-    // tearing the whole GX2 context down and rebuilding it per playback
-    // session (the original design) left GX2 computing correct frames
-    // that real hardware never actually scanned out.
-    static bool initGX2Context();
-    static void shutdownGX2Context();
 
     // width/height must match the decoded frames (Decoder::videoWidth()/
     // videoHeight()). displayAspect is the aspect ratio the picture
@@ -80,6 +74,15 @@ public:
 
     void shutdown();
 
+    // Where frames go. With a presenter (the normal case) each frame is
+    // drawn as the underlay of an app frame; without one, VideoOutput
+    // draws a bare frame itself (the ZR test picture). GX2 itself is
+    // owned by ui::Gfx either way -- VideoOutput never initialises it.
+    void setPresenter(VideoPresenter presenter) { presenter_ = std::move(presenter); }
+
+    // Draws the last frame again (while paused, so the HUD can update).
+    void presentLast();
+
     const char* lastError() const { return last_error_; }
 
 private:
@@ -94,8 +97,10 @@ private:
     int height_ = 0;
     char last_error_[256] = {0};
 
-    bool gfx_initialized_ = false;
+    bool shader_loaded_ = false;
     WHBGfxShaderGroup shader_{};
+    VideoPresenter presenter_;
+    int last_presented_ = -1;
     uint32_t y_sampler_location_ = 0;
     uint32_t uv_sampler_location_ = 1;
 
@@ -106,9 +111,7 @@ private:
     // One aspect-fitted quad per target, since their resolutions (and
     // on a 4:3 TV, aspect) differ. 4 vertices of {x, y, u, v}.
     void* tv_quad_ = nullptr;
-    void* drc_quad_ = nullptr;
     uint32_t tv_width_ = 0, tv_height_ = 0;
-    uint32_t drc_width_ = 0, drc_height_ = 0;
 
     int unsupported_format_logged_ = 0;
 

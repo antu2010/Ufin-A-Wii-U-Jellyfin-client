@@ -99,6 +99,40 @@ int main() {
         CHECK_NEAR(audio.clockSeconds(), before + 0.25, 0.01);
     }
 
+    // Volume scales the samples handed to SDL (menu music plays quieter).
+    {
+        AudioOutput loud;
+        CHECK(loud.init(48000, 2, AV_SAMPLE_FMT_FLTP));
+        auto tone = [](float value) {
+            AVFrame* f = makeAudioFrame(256, 48000);
+            for (int c = 0; c < 2; c++)
+                for (int i = 0; i < 256; i++) ((float*)f->data[c])[i] = value;
+            return f;
+        };
+        auto lastSample = []() {
+            Uint32 n = 0;
+            const unsigned char* d = fake_sdl_last_queued(&n);
+            return n >= 4 ? (int)((const int16_t*)d)[(n / 2) - 1] : 0; // last sample (settled)
+        };
+        AVFrame* f = tone(0.5f);
+        loud.queueFrame(f, 0.0);
+        int full = lastSample();
+        av_frame_free(&f);
+        loud.setVolume(0.25f);
+        f = tone(0.5f);
+        loud.queueFrame(f, 0.1);
+        int quiet = lastSample();
+        av_frame_free(&f);
+        CHECK(full > 15000);
+        CHECK(quiet > full / 4 - 200 && quiet < full / 4 + 200);
+        loud.setVolume(5.0f); // clamped to 1
+        f = tone(0.5f);
+        loud.queueFrame(f, 0.2);
+        CHECK(std::abs(lastSample() - full) < 50);
+        av_frame_free(&f);
+        loud.shutdown();
+    }
+
     // Resampling: a 44.1 kHz source produces ~48/44.1 as many output samples.
     {
         AudioOutput resampled;

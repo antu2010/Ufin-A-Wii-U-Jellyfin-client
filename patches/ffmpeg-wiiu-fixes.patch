@@ -11,10 +11,18 @@ index fe3db8b..60a848f 100755
  --disable-everything \
  --enable-decoder=mpeg4,h264_wiiu,aac,ac3,mp3 \
 diff --git a/libavcodec/h264_wiiu.c b/libavcodec/h264_wiiu.c
-index bd41335..c29d903 100644
+index bd41335..b3d7650 100644
 --- a/libavcodec/h264_wiiu.c
 +++ b/libavcodec/h264_wiiu.c
-@@ -25,6 +25,10 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
+@@ -9,6 +9,7 @@
+ #include "internal.h"
+ 
+ #include <malloc.h>
++#include <coreinit/cache.h>
+ 
+ static void frame_callback(H264DecodeOutput *output) { }
+ 
+@@ -25,6 +26,10 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
      memRequirement = 0x2200000 + 0x3ff + 0x480000;
  
      decoder = malloc(memRequirement);
@@ -25,7 +33,7 @@ index bd41335..c29d903 100644
      res = H264DECInitParam(memRequirement, decoder);
      if (res != 0)
      {
-@@ -62,8 +66,20 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
+@@ -62,8 +67,20 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
  
      ctx->decoder = decoder;
  
@@ -47,7 +55,7 @@ index bd41335..c29d903 100644
  
      ctx->framebuffer = framebuffer;
      ctx->framebuffer_size = framebuf_size;
-@@ -94,8 +110,8 @@ static int h264_wiiu_decode_close(AVCodecContext *avctx)
+@@ -94,8 +111,8 @@ static int h264_wiiu_decode_close(AVCodecContext *avctx)
  static int h264_wiiu_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPacket *avpkt)
  {
      WIIUContext* ctx = avctx->priv_data;
@@ -58,12 +66,18 @@ index bd41335..c29d903 100644
      void* decoder = ctx->decoder;
      void* framebuffer = ctx->framebuffer;
      uint8_t* pointers[2];
-@@ -144,7 +160,7 @@ static int h264_wiiu_decode_frame(AVCodecContext *avctx, void *data, int *got_fr
+@@ -144,7 +161,13 @@ static int h264_wiiu_decode_frame(AVCodecContext *avctx, void *data, int *got_fr
      // Y
      pointers[0] = (uint8_t*) framebuffer;
      // U/V
 -    pointers[1] = ((uint8_t*) framebuffer) + (avctx->height * pitch);
 +    pointers[1] = ((uint8_t*) framebuffer) + (((avctx->height + 15) & ~15) * pitch);
++
++    // The hardware decoder wrote the picture straight to memory; drop any
++    // stale CPU cache lines for the buffer first, or the copy below can
++    // read the previous frame (or older) on a real console. Cemu doesn't
++    // model the cache, so it never shows this.
++    DCInvalidateRange(framebuffer, ctx->framebuffer_size);
  
      av_image_copy(avframe->data, avframe->linesize, (const uint8_t **) pointers, linesize, AV_PIX_FMT_NV12, avctx->width, avctx->height);
  

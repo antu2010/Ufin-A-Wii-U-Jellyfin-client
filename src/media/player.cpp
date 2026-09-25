@@ -1,6 +1,5 @@
 #include "player.h"
 #include "../seek.h"
-#include "../ufin_log.h"
 #include "http_stream_io.h"
 #include "decoder.h"
 #include "video_output.h"
@@ -72,6 +71,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
 
     VideoOutput video;
     if (hasVideo) {
+        if (options.presentVideo) video.setPresenter(options.presentVideo);
         if (!video.init(decoder.videoWidth(), decoder.videoHeight(), options.displayAspect)) {
             last_error_ = "VideoOutput::init failed: " + std::string(video.lastError());
             decoder.close();
@@ -176,6 +176,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
 
     double firstStreamTime = NAN;  // first clock value seen, for itemPositionFromStreamTime
     double pauseStartedAt = NAN;   // wall time the current pause began (video-only clock)
+    double lastPausedRedraw = 0.0;
 
     while (true) {
         PlayerCommand cmd = poll();
@@ -210,7 +211,12 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
         if (!paused_) {
             double clock = masterClock();
             if (!std::isnan(clock)) {
-                if (std::isnan(firstStreamTime)) firstStreamTime = clock;
+                if (std::isnan(firstStreamTime)) {
+                    firstStreamTime = clock;
+                    OSReport("Ufin: first stream timestamp %.2fs (requested start %.1fs) -> playing from %.1fs\n",
+                             clock, options.startOffsetSeconds,
+                             itemPositionFromStreamTime(clock, options.startOffsetSeconds, clock));
+                }
                 last_position_ = itemPositionFromStreamTime(clock, options.startOffsetSeconds, firstStreamTime);
             }
         }
@@ -227,8 +233,20 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
 
         if (paused_) {
             // Hold the current picture; the decode thread fills its
-            // buffers and then stops reading on its own.
-            SDL_Delay(15);
+            // buffers and then stops reading on its own. Keep redrawing
+            // it (with the app's HUD on top, which shows the pause).
+            if (hasVideo && options.presentVideo) {
+                if (now - lastPausedRedraw >= 0.05) {
+                    video.presentLast();
+                    lastPausedRedraw = now;
+                } else {
+                    SDL_Delay(10);
+                }
+            } else if (!hasVideo && options.onIdleFrame) {
+                options.onIdleFrame();
+            } else {
+                SDL_Delay(15);
+            }
             continue;
         }
 
@@ -242,7 +260,8 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
                 result = PlayResult::Completed;
                 break;
             }
-            SDL_Delay(16);
+            if (options.onIdleFrame) options.onIdleFrame(); // draws + waits for vsync
+            else SDL_Delay(16);
             continue;
         }
 

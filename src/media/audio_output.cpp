@@ -38,6 +38,15 @@ bool AudioOutput::init(int sourceSampleRate, int sourceChannels, AVSampleFormat 
     // FFmpeg 4.3, which predates AVChannelLayout. If a future
     // FFmpeg-wiiu update changes this, this call is the first thing to
     // fix.
+    if (!setSourceFormat(sourceSampleRate, sourceChannels, sourceFormat)) return false;
+
+    started_ = false;
+    clock_valid_ = false;
+    return true;
+}
+
+bool AudioOutput::setSourceFormat(int sourceSampleRate, int sourceChannels, AVSampleFormat sourceFormat) {
+    if (swr_ctx_) swr_free(&swr_ctx_);
     int64_t inLayout = av_get_default_channel_layout(sourceChannels);
     int64_t outLayout = av_get_default_channel_layout(out_channels_);
 
@@ -47,12 +56,13 @@ bool AudioOutput::init(int sourceSampleRate, int sourceChannels, AVSampleFormat 
         0, nullptr);
 
     if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
+        if (swr_ctx_) swr_free(&swr_ctx_);
         snprintf(last_error_, sizeof(last_error_), "swr_init failed");
         return false;
     }
-
-    started_ = false;
-    clock_valid_ = false;
+    src_rate_ = sourceSampleRate;
+    src_channels_ = sourceChannels;
+    src_format_ = sourceFormat;
     return true;
 }
 
@@ -108,6 +118,12 @@ void AudioOutput::queueFrame(AVFrame* frame, double ptsSeconds) {
     if (convertedSamples <= 0) return;
 
     int bytesPerSample = out_channels_ * (int)sizeof(int16_t);
+    if (volume_ < 1.0f) {
+        int16_t* samples = (int16_t*)convert_buffer_;
+        const int count = convertedSamples * out_channels_;
+        const int gain = (int)(volume_ * 65536.0f);
+        for (int i = 0; i < count; i++) samples[i] = (int16_t)(((int32_t)samples[i] * gain) >> 16);
+    }
     SDL_QueueAudio(device_, convert_buffer_, convertedSamples * bytesPerSample);
 
     if (std::isnan(ptsSeconds)) return;

@@ -25,6 +25,9 @@ HttpResponse http_post(const std::string& host, int port, const std::string& pat
                         const std::string& body, const std::string& content_type,
                         const std::string& extra_headers = "");
 
+HttpResponse http_delete(const std::string& host, int port, const std::string& path,
+                          const std::string& extra_headers = "");
+
 // A connection opened for streaming a large response body (e.g. a movie
 // or track) instead of buffering it all into memory like http_get does.
 // After a successful http_open_stream(), `sock` is a live, connected

@@ -30,18 +30,31 @@ add_executable(ufin
     src/http_stream_reader.cpp
     src/jellyfin_client.cpp
     src/item_labels.cpp
+    src/image_cache.cpp
+    src/input.cpp
     src/vendor/cJSON.c
     src/media/http_stream_io.cpp
     src/media/decoder.cpp
     src/media/video_output.cpp
     src/media/audio_output.cpp
     src/media/player.cpp
-    src/ui/screens.cpp
-    src/ui/os_screen_display.cpp
+    src/media/menu_music.cpp
+    src/ui/app_ui.cpp
+    src/ui/format.cpp
+    src/ui/gfx.cpp
+    src/ui/gpu_image.cpp
     src/ui/keyboard.cpp
+    src/vendor/imgui/imgui.cpp
+    src/vendor/imgui/imgui_draw.cpp
+    src/vendor/imgui/imgui_tables.cpp
+    src/vendor/imgui/imgui_widgets.cpp
+    src/vendor/imgui/backends/imgui_impl_gx2.cpp
 )
 
-target_include_directories(ufin PRIVATE src src/vendor)
+target_include_directories(ufin PRIVATE src src/vendor src/vendor/imgui)
+# ImGui's default "open URL in shell" helper uses fork/execvp/waitpid,
+# which the Wii U doesn't have (link error). Ufin never uses it.
+target_compile_definitions(ufin PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 
 # Compile our GLSL shaders (src/media/shaders/nv12_video.{vert,frag}) into
 # a .gsh binary via glslcompiler.elf (from Exzap/CafeGLSL -- a Mesa-based

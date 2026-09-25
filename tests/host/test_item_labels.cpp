@@ -59,8 +59,58 @@ int main() {
     CHECK_STR(itemTag(make("Series")), "Series");
     CHECK(!isPlayableItem(make("Series")));
     CHECK_STR(itemTag(make("MusicAlbum")), "Album");
+    CHECK(isShufflableContainer(make("MusicAlbum")));
+    CHECK(isShufflableContainer(make("Playlist")));
+    CHECK(!isShufflableContainer(make("Series")));
     CHECK_STR(itemTag(make("BoxSet")), "Collection");
     CHECK_STR(itemTag(make("Something")), "Something");
+
+    CHECK(itemIcon(movie) == ui::Icon::Movie);
+    CHECK(itemIcon(ch) == ui::Icon::Channel);
+    CHECK(itemIcon(lib) == ui::Icon::Movie); // a movies library
+    CHECK(itemIcon(live) == ui::Icon::LiveTv);
+    CHECK(itemIcon(make("MusicAlbum")) == ui::Icon::Album);
+    CHECK(itemIcon(make("Folder")) == ui::Icon::Folder);
+
+    // Home rows.
+    JellyfinItem row = makeHomeRow(HOME_RESUME, 3);
+    CHECK(isHomeRow(row));
+    CHECK_STR(row.name, "Continue watching");
+    CHECK_STR(itemTag(row), "3");
+    CHECK(itemIcon(row) == ui::Icon::Resume);
+    CHECK(!isPlayableItem(row));
+    CHECK(itemIcon(makeHomeRow(HOME_FAVORITES, 1)) == ui::Icon::Heart);
+    CHECK_STR(makeHomeRow(HOME_NEXT_UP, 0).name, "Next up");
+    CHECK(!isHomeRow(movie));
+
+    // Resume detail + user state on list rows.
+    JellyfinItem part = make("Movie");
+    part.runTimeTicks = 6000LL * 10000000LL;
+    part.positionTicks = 754LL * 10000000LL; // 12:34
+    part.favorite = true;
+    CHECK(itemDetail(part).find("Resume at 12:34") == 0);
+    ui::ListEntry le;
+    applyUserState(part, le);
+    CHECK(le.favorite);
+    CHECK(!le.watched);
+    CHECK(le.progress > 0.12f && le.progress < 0.13f);
+    part.played = true;
+    ui::ListEntry le2;
+    applyUserState(part, le2);
+    CHECK(le2.watched);
+    CHECK(le2.progress == 0.0f);
+    CHECK(itemDetail(part).find("Resume") == std::string::npos); // watched: no resume line
+    JellyfinItem show = make("Series");
+    show.unplayedCount = 5;
+    ui::ListEntry le3;
+    applyUserState(show, le3);
+    CHECK_EQ(le3.unplayed, 5);
+    CHECK(!le3.watched);
+    show.unplayedCount = 0;
+    show.played = true;
+    ui::ListEntry le4;
+    applyUserState(show, le4);
+    CHECK(le4.watched);
 
     return check::finish("test_item_labels");
 }

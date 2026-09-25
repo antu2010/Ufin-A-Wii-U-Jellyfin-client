@@ -34,6 +34,15 @@ public:
     // audio doesn't run ahead while video is still spinning up).
     bool init(int sourceSampleRate, int sourceChannels, AVSampleFormat sourceFormat);
 
+    // Changes only the source format the resampler expects (no SDL/AX
+    // calls, so safe from a worker thread): for the menu music, whose
+    // device is opened on the main thread before the stream's format is
+    // known. Call before queueing frames of the new format.
+    bool setSourceFormat(int sourceSampleRate, int sourceChannels, AVSampleFormat sourceFormat);
+    bool matchesSource(int rate, int channels, AVSampleFormat fmt) const {
+        return rate == src_rate_ && channels == src_channels_ && fmt == src_format_;
+    }
+
     // Converts one decoded frame and queues the result for playback.
     // ptsSeconds is the frame's stream time (Decoder::frameTimeSeconds),
     // or NAN if unknown; it drives clockSeconds(). Safe to call from a
@@ -47,6 +56,9 @@ public:
     // video holds its frame) and SDL stops consuming, which in turn
     // stops the decode thread once it's far enough ahead.
     void setPaused(bool paused);
+
+    // Output gain, 0..1 (menu music plays quieter than real playback).
+    void setVolume(float volume) { volume_ = volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume); }
     bool paused() const;
 
     // How much queued audio SDL hasn't played yet -- in bytes at the
@@ -86,6 +98,10 @@ private:
     mutable std::mutex clock_mtx_;
     bool clock_valid_ = false;
     bool paused_ = false;
+    float volume_ = 1.0f;
+    int src_rate_ = 0;
+    int src_channels_ = 0;
+    AVSampleFormat src_format_ = AV_SAMPLE_FMT_NONE;
     double clock_pts_ = 0.0;
     uint32_t clock_wall_ms_ = 0;
 

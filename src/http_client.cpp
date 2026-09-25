@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <cstring>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -35,6 +36,10 @@ static bool resolve_host(const std::string& host, struct in_addr* out) {
     if (inet_pton(AF_INET, host.c_str(), out) == 1) {
         return true;
     }
+    // gethostbyname returns a shared static buffer; requests run on
+    // several threads (UI, image loader, progress reports), so serialise.
+    static std::mutex resolveMutex;
+    std::lock_guard<std::mutex> lock(resolveMutex);
     struct hostent* he = gethostbyname(host.c_str());
     if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
         return false;
@@ -196,6 +201,21 @@ HttpResponse http_post(const std::string& host, int port, const std::string& pat
         path.c_str(), host.c_str(), content_type.c_str(), body.size(), extra_headers.c_str());
     std::string request = std::string(header) + body;
     return do_request(host, port, request);
+}
+
+HttpResponse http_delete(const std::string& host, int port, const std::string& path,
+                          const std::string& extra_headers) {
+    char header[4096];
+    snprintf(header, sizeof(header),
+        "DELETE %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Length: 0\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n"
+        "%s"
+        "\r\n",
+        path.c_str(), host.c_str(), extra_headers.c_str());
+    return do_request(host, port, header);
 }
 
 bool http_open_stream(const std::string& host, int port, const std::string& path,

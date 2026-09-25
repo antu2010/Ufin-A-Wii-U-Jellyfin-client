@@ -11,6 +11,7 @@
 
 #pragma once
 #include <string>
+#include <cstdint>
 #include <functional>
 
 enum class PlayResult {
@@ -45,6 +46,17 @@ struct PlayOptions {
     // StartTimeTicks. Makes positionSeconds()/onTick report positions in
     // the item rather than in the stream.
     double startOffsetSeconds = 0.0;
+
+    // Draws each video frame as part of an app frame (see VideoPresenter
+    // in video_output.h) so the app can put its HUD on top. Unset = bare
+    // frames.
+    std::function<void(const std::function<void(uint32_t, uint32_t)>&)> presentVideo;
+
+    // Called about once per display frame whenever no video frame is
+    // being shown -- audio-only playback -- so the app can draw its own
+    // screen (Now Playing). Should render one frame; it's the loop's
+    // pacing then (the frame waits for vsync).
+    std::function<void()> onIdleFrame;
 };
 
 class Player {

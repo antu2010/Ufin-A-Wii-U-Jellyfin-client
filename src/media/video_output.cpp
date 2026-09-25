@@ -10,9 +10,9 @@
 #include <coreinit/debug.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/memory.h>
-#include <gx2/display.h>
 #include <gx2/draw.h>
 #include <gx2/mem.h>
+#include <gx2/swap.h>
 #include <gx2/registers.h>
 #include <gx2/shaders.h>
 #include <gx2/utils.h>
@@ -21,30 +21,6 @@
 static const uint32_t QUAD_VERTEX_COUNT = 4;
 static const uint32_t QUAD_VERTEX_STRIDE = sizeof(float) * 4; // x, y, u, v
 static const uint32_t QUAD_BYTES = QUAD_VERTEX_COUNT * QUAD_VERTEX_STRIDE;
-
-static bool s_gx2ContextReady = false;
-
-bool VideoOutput::initGX2Context() {
-    if (s_gx2ContextReady) return true;
-    if (!WHBGfxInit()) {
-        OSReport("Ufin: WHBGfxInit failed\n");
-        return false;
-    }
-    // Kept hidden until a VideoOutput session's init() below turns it on
-    // -- OSScreen is what should be visible right after this call, since
-    // it runs before OSScreenDisplay::init() at app start.
-    GX2SetTVEnable(FALSE);
-    GX2SetDRCEnable(FALSE);
-    s_gx2ContextReady = true;
-    OSReport("Ufin: GX2 context initialised (persistent for app lifetime)\n");
-    return true;
-}
-
-void VideoOutput::shutdownGX2Context() {
-    if (!s_gx2ContextReady) return;
-    WHBGfxShutdown();
-    s_gx2ContextReady = false;
-}
 
 VideoOutput::VideoOutput() {}
 
@@ -186,6 +162,7 @@ void VideoOutput::fillPlane(Plane& plane, int index, uint8_t byte0, uint8_t byte
     // memset only goes through the CPU cache; make sure the GPU sees it.
     DCFlushRange(dst, surf.imageSize);
     GX2RUnlockSurfaceEx(&surf, 0, GX2R_RESOURCE_BIND_NONE);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
 }
 
 void VideoOutput::uploadPlane(Plane& plane, int index, const uint8_t* src, int srcLinesize,
@@ -215,6 +192,12 @@ void VideoOutput::uploadPlane(Plane& plane, int index, const uint8_t* src, int s
     }
 
     GX2RUnlockSurfaceEx(&surf, 0, GX2R_RESOURCE_BIND_NONE);
+
+    // Belt and braces for real hardware (Cemu doesn't model caches, so
+    // it never shows this class of bug): make sure the GPU's texture
+    // cache drops whatever it held for this surface, or it can keep
+    // sampling an old frame.
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
 }
 
 void* VideoOutput::buildQuad(uint32_t targetWidth, uint32_t targetHeight, double displayAspect) {
@@ -258,32 +241,14 @@ bool VideoOutput::init(int width, int height, double displayAspect) {
         return false;
     }
 
-    if (!s_gx2ContextReady) {
-        // Programmer error, not a runtime condition -- initGX2Context()
-        // must have already been called once near the top of main().
-        snprintf(last_error_, sizeof(last_error_), "GX2 context not initialised");
-        OSReport("Ufin: VideoOutput::init called before initGX2Context()\n");
-        return false;
-    }
-
-    // The context itself is already up (see initGX2Context()); just turn
-    // its output back on for this session.
-    GX2SetTVEnable(TRUE);
-    GX2SetDRCEnable(TRUE);
-
-    // What WHBGfx actually created for each screen -- depends on the
-    // TV's scan mode (480p/720p/1080p) and aspect setting.
+    // GX2 is already up: ui::Gfx owns it for the whole run.
     GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
-    GX2ColorBuffer* drc = WHBGfxGetDRCColourBuffer();
     tv_width_ = tv ? tv->surface.width : 1280;
     tv_height_ = tv ? tv->surface.height : 720;
-    drc_width_ = drc ? drc->surface.width : 854;
-    drc_height_ = drc ? drc->surface.height : 480;
-    OSReport("Ufin: render targets -- TV %ux%u, DRC %ux%u\n", tv_width_, tv_height_, drc_width_,
-             drc_height_);
+    OSReport("Ufin: render target -- TV %ux%u (GamePad shows a scaled copy)\n", tv_width_, tv_height_);
 
     if (!loadShader()) return false;
-    gfx_initialized_ = true; // shader_ now needs WHBGfxFreeShaderGroup() in shutdown()
+    shader_loaded_ = true;
 
     // Single-channel textures: put the one channel in R and hard-wire
     // G/B to 0 and A to 1 (the shader reads .r / .rg only).
@@ -294,14 +259,14 @@ bool VideoOutput::init(int width, int height, double displayAspect) {
     if (!createPlane(uv_plane_, GX2_SURFACE_FORMAT_UNORM_R8_G8, compMapRG8, width_ / 2, height_ / 2, "UV")) return false;
 
     tv_quad_ = buildQuad(tv_width_, tv_height_, displayAspect);
-    drc_quad_ = buildQuad(drc_width_, drc_height_, displayAspect);
-    if (!tv_quad_ || !drc_quad_) {
+    if (!tv_quad_) {
         snprintf(last_error_, sizeof(last_error_), "quad vertex buffer allocation failed");
         OSReport("Ufin: quad buffer alloc failed\n");
         return false;
     }
 
     write_index_ = 0;
+    last_presented_ = -1;
     unsupported_format_logged_ = 0;
 
     OSReport("Ufin: VideoOutput::init complete\n");
@@ -341,27 +306,29 @@ void VideoOutput::drawQuad(int readIndex, const void* quad, uint32_t targetWidth
 }
 
 void VideoOutput::present(int readIndex) {
-    // Standard WHBGfx frame: wait for the previous swap, draw each
-    // target into its colour buffer, copy to the scan buffers, swap.
-    // WHBGfxClearColor also (re)binds the target's context state; the
-    // clear is what paints the letterbox bars black.
+    last_presented_ = readIndex;
+    if (presenter_) {
+        // Normal path: the app draws a whole frame (HUD included) with
+        // this picture underneath. Its WHBGfxFinishRender includes
+        // GX2DrawDone(), so by the time this returns the GPU is done
+        // reading this frame's textures -- which is what makes it safe
+        // to overwrite the *other* buffer next frame.
+        presenter_([this, readIndex](uint32_t w, uint32_t h) { drawQuad(readIndex, tv_quad_, w, h); });
+        return;
+    }
+    // Bare frame (ZR test picture): TV, then the same picture copied to
+    // the GamePad.
     WHBGfxBeginRender();
-
     WHBGfxBeginRenderTV();
     WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     drawQuad(readIndex, tv_quad_, tv_width_, tv_height_);
     WHBGfxFinishRenderTV();
-
-    WHBGfxBeginRenderDRC();
-    WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    drawQuad(readIndex, drc_quad_, drc_width_, drc_height_);
-    WHBGfxFinishRenderDRC();
-
-    // Includes GX2DrawDone(), so by the time this returns the GPU is
-    // finished reading this frame's textures -- which is what makes it
-    // safe to overwrite the *other* buffer next frame without any
-    // further synchronisation.
+    GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_DRC);
     WHBGfxFinishRender();
+}
+
+void VideoOutput::presentLast() {
+    if (last_presented_ >= 0 && y_plane_.valid && uv_plane_.valid) present(last_presented_);
 }
 
 void VideoOutput::renderTestPattern() {
@@ -407,16 +374,9 @@ void VideoOutput::shutdown() {
     destroyPlane(y_plane_);
     destroyPlane(uv_plane_);
     if (tv_quad_) { MEMFreeToDefaultHeap(tv_quad_); tv_quad_ = nullptr; }
-    if (drc_quad_) { MEMFreeToDefaultHeap(drc_quad_); drc_quad_ = nullptr; }
-    if (gfx_initialized_) {
+    if (shader_loaded_) {
+        // Only the shader is ours; GX2 stays up (ui::Gfx owns it).
         WHBGfxFreeShaderGroup(&shader_);
-        gfx_initialized_ = false;
-    }
-    // Hide output again (context itself stays alive for the whole app --
-    // see initGX2Context()/shutdownGX2Context()) so OSScreen can safely
-    // come back via OSScreenDisplay::show().
-    if (s_gx2ContextReady) {
-        GX2SetTVEnable(FALSE);
-        GX2SetDRCEnable(FALSE);
+        shader_loaded_ = false;
     }
 }

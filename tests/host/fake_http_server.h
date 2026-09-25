@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -65,6 +66,14 @@ public:
 
     int port() const { return port_; }
 
+    // Called for requests no static route matches (outside the lock, so
+    // it may be slow -- e.g. run ffmpeg). Return true and fill `out` to
+    // answer; false for a 404.
+    void setHandler(std::function<bool(const FakeRequest&, FakeRoute&)> h) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        handler_ = std::move(h);
+    }
+
     void addRoute(const std::string& path, const FakeRoute& route) {
         std::lock_guard<std::mutex> lock(mtx_);
         routes_[path] = route;
@@ -82,6 +91,7 @@ private:
     std::thread thread_;
     std::mutex mtx_;
     std::map<std::string, FakeRoute> routes_;
+    std::function<bool(const FakeRequest&, FakeRoute&)> handler_;
     std::vector<FakeRequest> requests_;
 
     static bool sendAll(int fd, const char* data, size_t len) {
@@ -148,6 +158,14 @@ private:
                 route = it->second;
                 found = true;
             }
+        }
+        if (!found) {
+            std::function<bool(const FakeRequest&, FakeRoute&)> h;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                h = handler_;
+            }
+            if (h) found = h(req, route);
         }
         if (!found) {
             route.status = 404;

@@ -46,3 +46,11 @@ void fake_sdl_advance_ticks(Uint32 ms);
 void fake_sdl_consume_audio(Uint32 bytes);
 bool fake_sdl_device_paused();
 Uint32 fake_sdl_total_queued();
+const unsigned char* fake_sdl_last_queued(Uint32* len); // bytes of the last SDL_QueueAudio
+#ifdef __cplusplus
+#include <thread>
+std::thread::id fake_sdl_open_thread();  // thread that last opened a device
+std::thread::id fake_sdl_close_thread(); // thread that last closed one
+int fake_sdl_open_devices();             // currently open
+void fake_sdl_set_realtime(bool on);     // wall-clock ticks, real sleeps, device drains in real time
+#endif

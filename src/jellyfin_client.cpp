@@ -21,8 +21,8 @@ std::string JellyfinClient::authHeader() const {
     // ignores X-Emby-Authorization, and then rejects the login with a 400
     // because no client/device info arrived. The Authorization form has
     // been accepted since Jellyfin 10.8.
-    std::string h = "Authorization: MediaBrowser Client=\"Ufin\", "
-                    "Device=\"WiiU\", DeviceId=\"wiiu-ufin-001\", Version=\"0.1.0\"";
+    std::string h = "Authorization: MediaBrowser Client=\"Ufin\", Device=\"Wii U\", DeviceId=\"" +
+                    (device_id_.empty() ? std::string("wiiu-ufin-001") : device_id_) + "\", Version=\"0.1.0\"";
     if (!token_.empty()) {
         h += ", Token=\"" + token_ + "\"";
     }
@@ -75,7 +75,11 @@ bool JellyfinClient::authenticate(const std::string& username, const std::string
         return false;
     }
 
-    cJSON* json = cJSON_Parse(resp.body.c_str());
+    return takeAuthResult(resp.body);
+}
+
+bool JellyfinClient::takeAuthResult(const std::string& body) {
+    cJSON* json = cJSON_Parse(body.c_str());
     if (!json) {
         last_error_ = "could not parse auth response JSON";
         return false;
@@ -93,8 +97,100 @@ bool JellyfinClient::authenticate(const std::string& username, const std::string
 
     token_ = access_token->valuestring;
     user_id_ = user_id->valuestring;
+    user_name_ = jsonString(user, "Name");
     cJSON_Delete(json);
     return true;
+}
+
+void JellyfinClient::useSavedLogin(const std::string& userId, const std::string& token) {
+    user_id_ = userId;
+    token_ = token;
+}
+
+bool JellyfinClient::validateLogin() {
+    if (token_.empty()) {
+        last_error_ = "not signed in";
+        return false;
+    }
+    HttpResponse resp = http_get(host_, port_, "/Users/Me", authHeader());
+    if (!resp.success) {
+        last_error_ = resp.status_code == 401 ? "the saved sign-in has expired"
+                                              : "could not check the saved sign-in (status " +
+                                                    std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (json) {
+        std::string id = jsonString(json, "Id");
+        if (!id.empty()) user_id_ = id;
+        user_name_ = jsonString(json, "Name");
+        cJSON_Delete(json);
+    }
+    return true;
+}
+
+void JellyfinClient::signOut() {
+    if (!token_.empty()) http_post(host_, port_, "/Sessions/Logout", "", "application/json", authHeader());
+    token_.clear();
+    user_id_.clear();
+    user_name_.clear();
+}
+
+bool JellyfinClient::quickConnectStart(QuickConnectRequest& out) {
+    token_.clear(); // Initiate must come from a not-yet-signed-in device
+    HttpResponse resp = http_post(host_, port_, "/QuickConnect/Initiate", "", "application/json", authHeader());
+    if (!resp.success) {
+        last_error_ = resp.status_code == 401 ? "Quick Connect is turned off on this server "
+                                                "(Dashboard -> General -> Enable Quick Connect)"
+                                              : "could not start Quick Connect (status " +
+                                                    std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        last_error_ = "could not parse Quick Connect response";
+        return false;
+    }
+    out.secret = jsonString(json, "Secret");
+    out.code = jsonString(json, "Code");
+    cJSON_Delete(json);
+    if (out.secret.empty() || out.code.empty()) {
+        last_error_ = "Quick Connect response had no code";
+        return false;
+    }
+    return true;
+}
+
+bool JellyfinClient::quickConnectApproved(const std::string& secret) {
+    last_error_.clear();
+    HttpResponse resp = http_get(host_, port_, "/QuickConnect/Connect?secret=" + urlEncode(secret), authHeader());
+    if (!resp.success) {
+        last_error_ = resp.status_code == 404 ? "the Quick Connect code expired -- start again"
+                                              : "Quick Connect check failed (status " +
+                                                    std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) return false;
+    cJSON* authed = cJSON_GetObjectItem(json, "Authenticated");
+    bool ok = cJSON_IsTrue(authed);
+    cJSON_Delete(json);
+    return ok;
+}
+
+bool JellyfinClient::quickConnectFinish(const std::string& secret) {
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "Secret", secret.c_str());
+    char* bodyStr = cJSON_PrintUnformatted(body);
+    HttpResponse resp = http_post(host_, port_, "/Users/AuthenticateWithQuickConnect", bodyStr, "application/json",
+                                  authHeader());
+    free(bodyStr);
+    cJSON_Delete(body);
+    if (!resp.success) {
+        last_error_ = "Quick Connect sign-in failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    return takeAuthResult(resp.body);
 }
 
 static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
@@ -116,6 +212,33 @@ static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
         cJSON* program = cJSON_GetObjectItem(item, "CurrentProgram");
         if (cJSON_IsObject(program)) ji.currentProgram = jsonString(program, "Name");
         ji.seriesName = jsonString(item, "SeriesName");
+        ji.seriesId = jsonString(item, "SeriesId");
+        ji.childCount = jsonInt(item, "ChildCount", -1);
+        cJSON* userData = cJSON_GetObjectItem(item, "UserData");
+        if (cJSON_IsObject(userData)) {
+            cJSON* pos = cJSON_GetObjectItem(userData, "PlaybackPositionTicks");
+            if (cJSON_IsNumber(pos)) ji.positionTicks = (int64_t)pos->valuedouble;
+            ji.played = cJSON_IsTrue(cJSON_GetObjectItem(userData, "Played"));
+            ji.favorite = cJSON_IsTrue(cJSON_GetObjectItem(userData, "IsFavorite"));
+            cJSON* pct = cJSON_GetObjectItem(userData, "PlayedPercentage");
+            if (cJSON_IsNumber(pct)) ji.playedPercentage = pct->valuedouble;
+            ji.unplayedCount = jsonInt(userData, "UnplayedItemCount", -1);
+        }
+
+        // Artwork: own Primary image first, then the album's (songs),
+        // then the series' (episodes / seasons).
+        cJSON* imageTags = cJSON_GetObjectItem(item, "ImageTags");
+        std::string ownTag = cJSON_IsObject(imageTags) ? jsonString(imageTags, "Primary") : std::string();
+        if (!ownTag.empty()) {
+            ji.imageItemId = ji.id;
+            ji.imageTag = ownTag;
+        } else if (!jsonString(item, "AlbumPrimaryImageTag").empty() && !jsonString(item, "AlbumId").empty()) {
+            ji.imageItemId = jsonString(item, "AlbumId");
+            ji.imageTag = jsonString(item, "AlbumPrimaryImageTag");
+        } else if (!jsonString(item, "SeriesPrimaryImageTag").empty() && !jsonString(item, "SeriesId").empty()) {
+            ji.imageItemId = jsonString(item, "SeriesId");
+            ji.imageTag = jsonString(item, "SeriesPrimaryImageTag");
+        }
         out.push_back(ji);
     }
 }
@@ -139,7 +262,10 @@ bool JellyfinClient::getViews(std::vector<JellyfinItem>& out) {
 
 bool JellyfinClient::getItems(const std::string& parentId, std::vector<JellyfinItem>& out) {
     std::string path = "/Users/" + user_id_ + "/Items?ParentId=" + parentId +
-                        "&SortBy=SortName&SortOrder=Ascending";
+                        "&SortBy=ParentIndexNumber,IndexNumber,SortName&SortOrder=Ascending";
+    // Disc, then track/episode number, then name: albums play in track
+    // order and seasons in episode order; items without numbers (movies,
+    // folders) fall through to plain name order.
     HttpResponse resp = http_get(host_, port_, path, authHeader());
     if (!resp.success) {
         last_error_ = "getItems failed (status " + std::to_string(resp.status_code) + ")";
@@ -157,7 +283,7 @@ bool JellyfinClient::getItems(const std::string& parentId, std::vector<JellyfinI
 
 bool JellyfinClient::getLiveTvChannels(std::vector<JellyfinItem>& out) {
     std::string path = "/LiveTv/Channels?UserId=" + user_id_ +
-                       "&AddCurrentProgram=true&EnableImages=false&EnableUserData=false";
+                       "&AddCurrentProgram=true&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=false";
     HttpResponse resp = http_get(host_, port_, path, authHeader());
     if (!resp.success) {
         last_error_ = "getLiveTvChannels failed (status " + std::to_string(resp.status_code) + ")";
@@ -175,7 +301,7 @@ bool JellyfinClient::getLiveTvChannels(std::vector<JellyfinItem>& out) {
 
 bool JellyfinClient::search(const std::string& term, std::vector<JellyfinItem>& out) {
     std::string path = "/Users/" + user_id_ + "/Items?SearchTerm=" + urlEncode(term) +
-                       "&Recursive=true&Limit=100&EnableImages=false&EnableUserData=false"
+                       "&Recursive=true&Limit=100&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=true"
                        "&IncludeItemTypes=Movie,Series,Episode,MusicAlbum,MusicArtist,Audio,BoxSet,Video";
     HttpResponse resp = http_get(host_, port_, path, authHeader());
     if (!resp.success) {
@@ -190,6 +316,78 @@ bool JellyfinClient::search(const std::string& term, std::vector<JellyfinItem>& 
     parseItemsArray(cJSON_GetObjectItem(json, "Items"), out);
     cJSON_Delete(json);
     return true;
+}
+
+// GET a list endpoint and parse its Items. `legacyPath`, if given, is
+// tried when the server doesn't know `path` (Jellyfin before 10.9).
+static bool getItemList(const std::string& host, int port, const std::string& auth, const std::string& path,
+                        const std::string& legacyPath, std::vector<JellyfinItem>& out, std::string& err,
+                        const char* what) {
+    HttpResponse resp = http_get(host, port, path, auth);
+    if (!resp.success && resp.status_code == 404 && !legacyPath.empty()) resp = http_get(host, port, legacyPath, auth);
+    if (!resp.success) {
+        err = std::string(what) + " failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        err = std::string("could not parse ") + what + " JSON";
+        return false;
+    }
+    // Most endpoints wrap the list in {"Items": [...]}; a few return a bare array.
+    cJSON* items = cJSON_IsArray(json) ? json : cJSON_GetObjectItem(json, "Items");
+    parseItemsArray(items, out);
+    cJSON_Delete(json);
+    return true;
+}
+
+static const char* LIST_FIELDS = "&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=true";
+
+bool JellyfinClient::getResume(std::vector<JellyfinItem>& out) {
+    return getItemList(host_, port_, authHeader(),
+                       "/UserItems/Resume?userId=" + user_id_ + "&Limit=24&MediaTypes=Video" + LIST_FIELDS,
+                       "/Users/" + user_id_ + "/Items/Resume?Limit=24&MediaTypes=Video" + LIST_FIELDS, out,
+                       last_error_, "Continue watching");
+}
+
+bool JellyfinClient::getNextUp(std::vector<JellyfinItem>& out) {
+    return getItemList(host_, port_, authHeader(), "/Shows/NextUp?userId=" + user_id_ + "&Limit=24" + LIST_FIELDS, "",
+                       out, last_error_, "Next up");
+}
+
+bool JellyfinClient::getFavorites(std::vector<JellyfinItem>& out) {
+    return getItemList(host_, port_, authHeader(),
+                       "/Users/" + user_id_ + "/Items?Filters=IsFavorite&Recursive=true&SortBy=SortName"
+                       "&IncludeItemTypes=Movie,Series,Episode,MusicAlbum,Audio,BoxSet,Video,TvChannel" + LIST_FIELDS,
+                       "", out, last_error_, "Favourites");
+}
+
+bool JellyfinClient::getEpisodes(const std::string& seriesId, std::vector<JellyfinItem>& out) {
+    return getItemList(host_, port_, authHeader(),
+                       "/Shows/" + seriesId + "/Episodes?userId=" + user_id_ + LIST_FIELDS, "", out, last_error_,
+                       "Episodes");
+}
+
+// POST (on) or DELETE (off) a per-user flag, new route first, then the
+// pre-10.9 one.
+static bool setUserFlag(const std::string& host, int port, const std::string& auth, bool on,
+                        const std::string& path, const std::string& legacyPath, std::string& err, const char* what) {
+    HttpResponse resp = on ? http_post(host, port, path, "", "application/json", auth) : http_delete(host, port, path, auth);
+    if (!resp.success && resp.status_code == 404) {
+        resp = on ? http_post(host, port, legacyPath, "", "application/json", auth) : http_delete(host, port, legacyPath, auth);
+    }
+    if (!resp.success) err = std::string(what) + " failed (status " + std::to_string(resp.status_code) + ")";
+    return resp.success;
+}
+
+bool JellyfinClient::setFavorite(const std::string& itemId, bool favorite) {
+    return setUserFlag(host_, port_, authHeader(), favorite, "/UserFavoriteItems/" + itemId + "?userId=" + user_id_,
+                       "/Users/" + user_id_ + "/FavoriteItems/" + itemId, last_error_, "Favourite");
+}
+
+bool JellyfinClient::setPlayed(const std::string& itemId, bool played) {
+    return setUserFlag(host_, port_, authHeader(), played, "/UserPlayedItems/" + itemId + "?userId=" + user_id_,
+                       "/Users/" + user_id_ + "/PlayedItems/" + itemId, last_error_, "Watched");
 }
 
 // Jellyfin reports aspect ratios as strings like "16:9" or "2.35:1".
@@ -223,6 +421,27 @@ static void parseVideoStream(cJSON* mediaStreams, VideoInfo& out) {
     }
 }
 
+// Audio and subtitle tracks from a MediaStreams array.
+static void parseTracks(cJSON* mediaStreams, VideoInfo& out) {
+    out.audioTracks.clear();
+    out.subtitleTracks.clear();
+    if (!cJSON_IsArray(mediaStreams)) return;
+    cJSON* s;
+    cJSON_ArrayForEach(s, mediaStreams) {
+        std::string type = jsonString(s, "Type");
+        if (type != "Audio" && type != "Subtitle") continue;
+        MediaTrack t;
+        t.index = jsonInt(s, "Index", -1);
+        t.language = jsonString(s, "Language");
+        t.title = jsonString(s, "DisplayTitle");
+        if (t.title.empty()) t.title = jsonString(s, "Title");
+        if (t.title.empty()) t.title = t.language.empty() ? type + " " + std::to_string(t.index) : t.language;
+        t.isDefault = cJSON_IsTrue(cJSON_GetObjectItem(s, "IsDefault"));
+        if (t.index < 0) continue;
+        (type == "Audio" ? out.audioTracks : out.subtitleTracks).push_back(t);
+    }
+}
+
 bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
     out = VideoInfo{};
 
@@ -250,6 +469,7 @@ bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
     if (cJSON_IsNumber(h) && h->valueint > 0) out.height = h->valueint;
 
     parseVideoStream(cJSON_GetObjectItem(json, "MediaStreams"), out);
+    parseTracks(cJSON_GetObjectItem(json, "MediaStreams"), out);
     cJSON* sources = cJSON_GetObjectItem(json, "MediaSources");
     if (cJSON_IsArray(sources) && cJSON_GetArraySize(sources) > 0) {
         cJSON* first = cJSON_GetArrayItem(sources, 0);
@@ -257,6 +477,15 @@ bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
         if (out.displayAspect <= 0.0) {
             parseVideoStream(cJSON_GetObjectItem(first, "MediaStreams"), out);
         }
+        // The media source's own list is authoritative when present.
+        cJSON* ms = cJSON_GetObjectItem(first, "MediaStreams");
+        if (cJSON_IsArray(ms) && cJSON_GetArraySize(ms) > 0) parseTracks(ms, out);
+        out.defaultAudioIndex = jsonInt(first, "DefaultAudioStreamIndex", -1);
+        out.defaultSubtitleIndex = jsonInt(first, "DefaultSubtitleStreamIndex", -1);
+    }
+    if (out.defaultAudioIndex < 0) {
+        for (const MediaTrack& t : out.audioTracks) if (t.isDefault) { out.defaultAudioIndex = t.index; break; }
+        if (out.defaultAudioIndex < 0 && !out.audioTracks.empty()) out.defaultAudioIndex = out.audioTracks[0].index;
     }
 
     if (out.displayAspect <= 0.0 && out.width > 0 && out.height > 0) {
@@ -333,7 +562,8 @@ bool JellyfinClient::closeLiveStream(const std::string& liveStreamId) {
     return resp.success;
 }
 
-StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks) const {
+StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks,
+                                                 const std::string& playSessionId) const {
     StreamTarget target;
     target.host = host_;
     target.port = port_;
@@ -351,6 +581,7 @@ StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId, int6
         itemId.c_str(), token_.c_str());
     target.path = pathBuf;
     if (startTimeTicks > 0) target.path += "&StartTimeTicks=" + std::to_string((long long)startTimeTicks);
+    if (!playSessionId.empty()) target.path += "&PlaySessionId=" + urlEncode(playSessionId);
     return target;
 }
 
@@ -427,7 +658,31 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     if (options.startTimeTicks > 0) {
         target.path += "&StartTimeTicks=" + std::to_string((long long)options.startTimeTicks);
     }
+    if (options.audioStreamIndex >= 0) {
+        target.path += "&AudioStreamIndex=" + std::to_string(options.audioStreamIndex);
+    }
+    if (options.subtitleStreamIndex >= 0) {
+        // Burned into the picture: the Wii U decoder has no subtitle track.
+        target.path += "&SubtitleStreamIndex=" + std::to_string(options.subtitleStreamIndex) + "&SubtitleMethod=Encode";
+    } else if (options.subtitleStreamIndex == -1) {
+        target.path += "&SubtitleStreamIndex=-1"; // explicitly none
+    }
     return target;
+}
+
+std::string JellyfinClient::buildImagePath(const std::string& imageItemId, const std::string& imageTag,
+                                           int width, int height) const {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "/Items/%s/Images/Primary?maxWidth=%d&maxHeight=%d&quality=85&format=Jpg&tag=%s",
+             imageItemId.c_str(), width, height, urlEncode(imageTag).c_str());
+    return buf;
+}
+
+bool JellyfinClient::fetchBinary(const std::string& path, std::string& out) const {
+    HttpResponse resp = http_get(host_, port_, path, authHeader());
+    if (!resp.success) return false;
+    out.swap(resp.body);
+    return true;
 }
 
 static bool postSessionEvent(const std::string& host, int port, const std::string& authHeader,

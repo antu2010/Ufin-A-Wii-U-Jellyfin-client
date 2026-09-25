@@ -15,6 +15,31 @@ struct JellyfinItem {
     std::string channelNumber;  // TvChannel only, e.g. "5" or "5.1"
     std::string currentProgram; // TvChannel only: what's on right now, if the guide knows
     std::string seriesName;     // Episode / Season: the show it belongs to
+
+    // Artwork: whose Primary image to show, and its tag (the tag changes
+    // when the image does, so it's part of the cache key). Resolved when
+    // parsing: the item's own image, else its album's (songs) or its
+    // series' (episodes, seasons). Empty = no artwork.
+    std::string imageItemId;
+    std::string imageTag;
+
+    std::string seriesId;       // Episode / Season: its show (for "up next")
+
+    // Per-user state (UserData)
+    int64_t positionTicks = 0;  // where the user stopped, 0 = not started
+    bool played = false;        // watched / listened
+    bool favorite = false;
+    double playedPercentage = 0.0;
+    int unplayedCount = -1;     // Series / Season: unwatched episodes, -1 = unknown
+    int childCount = -1;        // folders: items inside, -1 = unknown
+};
+
+// One audio or subtitle track of a video.
+struct MediaTrack {
+    int index = -1;             // Jellyfin's stream index (AudioStreamIndex / SubtitleStreamIndex)
+    std::string title;          // "Italian - AAC - 5.1 - Default"
+    std::string language;       // "ita"
+    bool isDefault = false;
 };
 
 // Everything needed to make HTTP requests against a media stream:
@@ -44,6 +69,12 @@ struct VideoStreamOptions {
     // Where to start, in Jellyfin ticks (100 ns). Seeking restarts the
     // transcode here -- the stream itself can't be seeked.
     int64_t startTimeTicks = 0;
+
+    // Track choice. audio -1 = the server's default; subtitles -1 = none,
+    // otherwise burned into the picture (the Wii U decoder shows no
+    // separate subtitle stream). -2 = leave both to the server.
+    int audioStreamIndex = -2;
+    int subtitleStreamIndex = -2;
 };
 
 // What we need to know about a video before playing it -- fetched from
@@ -55,6 +86,11 @@ struct VideoInfo {
     double displayAspect = 0.0;   // width/height the picture should be shown at, 0 if unknown
     int64_t runTimeTicks = 0;     // duration in Jellyfin ticks (100 ns), 0 if unknown
     std::string mediaSourceId;    // id of the first media source, empty if unknown
+
+    std::vector<MediaTrack> audioTracks;
+    std::vector<MediaTrack> subtitleTracks;
+    int defaultAudioIndex = -1;    // stream index, -1 = unknown
+    int defaultSubtitleIndex = -1; // -1 = none
 };
 
 // An opened Live TV stream (see openLiveStream). Pass the ids into
@@ -97,6 +133,19 @@ public:
     // Library-wide search by name (movies, shows, episodes, music).
     bool search(const std::string& term, std::vector<JellyfinItem>& out);
 
+    // Home rows: partly watched videos, the next unwatched episode of each
+    // show, and the user's favourites.
+    bool getResume(std::vector<JellyfinItem>& out);
+    bool getNextUp(std::vector<JellyfinItem>& out);
+    bool getFavorites(std::vector<JellyfinItem>& out);
+
+    // Every episode of a show, in order (for autoplaying the next one).
+    bool getEpisodes(const std::string& seriesId, std::vector<JellyfinItem>& out);
+
+    // Favourite / watched toggles.
+    bool setFavorite(const std::string& itemId, bool favorite);
+    bool setPlayed(const std::string& itemId, bool played);
+
     // Fetches the item's metadata to learn its real aspect ratio and
     // duration. Returns false (with lastError() set) if the request
     // fails; fields that couldn't be determined stay at their zero
@@ -117,7 +166,8 @@ public:
     // (Jellyfin's /Audio/ endpoint rather than /Videos/). Forces AAC in
     // MP4 so it matches the decoder + demuxer our FFmpeg build actually
     // has.
-    StreamTarget buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks = 0) const;
+    StreamTarget buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks = 0,
+                                     const std::string& playSessionId = "") const;
 
     // Builds a request target for streaming a video item (or an opened
     // Live TV channel), forcing a server-side transcode to H.264 + AAC
@@ -127,6 +177,17 @@ public:
     // decoder wrapper; see the implementation for the reasoning.
     StreamTarget buildVideoStreamUrl(const std::string& itemId,
                                      const VideoStreamOptions& options = VideoStreamOptions()) const;
+
+    // Request path for an item's Primary image, scaled by the server to
+    // fit inside width x height (keeping its shape), as JPEG -- what
+    // stb_image decodes.
+    std::string buildImagePath(const std::string& imageItemId, const std::string& imageTag,
+                               int width, int height) const;
+
+    // Fetches bytes from this server (for images). Safe to call from a
+    // background thread: touches no client state besides reading the
+    // login token.
+    bool fetchBinary(const std::string& path, std::string& out) const;
 
     // Jellyfin's "Sessions" API -- reporting these is what makes the
     // server's own web UI show "Ufin is playing X" instead of nothing.
@@ -138,15 +199,50 @@ public:
     bool reportPlaybackStopped(const std::string& itemId, int64_t positionTicks,
                                const PlaybackIds& ids = PlaybackIds());
 
+    // --- signing in without config.json ---
+
+    // Identifies this console to Jellyfin (its device list, Quick Connect).
+    // Keep it stable across launches; empty = a fixed default.
+    void setDeviceId(const std::string& id) { device_id_ = id; }
+
+    // Server can change on the login screen.
+    void setServer(const std::string& host, int port) { host_ = host; port_ = port; }
+
+    // Reuses a token saved by an earlier sign-in; check it with
+    // validateLogin() before trusting it.
+    void useSavedLogin(const std::string& userId, const std::string& token);
+    bool validateLogin();    // GET /Users/Me
+    void signOut();          // forgets the token (and tells the server)
+
+    // Quick Connect: show `code` on screen; the user approves it from
+    // another signed-in device (Jellyfin -> Settings -> Quick Connect).
+    struct QuickConnectRequest {
+        std::string secret;
+        std::string code;
+    };
+    bool quickConnectStart(QuickConnectRequest& out);
+    // True once approved (then call quickConnectFinish). False otherwise;
+    // lastError() is set only if something went wrong.
+    bool quickConnectApproved(const std::string& secret);
+    bool quickConnectFinish(const std::string& secret);
+
     const std::string& lastError() const { return last_error_; }
     const std::string& userId() const { return user_id_; }
+    const std::string& userName() const { return user_name_; }
+    const std::string& accessToken() const { return token_; }
+    const std::string& host() const { return host_; }
+    int port() const { return port_; }
 
 private:
     std::string host_;
     int port_;
     std::string token_;
     std::string user_id_;
+    std::string user_name_;
+    std::string device_id_;
     std::string last_error_;
+
+    bool takeAuthResult(const std::string& body); // AccessToken + User from an auth response
 
     std::string authHeader() const;
 };
