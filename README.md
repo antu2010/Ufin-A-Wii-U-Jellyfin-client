@@ -36,7 +36,6 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 * ✅ Posters, album art and channel logos, loaded in the background from Jellyfin
 * ✅ Menu music
 * ✅ Continue watching, Next up and Favourites on Home; Resume / Start over
-* ✅ Audio and subtitle track choice during playback
 * ✅ Autoplay the next episode after a countdown
 * ✅ Watched ticks, resume bars, unwatched counts and favourite hearts in lists
 * ✅ GamePad screen off during TV playback
