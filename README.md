@@ -4,7 +4,7 @@ WIP jellyfin client for the Nintendo Wii U
 
 ---
 
-> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware. Playback can stutter heavily on poor or congested network connections, but audio/video should stay synchronized and resume from the correct position when the stream catches up or restarts. if anyone can test on Ethernet or stable WiFi and report how the playback is in an issue would be appreciated
+> ⚠️ **Beta 1.0:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware.
 
 # Jellyfin Wii U
 
@@ -12,7 +12,6 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 
 **Beta development.** Expect bugs, crashes, and probably the occasional Wii U death beep.
 
-> Beta v1.0.0 will be released in the next few days
 
 ## Current status
 
@@ -41,16 +40,17 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 * ✅ GamePad screen off during TV playback
 * ✅ Jellyfin 10.8 through 12.x
 * ✅ GamePad controls
+* ✅ Audio and subtitle track selection
 
 ### Implemented, but not yet fully tested on real hardware
 
-* 🧪 Audio and subtitle track selection
+
 * 🧪 Quick Connect sign-in
 * 🧪 Live TV
 * 🧪 Wii Remote (+ Nunchuk / Classic Controller)
 * 🧪 Wii U Pro Controller
 
-The GamePad is currently the only controller fully tested on real hardware. The other controller implementations will be tested before the final Beta 1.0 release.
+The GamePad is currently the only controller fully tested on real hardware. The other controller implementations will be tested before the final 1.1 release.
 
 Ufin currently relies on Jellyfin server-side transcoding for its known-good video path. The recommended format is 720p30 H.264 Baseline + AAC.
 
