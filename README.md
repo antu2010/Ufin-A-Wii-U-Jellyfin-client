@@ -4,7 +4,7 @@ WIP jellyfin client for the Nintendo Wii U
 
 ---
 
-> ⚠️ **Beta 1.1:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware. Playback can rarely stutter on poor or congested network connections, but audio/video should stay synchronized and resume from the correct position when the stream catches up or restarts. if anyone can test on Ethernet or stable WiFi and report how the playback is in an issue would be appreciated
+> ⚠️ **Beta 1.1:** Music and video playback, including 720p30 H.264 video, have been confirmed working on real hardware. The new GX2 + Dear ImGui interface and the v0.2 feature set have also been tested on real hardware. Playback can rarely stutter on poor or congested network connections, but audio/video should stay synchronized and resume from the correct position when the stream catches up or restarts. if anyone can test on Ethernet or stable WiFi and report how the playback is in an issue would be appreciated, also, the buffering counter will always stay at 0/15s, known issue, will be fixed next release, just wait and it will start playing
 
 # Jellyfin Wii U
 
