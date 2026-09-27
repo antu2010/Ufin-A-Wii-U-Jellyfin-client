@@ -124,6 +124,27 @@ void AudioOutput::queueFrame(AVFrame* frame, double ptsSeconds) {
         const int gain = (int)(volume_ * 65536.0f);
         for (int i = 0; i < count; i++) samples[i] = (int16_t)(((int32_t)samples[i] * gain) >> 16);
     }
+
+    // Visualizer snapshot: downmix the most recent slice of this
+    // (already volume-adjusted) buffer to mono. A fixed number of adds
+    // and shifts, no allocation -- negligible next to the resample and
+    // SDL_QueueAudio call around it, so this can't add meaningful work
+    // to the audio path, let alone stutter it.
+    {
+        const int16_t* samples = (const int16_t*)convert_buffer_;
+        int n = convertedSamples < VIS_SNAPSHOT_SAMPLES ? convertedSamples : VIS_SNAPSHOT_SAMPLES;
+        int startFrame = convertedSamples - n; // keep the most recent n frames
+        std::lock_guard<std::mutex> vlock(vis_mtx_);
+        for (int i = 0; i < n; i++) {
+            int idx = (startFrame + i) * out_channels_;
+            int32_t l = samples[idx];
+            int32_t r = (out_channels_ > 1) ? samples[idx + 1] : l;
+            vis_samples_[i] = (int16_t)((l + r) / 2);
+        }
+        vis_count_ = n;
+        vis_sequence_++;
+    }
+
     SDL_QueueAudio(device_, convert_buffer_, convertedSamples * bytesPerSample);
 
     if (std::isnan(ptsSeconds)) return;
@@ -198,5 +219,19 @@ void AudioOutput::shutdown() {
     started_ = false;
     clock_valid_ = false;
     paused_ = false;
+    {
+        std::lock_guard<std::mutex> vlock(vis_mtx_);
+        vis_count_ = 0;
+        vis_sequence_ = 0;
+    }
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+int AudioOutput::fetchVisualizerSamples(int16_t* out, int capacity, uint32_t* lastSeq) const {
+    std::lock_guard<std::mutex> lock(vis_mtx_);
+    if (lastSeq && *lastSeq == vis_sequence_) return 0; // nothing new since last call
+    int n = vis_count_ < capacity ? vis_count_ : capacity;
+    if (n > 0) memcpy(out, vis_samples_, (size_t)n * sizeof(int16_t));
+    if (lastSeq) *lastSeq = vis_sequence_;
+    return n;
 }

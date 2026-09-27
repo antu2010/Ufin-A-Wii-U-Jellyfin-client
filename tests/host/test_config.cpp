@@ -70,7 +70,8 @@ int main() {
     CHECK_STR(tok.menuMusicName, "Tune");
     CHECK(tok.crt);
     CHECK_EQ(tok.accent, 0); // look & feel defaults when absent
-    CHECK(!tok.ambient);
+    CHECK_EQ(tok.backgroundEffect, 0);
+    CHECK(!tok.lightMode);
     CHECK(!tok.snow);
     CHECK(!tok.clock);
     CHECK(!tok.rainbowUnlocked);
@@ -95,7 +96,8 @@ int main() {
         c.menuMusicName = "Citt\xc3\xa0";
         c.crt = true;
         c.accent = 3;
-        c.ambient = true;
+        c.backgroundEffect = 3;
+        c.lightMode = true;
         c.snow = true;
         c.clock = true;
         c.rainbowUnlocked = true;
@@ -110,7 +112,8 @@ int main() {
         CHECK_STR(back.menuMusicName, "Citt\xc3\xa0");
         CHECK(back.crt);
         CHECK_EQ(back.accent, 3);
-        CHECK(back.ambient);
+        CHECK_EQ(back.backgroundEffect, 3);
+        CHECK(back.lightMode);
         CHECK(back.snow);
         CHECK(back.clock);
         CHECK(back.rainbowUnlocked);

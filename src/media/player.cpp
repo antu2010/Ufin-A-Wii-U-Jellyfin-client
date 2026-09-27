@@ -77,6 +77,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     last_position_ = options.startOffsetSeconds;
     paused_ = false;
     seek_target_ = 0.0;
+    volume_ = options.initialVolume < 0.0 ? 0.0 : (options.initialVolume > 1.0 ? 1.0 : options.initialVolume);
 
     HttpStreamIO io(host, port, path);
     if (!io.open()) {
@@ -85,6 +86,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     }
 
     Decoder decoder;
+    decoder.setAllowUnalignedGeometry(options.allowUnalignedVideoGeometry);
     if (!decoder.open(io.avioContext())) {
         last_error_ = "Decoder::open failed: " + std::string(decoder.lastError());
         return PlayResult::Error;
@@ -122,6 +124,8 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
             decoder.close();
             return PlayResult::Error;
         }
+        audio.setVolume((float)volume_);
+        active_audio_ = &audio;
         // Playback starts once the prebuffer phase below is satisfied,
         // whether or not there's video -- audio.start() is called there.
     }
@@ -136,6 +140,11 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     FrameQueue videoQueue;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> decodeDone{false};
+    // Set by the decode thread the moment it observes
+    // decoder.fatalDecodeError() (see decoder.h); the render loop below
+    // polls this and turns it into a clean PlayResult::Error instead of
+    // the decode thread continuing to hammer a wedged hardware decoder.
+    std::atomic<bool> fatalDecodeDetected{false};
 
     std::thread decodeThread([&]() {
         // Demuxing and decoding are separate steps (see the per-stream
@@ -145,11 +154,25 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
         // frame, and the network is read whenever the stream that needs
         // one has no packets buffered.
         while (!stopRequested) {
+            if (decoder.fatalDecodeError()) {
+                // The circuit breaker has already tripped inside
+                // decodeVideoFrame()/decodeFrom() -- decodeFrom() itself
+                // stops feeding the decoder once this is set, so there's
+                // nothing left to do here but stop the thread and let
+                // the render loop notice fatalDecodeDetected.
+                fatalDecodeDetected = true;
+                break;
+            }
             bool progressed = false;
             AVFrame* frame = nullptr;
 
+            // Keep decoded audio close to the actual playback position even
+            // for audio-only streams. Without this cap, an audio-only track
+            // can be decoded and queued to completion almost instantly; the
+            // visualizer would then only ever see the final decoded samples
+            // while the user is listening to the middle of the song.
             const bool audioWanted = hasAudio &&
-                (!hasVideo || audio.queuedSeconds() < MAX_AUDIO_AHEAD_SECONDS);
+                audio.queuedSeconds() < MAX_AUDIO_AHEAD_SECONDS;
             const bool videoWanted = hasVideo && videoQueue.size() < FrameQueue::MAX_SIZE;
 
             if (audioWanted && decoder.decodeAudioFrame(&frame) == DecodedFrameType::AUDIO) {
@@ -227,6 +250,22 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
                 break;
             }
 
+            if (cmd.kind == PlayerCommand::Kind::SetVolume) {
+                volume_ = cmd.volume < 0.0 ? 0.0 : (cmd.volume > 1.0 ? 1.0 : cmd.volume);
+                if (hasAudio) audio.setVolume((float)volume_);
+            }
+            if (fatalDecodeDetected) {
+                // Tripped before we ever got to show a frame -- don't
+                // fall through into "start anyway with what's buffered"
+                // below, there's no working video decoder to play from.
+                stopRequested = true;
+                videoQueue.stop();
+                last_error_ = "persistent hardware video decode failure (circuit breaker)";
+                result = PlayResult::Error;
+                stoppedDuringPrebuffer = true;
+                break;
+            }
+
             const bool videoReady = !hasVideo || decoder.queuedVideoSeconds() >= PREBUFFER_TARGET_SECONDS;
             const bool audioReady = !hasAudio || decoder.queuedAudioSeconds() >= PREBUFFER_TARGET_SECONDS;
             if (videoReady && audioReady) break;
@@ -297,6 +336,24 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
             videoQueue.stop();
             result = PlayResult::SeekRequested;
             break;
+        }
+        if (fatalDecodeDetected) {
+            // Circuit breaker tripped (see decoder.h/decoder.cpp):
+            // persistent hardware video decode failures, not a one-off
+            // glitch. Stop cleanly through the normal error path rather
+            // than let the decode thread (already stopped itself) or
+            // this loop keep going with a wedged decoder.
+            OSReport("Ufin: persistent decode failure detected -- ending playback (position %.1fs)\n",
+                     last_position_);
+            stopRequested = true;
+            videoQueue.stop();
+            last_error_ = "persistent hardware video decode failure (circuit breaker)";
+            result = PlayResult::Error;
+            break;
+        }
+        if (cmd.kind == PlayerCommand::Kind::SetVolume) {
+            volume_ = cmd.volume < 0.0 ? 0.0 : (cmd.volume > 1.0 ? 1.0 : cmd.volume);
+            if (hasAudio) audio.setVolume((float)volume_);
         }
         if (cmd.kind == PlayerCommand::Kind::TogglePause) {
             paused_ = !paused_;
@@ -458,9 +515,19 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     OSReport("Ufin: Player done -- result=%d rendered=%d dropped=%d position=%.1fs\n",
              (int)result, framesRendered, framesDropped, last_position_);
 
+    active_audio_ = nullptr; // about to shut down / go out of scope
     if (hasVideo) video.shutdown();
     if (hasAudio) audio.shutdown();
     decoder.close();
 
     return result;
+}
+
+int Player::fetchVisualizerSamples(int16_t* out, int capacity, uint32_t* lastSeq) const {
+    if (!active_audio_) return 0;
+    return active_audio_->fetchVisualizerSamples(out, capacity, lastSeq);
+}
+
+int Player::visualizerSampleRate() const {
+    return active_audio_ ? active_audio_->outputSampleRate() : 0;
 }

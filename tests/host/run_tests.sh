@@ -64,6 +64,7 @@ run test_login_utils "$HERE/test_login_utils.cpp"
 run test_play_queue "$HERE/test_play_queue.cpp"
 run test_playback_controls "$HERE/test_playback_controls.cpp"
 run test_item_labels "$HERE/test_item_labels.cpp" "$SRC/item_labels.cpp" "$SRC/ui/format.cpp"
+run test_audio_visualizer "$HERE/test_audio_visualizer.cpp" "$SRC/media/audio_visualizer.cpp"
 
 if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
     CXXFLAGS="$CXXFLAGS -I$FFMPEG_HOST/include"

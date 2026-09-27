@@ -84,6 +84,19 @@ struct NowPlayingModel {
     std::string nextText;          // "Next: ..."
     std::vector<Hint> hints;
     Texture art = 0;               // album art, 0 = gradient placeholder
+    float volume = 1.0f;           // 0..1, drawn as a slider below the transport buttons
+};
+
+// The music visualizer (- during audio playback). Bar levels come from
+// AudioVisualizer::levels() -- this struct only carries plain numbers so
+// the draw function stays host-testable like the rest of ui/.
+struct VisualizerModel {
+    std::string title;
+    bool paused = false;
+    static const int MAX_BANDS = 16;
+    float bands[MAX_BANDS] = {};   // roughly 0..1, low frequency first
+    int bandCount = 0;
+    std::vector<Hint> hints;
 };
 
 // A small dialog: title, a line of text, and a column of choices.
@@ -156,12 +169,21 @@ struct QuickConnectModel {
 
 // --- theme ---
 
-enum class Accent { Blue, Purple, Green, Orange, Pink, Rainbow, COUNT };
+enum class Accent { Blue, Purple, Green, Orange, Pink, Teal, Crimson, Amber, Indigo, Rainbow, COUNT };
 const char* accentName(Accent a);
 void setAccent(Accent a);
 
-// Soft glowing shapes drifting slowly behind the menus.
-void setAmbientBackground(bool on);
+// Swaps the base neutral palette (background/panel/text/...) for a light
+// set instead of the default dark one; every accent colour works with
+// either. Independent of setAccent -- the two combine freely.
+void setLightMode(bool on);
+
+// The animated background effect drawn behind the menus. Every value
+// (bar Off) is built from the current accent colours and kept subtle
+// enough to work in both light and dark mode without hurting readability.
+enum class Background { Off, Circles, WiiBubbles, Gradient, Polygons, Starfield, COUNT };
+const char* backgroundEffectName(Background b);
+void setBackgroundEffect(Background b);
 
 // Call once per frame (drives the Rainbow accent).
 void tickTheme(double time);
@@ -175,6 +197,7 @@ void applyTheme();
 void drawBrowser(const BrowserModel& model);
 void drawMessage(const MessageModel& model);
 void drawNowPlaying(const NowPlayingModel& model);
+void drawMusicVisualizer(const VisualizerModel& model);
 void drawVideoHud(const VideoHudModel& model);
 void drawLogin(const LoginModel& model);
 void drawChoice(const ChoiceModel& model);   // over whatever is drawn already

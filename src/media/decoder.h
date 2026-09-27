@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <atomic>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -29,6 +30,12 @@ public:
     // alive for as long as this Decoder is in use -- Decoder does not
     // own or free it.
     bool open(AVIOContext* avioCtx);
+
+    // Diagnostic escape hatch for the h264_wiiu macroblock-alignment check
+    // in openCodecForStream() -- see UfinConfig::allowUnalignedVideoGeometry
+    // for the full explanation. Must be called before open(); has no effect
+    // once open() has already run. Off by default.
+    void setAllowUnalignedGeometry(bool allow) { allow_unaligned_geometry_ = allow; }
 
     // Decodes and returns the next available frame, whichever stream
     // (video or audio) it comes from first. The returned AVFrame* stays
@@ -109,6 +116,16 @@ public:
 
     const char* lastError() const { return last_error_; }
 
+    // Circuit breaker for a persistently failing hardware video decoder
+    // (see the long comment on consecutive_video_decode_errors_ below).
+    // Once this is true it never goes back to false for this Decoder
+    // instance -- a fresh Decoder (i.e. a fresh Player::play() call,
+    // such as after a seek) starts clean. Safe to read from another
+    // thread: consecutive_video_decode_errors_ is decode-thread-only,
+    // but this flag is the one piece of that state Player's own thread
+    // needs to observe, so it alone is atomic.
+    bool fatalDecodeError() const { return fatal_decode_error_.load(std::memory_order_acquire); }
+
 private:
     AVFormatContext* fmt_ctx_ = nullptr;
 
@@ -133,8 +150,25 @@ private:
 
     bool decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
                     bool& drained, bool isVideo, AVFrame** outFrame);
-    int video_decode_errors_ = 0;
+    int video_decode_errors_ = 0; // total, for logging -- never reset except by close()
+
+    // Consecutive-failure circuit breaker: unlike video_decode_errors_
+    // above (a running total, purely informational), this counts only
+    // an unbroken streak of hardware decode errors and is reset to 0 by
+    // every successfully decoded video frame -- see decodeFrom(). A few
+    // isolated errors in an otherwise-healthy stream are expected and
+    // harmless (a dropped/corrupt packet, a brief hardware hiccup) and
+    // must not end playback; what must end playback is the hardware
+    // decoder never recovering. Only decodeFrom() (decode thread) ever
+    // touches this counter, so it doesn't need to be atomic itself --
+    // only the fatal_decode_error_ flag it sets does, for Player's
+    // thread to read.
+    static const int MAX_CONSECUTIVE_VIDEO_DECODE_ERRORS = 30;
+    int consecutive_video_decode_errors_ = 0;
+    std::atomic<bool> fatal_decode_error_{false};
+
     char last_error_[256] = {0};
+    bool allow_unaligned_geometry_ = false;
 
     bool openCodecForStream(int streamIndex, AVCodecContext** outCtx);
 };

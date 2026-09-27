@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cctype>
 #include <algorithm>
+#include <fcntl.h>
+#include <cerrno>
 #include <coreinit/debug.h>
 
 static bool resolveHost(const std::string& host, struct in_addr* out) {
@@ -46,6 +48,42 @@ static bool waitReadable(int sock, int timeoutSeconds) {
 
     int result = select(sock + 1, &readSet, nullptr, nullptr, &tv);
     return result > 0;
+}
+
+// The comment above explains why recv() needed a manual timeout;
+// connect() has exactly the same problem and never got the same fix --
+// a plain blocking connect() left blocked by a stalled handshake (no
+// SYN-ACK, no RST, nothing) hangs indefinitely with no error and nothing
+// to OSReport, same as recv() used to. Bounded the same way: non-blocking
+// connect() + select() on the write side, then restore blocking mode.
+static bool connectWithTimeout(int sock, const struct sockaddr_in& server, int timeoutSeconds) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(sock, (const struct sockaddr*)&server, sizeof(server));
+    if (rc == 0) {
+        fcntl(sock, F_SETFL, flags);
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        fcntl(sock, F_SETFL, flags);
+        return false;
+    }
+
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(sock, &writeSet);
+    struct timeval tv;
+    tv.tv_sec = timeoutSeconds;
+    tv.tv_usec = 0;
+    int sel = select(sock + 1, nullptr, &writeSet, nullptr, &tv);
+    fcntl(sock, F_SETFL, flags);
+    if (sel <= 0) return false;
+
+    int soErr = 0;
+    socklen_t errLen = sizeof(soErr);
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &errLen) < 0 || soErr != 0) return false;
+    return true;
 }
 
 HttpStreamReader::HttpStreamReader(std::string host, int port, std::string path)
@@ -135,9 +173,9 @@ bool HttpStreamReader::open() {
     server.sin_port = htons((uint16_t)port_);
     server.sin_addr = addr;
 
-    if (connect(sock_, (struct sockaddr*)&server, sizeof(server)) < 0) {
-        last_error_ = "connect() failed to " + host_;
-        OSReport("Ufin: connect() failed\n");
+    if (!connectWithTimeout(sock_, server, 15)) {
+        last_error_ = "connect() failed or timed out connecting to " + host_;
+        OSReport("Ufin: connect() failed or timed out\n");
         return false;
     }
     OSReport("Ufin: connect() ok\n");

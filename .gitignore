@@ -1,4 +1,5 @@
 # Build output
+/FFmpeg-wiiu/
 /build/
 *.rpx
 *.elf

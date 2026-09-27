@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <fcntl.h>
+#include <cerrno>
 
 // NOTE: this whole file assumes wut's socket layer behaves like standard
 // BSD sockets (it's meant to). If any of socket()/connect()/send()/recv()
@@ -31,6 +33,47 @@ static bool wait_readable(int sock, int timeoutSeconds) {
 }
 
 static const int REQUEST_TIMEOUT_SECONDS = 20;
+
+// connect() has no timeout of its own -- only wait_readable() above
+// bounds the *read* side. Left as a plain blocking connect(), a stalled
+// TCP handshake (packets silently dropped, a routing hiccup, anything
+// short of an outright connection refusal) hangs the calling thread
+// indefinitely: no error is ever returned, so nothing here ever reaches
+// an OSReport/log line, and the caller's one-shot "Loading..." busy
+// screen never gets a chance to redraw or show an error. This wraps
+// connect() with the same kind of select()-based bound wait_readable()
+// already uses for reads, just applied to the connect phase: make the
+// socket briefly non-blocking, kick off the connect, wait on it with
+// select(), then restore blocking mode either way.
+static bool connect_with_timeout(int sock, const struct sockaddr_in& server, int timeoutSeconds) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(sock, (const struct sockaddr*)&server, sizeof(server));
+    if (rc == 0) {
+        fcntl(sock, F_SETFL, flags); // connected immediately
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        fcntl(sock, F_SETFL, flags);
+        return false;
+    }
+
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(sock, &writeSet);
+    struct timeval tv;
+    tv.tv_sec = timeoutSeconds;
+    tv.tv_usec = 0;
+    int sel = select(sock + 1, nullptr, &writeSet, nullptr, &tv);
+    fcntl(sock, F_SETFL, flags); // restore blocking mode for send()/recv() either way
+    if (sel <= 0) return false; // timed out, or select() itself failed
+
+    int soErr = 0;
+    socklen_t errLen = sizeof(soErr);
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &errLen) < 0 || soErr != 0) return false;
+    return true;
+}
 
 static bool resolve_host(const std::string& host, struct in_addr* out) {
     if (inet_pton(AF_INET, host.c_str(), out) == 1) {
@@ -104,8 +147,9 @@ static HttpResponse do_request(const std::string& host, int port, const std::str
     server.sin_port = htons((uint16_t)port);
     server.sin_addr = addr;
 
-    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
-        resp.body = "connect() failed to " + host;
+    if (!connect_with_timeout(sock, server, REQUEST_TIMEOUT_SECONDS)) {
+        resp.body = "connect() failed or timed out (" +
+                    std::to_string(REQUEST_TIMEOUT_SECONDS) + "s) connecting to " + host;
         close(sock);
         return resp;
     }
@@ -237,8 +281,9 @@ bool http_open_stream(const std::string& host, int port, const std::string& path
     server.sin_port = htons((uint16_t)port);
     server.sin_addr = addr;
 
-    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
-        out.error = "connect() failed to " + host;
+    if (!connect_with_timeout(sock, server, REQUEST_TIMEOUT_SECONDS)) {
+        out.error = "connect() failed or timed out (" +
+                    std::to_string(REQUEST_TIMEOUT_SECONDS) + "s) connecting to " + host;
         close(sock);
         return false;
     }

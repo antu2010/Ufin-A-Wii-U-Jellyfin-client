@@ -22,7 +22,7 @@ std::string JellyfinClient::authHeader() const {
     // because no client/device info arrived. The Authorization form has
     // been accepted since Jellyfin 10.8.
     std::string h = "Authorization: MediaBrowser Client=\"Ufin\", Device=\"Wii U\", DeviceId=\"" +
-                    (device_id_.empty() ? std::string("wiiu-ufin-001") : device_id_) + "\", Version=\"0.1.0\"";
+                    (device_id_.empty() ? std::string("wiiu-ufin-001") : device_id_) + "\", Version=\"1.1.0\"";
     if (!token_.empty()) {
         h += ", Token=\"" + token_ + "\"";
     }

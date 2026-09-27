@@ -41,6 +41,7 @@
 #include "seek.h"
 #include "media/menu_music.h"
 #include "media/player.h"
+#include "media/audio_visualizer.h"
 #include "media/video_output.h"
 #include "ui/app_ui.h"
 #include "ui/gfx.h"
@@ -144,6 +145,12 @@ static bool loadFrame(JellyfinClient& client, Frame& f) {
 
 // --- playback ---
 
+// Volume the user last set with the on-screen slider (see
+// ui::npVolumeRect / PlaybackControl::poll). Session-only -- kept here
+// rather than in UfinConfig -- so it carries across tracks/seeks/movies
+// for the life of the app without needing a config write on every drag.
+static float g_playbackVolume = 1.0f;
+
 // Reads the GamePad for Player many times a second (which also keeps
 // ProcUI serviced -- pressing HOME mid-playback otherwise leaves the
 // system waiting on us) and turns presses into PlayerCommands:
@@ -161,7 +168,8 @@ struct PlaybackControl {
     bool inQueue = false;
     bool isVideo = false;
     double durationSeconds = 0.0; // 0 = unknown (no upper clamp)
-    const Player* player = nullptr;
+    Player* player = nullptr;
+    float volume = g_playbackVolume; // 0..1, dragged via the Now Playing slider
 
     double pendingDelta = 0.0;
     OSTime lastSkipPress = 0;
@@ -181,6 +189,29 @@ struct PlaybackControl {
     bool gamepadOff = false;
     std::string notice;
     OSTime noticeAt = 0;
+
+    // TV-only mode (+ during seekable video: movies/episodes, not Live
+    // TV). Purely a presentation switch read by playItem's presentVideo:
+    // the TV keeps showing the same underlying video picture either way,
+    // and every command below (pause, seek, stop, ...) still goes through
+    // the exact same Player/PlaybackControl path regardless of its state.
+    // Scoped to this session's PlaybackControl, so it can never leak into
+    // another screen and is always false again the next time a video
+    // starts (a fresh PlaybackControl per playItem() call).
+    bool tvOnlyMode = false;
+
+    // Edge-detection for the on-screen transport buttons (see
+    // ui::hitTestNowPlaying): -1 when nothing is held down, else the
+    // button index that was under the finger on the *previous* poll, so
+    // a finger held on a button doesn't repeat its command every poll --
+    // same idea as `t`/trigger below being press-edges only for real
+    // buttons.
+    int touchLastHit = -1;
+
+    // Music visualizer (- during audio playback). Video already owns -
+    // for the GamePad-screen toggle above, so this only ever applies
+    // when isVideo is false -- the two can't conflict.
+    bool visualizerOn = false;
 
     bool hasTrackChoice() const {
         return tracks && (tracks->audioTracks.size() > 1 || !tracks->subtitleTracks.empty());
@@ -221,8 +252,62 @@ struct PlaybackControl {
         }
 
         if (t & VPAD_BUTTON_B) return PlayerCommand::stop();
-        if (isVideo && (t & VPAD_BUTTON_MINUS)) setGamepadScreen(!gamepadOff);
-        if (canSeekAndPause && (t & VPAD_BUTTON_Y) && hasTrackChoice()) {
+        if (isVideo) {
+            if (t & VPAD_BUTTON_MINUS) setGamepadScreen(!gamepadOff);
+            // + toggles TV-only mode: seekable video only (movies and
+            // episodes), so Live TV -- which has its own simpler HUD and
+            // no seeking -- is left alone, and so is music (this whole
+            // branch is `isVideo`-only, same as the GamePad-screen toggle
+            // above). canSeekAndPause is exactly "not Live TV" here, so no
+            // separate flag is needed for that scoping.
+            if (canSeekAndPause && (t & VPAD_BUTTON_PLUS)) tvOnlyMode = !tvOnlyMode;
+        } else if (t & VPAD_BUTTON_MINUS) {
+            visualizerOn = !visualizerOn;
+        }
+
+        // GamePad touch: the transport buttons drawn under the progress
+        // bar on any Now Playing screen -- music (with or without the
+        // visualizer) and the movie remote (TV-only mode). Nothing else
+        // (Live TV, the normal video HUD) ever draws that screen, so
+        // touches are only hit-tested here in exactly those two cases.
+        // Edge-detected via touchLastHit so a held finger fires once,
+        // same as a real button's press-edge `t` above.
+        const bool nowPlayingShown = !isVideo || tvOnlyMode;
+        // Volume slider: unlike the transport buttons above, this isn't
+        // edge-detected -- a held/dragged finger should keep updating the
+        // volume every poll, not just on touch-down, or dragging would do
+        // nothing until lifted and re-pressed.
+        if (nowPlayingShown && in.touched && ui::npVolumeRect().contains(in.touchX, in.touchY)) {
+            volume = ui::npVolumeFraction(in.touchX);
+            g_playbackVolume = volume;
+            return PlayerCommand::setVolume(volume);
+        }
+        int touchHit = (nowPlayingShown && in.touched) ? ui::hitTestNowPlaying(in.touchX, in.touchY) : -1;
+        if (touchHit >= 0 && touchHit != touchLastHit) {
+            touchLastHit = touchHit;
+            switch ((ui::NpButton)touchHit) {
+                case ui::NpButton::SeekBack:
+                    if (canSeekAndPause) { pendingDelta -= SKIP_BACK_SECONDS; lastSkipPress = OSGetTime(); }
+                    break;
+                case ui::NpButton::PlayPause:
+                    if (canSeekAndPause) return PlayerCommand::togglePause();
+                    break;
+                case ui::NpButton::SeekForward:
+                    if (canSeekAndPause) { pendingDelta += SKIP_FORWARD_SECONDS; lastSkipPress = OSGetTime(); }
+                    break;
+                case ui::NpButton::Stop:
+                    return PlayerCommand::stop();
+                default:
+                    break;
+            }
+        } else if (!in.touched) {
+            touchLastHit = -1;
+        }
+        // The audio & subtitle panel is drawn as part of the TV's video
+        // HUD (see presentVideo's non-tvOnlyMode branch); the clean TV
+        // picture in TV-only mode has nowhere to show it, so it's parked
+        // until + returns to the normal view.
+        if (canSeekAndPause && !tvOnlyMode && (t & VPAD_BUTTON_Y) && hasTrackChoice()) {
             menuAudio = audioIndex;
             menuSubtitle = subtitleIndex;
             trackRow = 0;
@@ -330,6 +415,20 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     const bool isAudio = (picked.type == "Audio");
     const bool isLive = (picked.type == "TvChannel");
     const std::string title = itemDisplayName(picked);
+    // Subtitle for the movie remote UI (TV-only mode, below): show name +
+    // "S#E#" for episodes, else the year, matching the codes already used
+    // elsewhere (see item_labels.cpp's episodeCode()/itemTag()).
+    std::string movieSubtitle;
+    if (!picked.seriesName.empty()) {
+        movieSubtitle = picked.seriesName;
+        if (picked.parentIndexNumber >= 0 && picked.indexNumber >= 0) {
+            char code[32];
+            snprintf(code, sizeof(code), "S%dE%d", picked.parentIndexNumber, picked.indexNumber);
+            movieSubtitle += std::string("  ") + code;
+        }
+    } else if (picked.productionYear > 0) {
+        movieSubtitle = std::to_string(picked.productionYear);
+    }
 
     VideoStreamOptions videoOptions;
     videoOptions.videoBitrate = cfg.videoBitrate;
@@ -337,6 +436,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
 
     double durationSeconds = picked.runTimeTicks > 0 ? picked.runTimeTicks / 10000000.0 : 0.0;
     PlayOptions playOptions;
+    playOptions.allowUnalignedVideoGeometry = cfg.allowUnalignedVideoGeometry;
     PlaybackIds ids;
     VideoInfo info; // tracks, for the Audio & subtitles panel
 
@@ -378,6 +478,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
 
     Player player;
     PlaybackControl control;
+    playOptions.initialVolume = control.volume; // carries the user's last-set volume in
     control.canSeekAndPause = !isLive;
     control.inQueue = (queue != nullptr);
     control.isVideo = !isAudio;
@@ -412,6 +513,40 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     // the HUD on top. The HUD shows while paused, while a skip is being
     // collected, and for a few seconds after any button press.
     playOptions.presentVideo = [&](const std::function<void(uint32_t, uint32_t)>& drawVideo) {
+        if (control.tvOnlyMode) {
+            // TV = clean video, no HUD at all (empty tvBuild). GamePad =
+            // a movie remote, built the same way Now Playing already is
+            // for music (see onIdleFrame below) -- same model, same draw
+            // function, same controls, just a different subtitle/hints.
+            // This does not touch the decoder, the audio clock or Player
+            // in any way: it only changes which of the two independent
+            // ImGui frames drawn by frameTvDrc goes where, exactly like
+            // the music visualizer's TV/GamePad split already does.
+            ui::NowPlayingModel np;
+            np.title = title;
+            np.subtitle = movieSubtitle;
+            np.positionSeconds = player.positionSeconds();
+            np.durationSeconds = durationSeconds;
+            np.paused = player.isPaused();
+            np.volume = control.volume;
+            if (control.pendingDelta != 0.0) {
+                // Same wording as the audio Now Playing screen's pending-skip
+                // subtitle below, for consistency.
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Skipping %+d s ...", (int)control.pendingDelta);
+                np.subtitle = buf;
+            }
+            np.hints = {{"A", np.paused ? "Play" : "Pause"}, {"<", "-10 s"}, {">", "+30 s"}};
+            np.hints.push_back({"+", "Normal view"});
+            np.hints.push_back({"B", "Stop"});
+            np.art = artFor(picked, ui::layout::NP_IMAGE_MAX, ui::layout::NP_IMAGE_MAX, nullptr);
+            ui::gfx().frameTvDrc({}, [&] { ui::drawNowPlaying(np); }, drawVideo);
+            // Same reason as the music visualizer's frameTvDrc call above:
+            // bypasses drawFrame(), so pump the image cache by hand or the
+            // poster never finishes uploading and stays a placeholder.
+            if (g_images) g_images->pump();
+            return;
+        }
         ui::VideoHudModel hud;
         hud.title = title;
         hud.live = isLive;
@@ -437,20 +572,96 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         } else {
             hud.hints = {{"A", hud.paused ? "Play" : "Pause"}, {"<", "-10 s"}, {">", "+30 s"}};
             if (control.hasTrackChoice()) hud.hints.push_back({"Y", "Audio & subtitles"});
+            hud.hints.push_back({"+", "TV mode"});
             hud.hints.push_back({"-", "GamePad screen"});
             hud.hints.push_back({"B", "Stop"});
         }
         drawFrame([&] { ui::drawVideoHud(hud); }, drawVideo);
     };
 
+    // Music visualizer (- to toggle, see PlaybackControl::poll). Owned
+    // here rather than inside Player so it stays purely a UI/render-
+    // thread concern -- Player only ever hands out raw PCM.
+    media::AudioVisualizer visualizer;
+    uint32_t visualizerSeq = 0;
+    OSTime lastIdleFrameTime = OSGetTime();
+
     // Audio: Now Playing, redrawn every frame by the player loop.
     playOptions.onIdleFrame = [&]() {
+        OSTime now = OSGetTime();
+        double dt = OSTicksToMilliseconds(now - lastIdleFrameTime) / 1000.0;
+        lastIdleFrameTime = now;
+
+        if (control.visualizerOn) {
+            // Analysis runs here, on the same thread as this callback
+            // (the render loop), never on the audio/decode thread --
+            // see AudioVisualizer's own comment for why that's safe to
+            // do unconditionally every frame.
+            int16_t pcm[1024];
+            int n = player.fetchVisualizerSamples(pcm, 1024, &visualizerSeq);
+            int rate = player.visualizerSampleRate();
+            visualizer.update(n > 0 ? pcm : nullptr, n, rate, dt);
+
+            ui::VisualizerModel vm;
+            vm.title = title;
+            vm.paused = player.isPaused();
+            vm.bandCount = media::AudioVisualizer::BANDS;
+            for (int i = 0; i < vm.bandCount && i < ui::VisualizerModel::MAX_BANDS; i++) {
+                vm.bands[i] = visualizer.levels()[i];
+            }
+            vm.hints = {{"A", vm.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
+            if (queue) vm.hints.push_back({"L R", "Prev / Next"});
+            vm.hints.push_back({"-", "Now Playing"});
+            vm.hints.push_back({"B", "Stop"});
+
+            // The visualizer is a TV-only presentation. Keep the normal
+            // Now Playing UI on the GamePad so controls, progress, artwork
+            // and the visualizer toggle remain available there.
+            ui::NowPlayingModel np;
+            np.title = title;
+            np.subtitle = picked.seriesName.empty() ? "Audio" : picked.seriesName;
+            np.positionSeconds = player.positionSeconds();
+            np.durationSeconds = durationSeconds;
+            np.paused = player.isPaused();
+            np.volume = control.volume;
+            if (queue) {
+                np.queueText = queue->queueText;
+                np.nextText = queue->nextText;
+            }
+            if (control.pendingDelta != 0.0) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Skipping %+d s ...", (int)control.pendingDelta);
+                np.subtitle = buf;
+            }
+            np.hints = {{"A", np.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
+            if (queue) np.hints.push_back({"L R", "Prev / Next"});
+            np.hints.push_back({"-", "Visualizer"});
+            np.hints.push_back({"B", "Stop"});
+            np.art = artFor(picked, ui::layout::NP_IMAGE_MAX, ui::layout::NP_IMAGE_MAX, nullptr);
+
+            ui::gfx().frameTvDrc(
+                [&] { ui::drawMusicVisualizer(vm); },
+                [&] { ui::drawNowPlaying(np); });
+            // frameTvDrc() doesn't go through drawFrame(), so pump the
+            // image cache here too -- otherwise a not-yet-uploaded art
+            // texture (e.g. right after playback starts) never gets its
+            // GX2 upload while this two-pass path is active, and the
+            // GamePad is stuck showing the placeholder note icon.
+            if (g_images) g_images->pump();
+            return;
+        }
+        // Visualizer just turned off (or never on) -- keep it reset so
+        // turning it back on later doesn't flash stale levels from
+        // before.
+        visualizer.reset();
+
         ui::NowPlayingModel np;
         np.title = title;
         np.subtitle = picked.seriesName.empty() ? "Audio" : picked.seriesName;
         np.positionSeconds = player.positionSeconds();
         np.durationSeconds = durationSeconds;
         np.paused = player.isPaused();
+        np.volume = control.volume;
         if (queue) {
             np.queueText = queue->queueText;
             np.nextText = queue->nextText;
@@ -462,6 +673,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         }
         np.hints = {{"A", np.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
         if (queue) np.hints.push_back({"L R", "Prev / Next"});
+        np.hints.push_back({"-", "Visualizer"});
         np.hints.push_back({"B", "Stop"});
         np.art = artFor(picked, ui::layout::NP_IMAGE_MAX, ui::layout::NP_IMAGE_MAX, nullptr);
         drawFrame([&] { ui::drawNowPlaying(np); });
@@ -499,6 +711,11 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             playOptions);
 
         if (result != PlayResult::SeekRequested) break;
+        // Carry whatever volume the user left it at into the stream
+        // restart below (a fresh Player::play() call otherwise starts
+        // back at playOptions.initialVolume's original value).
+        control.volume = (float)player.volume();
+        playOptions.initialVolume = control.volume;
         startAt = player.seekTarget();
         if (control.tracksChanged) {
             // New audio / subtitle choice: same restart as a skip, with the
@@ -905,17 +1122,52 @@ struct App {
 
     // --- settings ---
 
-    enum SettingsRow { SetMusic, SetCrt, SetAccent, SetAmbient, SetSnow, SetClock, SetAutoplay, SetGamepadScreen,
-                       SetTestPicture, SetAccount, SetAbout };
+    enum SettingsRow { SetMusic, SetCrt, SetAccent, SetUnlockRainbow, SetLight, SetBackground, SetSnow, SetClock,
+                       SetQuality, SetAutoplay, SetGamepadScreen, SetStrictVideoGeometry, SetTestPicture, SetAccount,
+                       SetAbout };
 
     std::vector<SettingsRow> settingsRows() const {
-        return {SetMusic, SetAutoplay, SetGamepadScreen, SetAccent, SetAmbient, SetCrt, SetSnow, SetClock,
-                SetTestPicture, SetAccount, SetAbout};
+        std::vector<SettingsRow> rows = {SetMusic, SetAutoplay, SetGamepadScreen, SetStrictVideoGeometry, SetQuality,
+                SetAccent};
+        if (cfg.rainbowEasterEgg) rows.push_back(SetUnlockRainbow);
+        rows.insert(rows.end(), {SetLight, SetBackground, SetCrt, SetSnow, SetClock, SetTestPicture, SetAccount, SetAbout});
+        return rows;
     }
 
     int accentCount() const { return cfg.rainbowUnlocked ? (int)ui::Accent::COUNT : (int)ui::Accent::Rainbow; }
 
     static const char* onOff(bool on) { return on ? "On" : "Off"; }
+
+    // Playback quality presets, cycled by the "Video quality" settings
+    // row. Every preset stays on H.264 baseline: buildVideoStreamUrl's
+    // own comment explains why (h264_wiiu returns frames in decode
+    // order, and Main/High profile B-frames come back with the wrong
+    // timestamps -- "the video plays like jelly", frames repeating or
+    // hopping back and forth). Only the bitrate changes between
+    // presets. "Safe" matches VideoStreamOptions' own defaults (see
+    // jellyfin_client.h) -- the values known to work everywhere on the
+    // Wii U's hardware decoder and Wi-Fi. Hand-editing video_bitrate /
+    // video_profile in config.json still works and simply shows as
+    // "Custom" here until a preset is picked again.
+    struct QualityPreset { const char* name; int bitrate; const char* profile; const char* detail; };
+    static const QualityPreset* qualityPresets(int& count) {
+        static const QualityPreset presets[] = {
+            {"Low",    1000000, "baseline", "1 Mbps -- best for a weak or busy Wi-Fi network"},
+            {"Safe",   2500000, "baseline", "2.5 Mbps -- the tested default"},
+            {"Medium", 4000000, "baseline", "4 Mbps -- sharper picture on a solid connection"},
+            {"High",   8000000, "baseline", "8 Mbps -- best quality, needs a strong network"},
+        };
+        count = (int)(sizeof(presets) / sizeof(presets[0]));
+        return presets;
+    }
+    int qualityIndex() const {
+        int count;
+        const QualityPreset* presets = qualityPresets(count);
+        for (int i = 0; i < count; i++) {
+            if (cfg.videoBitrate == presets[i].bitrate && cfg.videoProfile == presets[i].profile) return i;
+        }
+        return -1; // hand-edited in config.json
+    }
 
     ui::ListEntry settingsEntry(SettingsRow row) const {
         ui::ListEntry e;
@@ -935,12 +1187,44 @@ struct App {
                 e.detail = cfg.rainbowUnlocked ? "A: next colour (Rainbow slowly cycles through them all)"
                                                : "A: next colour";
                 break;
-            case SetAmbient:
+            case SetUnlockRainbow:
+                e.name = "Rainbow accent";
+                e.icon = ui::Icon::Palette;
+                e.tag = onOff(cfg.rainbowUnlocked);
+                e.detail = "Adds the Rainbow accent to the colour list above";
+                break;
+            case SetLight:
+                e.name = "Light mode";
+                e.icon = ui::Icon::Palette;
+                e.tag = onOff(cfg.lightMode);
+                e.detail = "A light palette instead of dark -- every accent colour works with either";
+                break;
+            case SetBackground: {
+                ui::Background bg = (ui::Background)cfg.backgroundEffect;
                 e.name = "Animated background";
                 e.icon = ui::Icon::Sparkle;
-                e.tag = onOff(cfg.ambient);
-                e.detail = "Soft glowing shapes drift behind the menus";
+                e.tag = ui::backgroundEffectName(bg);
+                switch (bg) {
+                    case ui::Background::Off:        e.detail = "No effect behind the menus"; break;
+                    case ui::Background::Circles:    e.detail = "Soft glowing shapes drift behind the menus"; break;
+                    case ui::Background::WiiBubbles: e.detail = "Rising bubbles, like the Wii U menu"; break;
+                    case ui::Background::Gradient:   e.detail = "A slow, subtle animated colour gradient"; break;
+                    case ui::Background::Polygons:   e.detail = "Faint drifting geometric shapes"; break;
+                    case ui::Background::Starfield:  e.detail = "A field of gently twinkling points"; break;
+                    default: break;
+                }
                 break;
+            }
+            case SetQuality: {
+                e.name = "Video quality";
+                e.icon = ui::Icon::Video;
+                int idx = qualityIndex();
+                int count;
+                const QualityPreset* presets = qualityPresets(count);
+                e.tag = idx >= 0 ? presets[idx].name : "Custom";
+                e.detail = idx >= 0 ? presets[idx].detail : "Set by hand in config.json -- A picks a preset instead";
+                break;
+            }
             case SetCrt:
                 e.name = "CRT mode";
                 e.icon = ui::Icon::Video;
@@ -971,6 +1255,14 @@ struct App {
                 e.tag = onOff(!cfg.gamepadOffInVideo);
                 e.detail = "Off saves battery when you watch on the TV (- during a video switches it too)";
                 break;
+            case SetStrictVideoGeometry:
+                e.name = "Strict video format check";
+                e.icon = ui::Icon::Video;
+                e.tag = onOff(!cfg.allowUnalignedVideoGeometry);
+                e.detail = cfg.allowUnalignedVideoGeometry
+                    ? "Off: unusually-shaped videos play, but there's a small chance of a crash on real hardware"
+                    : "On: unusually-shaped videos are refused with an error instead of risking a crash";
+                break;
             case SetTestPicture:
                 e.name = "Video test picture";
                 e.icon = ui::Icon::Video;
@@ -985,7 +1277,7 @@ struct App {
             case SetAbout:
                 e.name = "About Ufin";
                 e.icon = ui::Icon::Info;
-                e.tag = "0.1.0";
+                e.tag = "1.1.0";
                 // Build time: makes an old build on the SD card easy to spot.
                 e.detail = std::string("A Jellyfin client for the Wii U  -  built ") + __DATE__ + " " + __TIME__;
                 break;
@@ -997,7 +1289,9 @@ struct App {
     void applyLook() {
         if (cfg.accent >= accentCount()) cfg.accent = 0;
         ui::setAccent((ui::Accent)cfg.accent);
-        ui::setAmbientBackground(cfg.ambient);
+        if (cfg.backgroundEffect < 0 || cfg.backgroundEffect >= (int)ui::Background::COUNT) cfg.backgroundEffect = 0;
+        ui::setBackgroundEffect((ui::Background)cfg.backgroundEffect);
+        ui::setLightMode(cfg.lightMode);
         }
 
     void activateSetting(SettingsRow row) {
@@ -1015,9 +1309,28 @@ struct App {
                 cfg.accent = (cfg.accent + 1) % accentCount();
                 say(std::string("Accent: ") + ui::accentName((ui::Accent)cfg.accent));
                 break;
-            case SetAmbient:
-                cfg.ambient = !cfg.ambient;
+            case SetUnlockRainbow:
+                cfg.rainbowUnlocked = !cfg.rainbowUnlocked;
+                if (cfg.rainbowUnlocked) cfg.accent = (int)ui::Accent::Rainbow;
+                say(cfg.rainbowUnlocked ? "Rainbow accent on" : "Rainbow accent off");
                 break;
+            case SetLight:
+                cfg.lightMode = !cfg.lightMode;
+                break;
+            case SetBackground:
+                cfg.backgroundEffect = (cfg.backgroundEffect + 1) % (int)ui::Background::COUNT;
+                say(std::string("Background: ") + ui::backgroundEffectName((ui::Background)cfg.backgroundEffect));
+                break;
+            case SetQuality: {
+                int count;
+                const QualityPreset* presets = qualityPresets(count);
+                int idx = qualityIndex();
+                idx = (idx < 0) ? 0 : (idx + 1) % count; // Custom -> Low, then cycles normally
+                cfg.videoBitrate = presets[idx].bitrate;
+                cfg.videoProfile = presets[idx].profile;
+                say(std::string("Video quality: ") + presets[idx].name);
+                break;
+            }
             case SetCrt:
                 cfg.crt = !cfg.crt;
                 if (cfg.crt) say("CRT mode -- adjust your tracking");
@@ -1035,6 +1348,12 @@ struct App {
             case SetGamepadScreen:
                 cfg.gamepadOffInVideo = !cfg.gamepadOffInVideo;
                 break;
+            case SetStrictVideoGeometry:
+                cfg.allowUnalignedVideoGeometry = !cfg.allowUnalignedVideoGeometry;
+                say(cfg.allowUnalignedVideoGeometry
+                    ? "Strict video format check off"
+                    : "Strict video format check on");
+                break;
             case SetTestPicture:
                 stopMusic();
                 runGx2TestPattern();
@@ -1047,21 +1366,24 @@ struct App {
                 showSignIn("Signed out.");
                 return;
             case SetAbout:
-                // Tap it seven times... (like a phone's build number)
-                if (cfg.rainbowUnlocked) {
-                    say("Ufin 0.1.0 -- UI inspired by CafeMP. Thanks for watching!");
+                // Tap it seven times... (like a phone's build number). Reveals
+                // the Rainbow accent toggle in Settings for good, rather than
+                // switching it on outright -- see SetUnlockRainbow above.
+                if (cfg.rainbowEasterEgg) {
+                    say("Ufin 1.1.0 -- UI inspired by CafeMP. Thanks for watching!");
                     return;
                 }
                 aboutTaps++;
                 if (aboutTaps >= 7) {
+                    cfg.rainbowEasterEgg = true;
                     cfg.rainbowUnlocked = true;
                     cfg.accent = (int)ui::Accent::Rainbow;
-                    say("Rainbow accent unlocked!");
+                    say("Rainbow accent unlocked! Find it any time in Settings.");
                 } else if (aboutTaps >= 3) {
                     say(std::to_string(7 - aboutTaps) + (7 - aboutTaps == 1 ? " more..." : " more..."));
                     return;
                 } else {
-                    say("Ufin 0.1.0 -- UI inspired by CafeMP");
+                    say("Ufin 1.1.0 -- UI inspired by CafeMP");
                     return;
                 }
                 break;

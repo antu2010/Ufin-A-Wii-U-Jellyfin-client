@@ -39,6 +39,57 @@ bool Decoder::openCodecForStream(int streamIndex, AVCodecContext** outCtx) {
         return false;
     }
 
+    // Safety gate for the Wii U hardware decoder specifically (see the
+    // long comment on Width=1280&Height=720 in
+    // JellyfinClient::buildVideoStreamUrl): h264_wiiu's framebuffer
+    // allocation is width*height*1.5 with NO internal rounding, while the
+    // hardware itself writes rows at a 256-pixel-aligned pitch and a
+    // 16-row-aligned height. Ufin always *asks* Jellyfin for exactly
+    // 1280x720 -- both already aligned -- but Jellyfin does not always
+    // honor that: depending on server-side scaling/policy behavior, the
+    // stream that actually arrives can have a different, non-aligned
+    // geometry (e.g. 1280x692 observed from a source that Jellyfin scaled
+    // by preserving aspect ratio instead of squeezing to the exact
+    // request). If that ever reaches avcodec_open2() here, the hardware
+    // decoder's under-sized allocation vs. the pitch/height it actually
+    // writes is exactly the kind of mismatch that can write past the end
+    // of its buffer -- which on real hardware doesn't raise a catchable
+    // error, it corrupts memory or crashes the console outright.
+    //
+    // So: refuse before ever touching the hardware decoder if the stream
+    // isn't aligned the way it assumes, and fail cleanly through the
+    // existing Decoder::open() -> Player::play() -> PlayResult::Error
+    // path instead. This is deliberately specific to h264_wiiu (by name)
+    // -- a software H.264 fallback has no such alignment requirement, and
+    // this must never turn into a blanket "reject anything but 1280x720"
+    // rule (see repository investigation notes): only the alignment the
+    // hardware actually needs is enforced here.
+    if (strcmp(codec->name, "h264_wiiu") == 0) {
+        const int kPitchAlign = 256;
+        const int kHeightAlign = 16;
+        bool unsafe = (params->width <= 0 || params->height <= 0 ||
+                       (params->width % kPitchAlign) != 0 || (params->height % kHeightAlign) != 0);
+        if (unsafe && !allow_unaligned_geometry_) {
+            snprintf(last_error_, sizeof(last_error_),
+                     "unsafe geometry for h264_wiiu: %dx%d (needs width a multiple of %d, "
+                     "height a multiple of %d) -- refusing to open the hardware decoder",
+                     params->width, params->height, kPitchAlign, kHeightAlign);
+            OSReport("Ufin: %s\n", last_error_);
+            return false;
+        }
+        if (unsafe) {
+            // allow_unaligned_geometry_ set (UfinConfig::allowUnalignedVideoGeometry):
+            // proceeding on the assumption this FFmpeg-wiiu build already has the
+            // matching aligned-framebuffer fix in h264_wiiu.c. If it doesn't, this
+            // is exactly the crash the check above exists to prevent -- only
+            // enable that config setting after confirming that fix is actually
+            // in the FFmpeg-wiiu build this binary links against.
+            OSReport("Ufin: opening h264_wiiu with unaligned geometry %dx%d "
+                      "(allow_unaligned_video_geometry is set)\n",
+                      params->width, params->height);
+        }
+    }
+
     AVCodecContext* ctx = avcodec_alloc_context3(codec);
     if (!ctx) {
         snprintf(last_error_, sizeof(last_error_), "avcodec_alloc_context3 failed");
@@ -190,9 +241,18 @@ bool Decoder::readPacket() {
 bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
                          bool& drained, bool isVideo, AVFrame** outFrame) {
     if (!ctx || drained) return false;
+    if (isVideo && fatal_decode_error_.load(std::memory_order_acquire)) {
+        // Already tripped: Player's own thread will notice
+        // fatalDecodeError() and tear playback down shortly. Don't feed
+        // this decoder any more packets in the meantime -- that's the
+        // whole point of the breaker (see the comment on
+        // consecutive_video_decode_errors_ in decoder.h).
+        return false;
+    }
     for (int guard = 0; guard < 64; guard++) {
         int ret = avcodec_receive_frame(ctx, frame_);
         if (ret == 0) {
+            if (isVideo) consecutive_video_decode_errors_ = 0;
             *outFrame = frame_;
             return true;
         }
@@ -203,10 +263,20 @@ bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool
         if (ret != AVERROR(EAGAIN) && isVideo) {
             // A genuine decode error for one packet (h264_wiiu reports
             // hardware decoder failures this way); the packet is already
-            // consumed, so log it and keep feeding.
+            // consumed, so log it and keep feeding -- unless this is now
+            // an unbroken streak long enough to call the decoder wedged.
             video_decode_errors_++;
+            consecutive_video_decode_errors_++;
             if (video_decode_errors_ <= 5 || video_decode_errors_ % 100 == 0) {
-                OSReport("Ufin: video decode error %d (count=%d)\n", ret, video_decode_errors_);
+                OSReport("Ufin: video decode error %d (count=%d, consecutive=%d)\n", ret,
+                         video_decode_errors_, consecutive_video_decode_errors_);
+            }
+            if (consecutive_video_decode_errors_ >= MAX_CONSECUTIVE_VIDEO_DECODE_ERRORS) {
+                OSReport("Ufin: %d consecutive video decode errors -- hardware decoder "
+                         "appears wedged, tripping the circuit breaker\n",
+                         consecutive_video_decode_errors_);
+                fatal_decode_error_.store(true, std::memory_order_release);
+                return false;
             }
         }
 
@@ -354,4 +424,6 @@ void Decoder::close() {
     audio_stream_index_ = -1;
     reachedEof_ = false;
     video_decode_errors_ = 0;
+    consecutive_video_decode_errors_ = 0;
+    fatal_decode_error_.store(false, std::memory_order_release);
 }

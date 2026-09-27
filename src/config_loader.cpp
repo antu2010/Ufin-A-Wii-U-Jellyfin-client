@@ -71,12 +71,25 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
         outConfig.accent = cJSON_IsNumber(accent) ? accent->valueint : 0;
         if (outConfig.accent < 0) outConfig.accent = 0;
     }
-    outConfig.ambient = boolean("ambient_background", false);
+    {
+        cJSON* bg = cJSON_GetObjectItem(json, "background_effect");
+        if (cJSON_IsNumber(bg)) {
+            outConfig.backgroundEffect = bg->valueint;
+        } else {
+            // Back-compat with the old on/off "ambient_background" key:
+            // true becomes Circles (1), the effect it used to mean.
+            outConfig.backgroundEffect = boolean("ambient_background", false) ? 1 : 0;
+        }
+        if (outConfig.backgroundEffect < 0 || outConfig.backgroundEffect > 5) outConfig.backgroundEffect = 0;
+    }
+    outConfig.lightMode = boolean("light_mode", false);
     outConfig.snow = boolean("snow", false);
     outConfig.clock = boolean("clock", false);
+    outConfig.rainbowEasterEgg = boolean("rainbow_easter_egg", false);
     outConfig.rainbowUnlocked = boolean("rainbow_unlocked", false);
     outConfig.autoplayNext = boolean("autoplay_next", true);
     outConfig.gamepadOffInVideo = boolean("gamepad_off_in_video", false);
+    outConfig.allowUnalignedVideoGeometry = boolean("allow_unaligned_video_geometry", true);
 
     cJSON* videoBitrate = cJSON_GetObjectItem(json, "video_bitrate");
     if (cJSON_IsNumber(videoBitrate) && videoBitrate->valueint > 0) {
@@ -149,12 +162,16 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setStr("menu_music_name", config.menuMusicName);
     setBool("crt", config.crt);
     setNum("accent", config.accent);
-    setBool("ambient_background", config.ambient);
+    cJSON_DeleteItemFromObject(json, "ambient_background"); // superseded by background_effect
+    setNum("background_effect", config.backgroundEffect);
+    setBool("light_mode", config.lightMode);
     setBool("snow", config.snow);
     setBool("clock", config.clock);
+    setBool("rainbow_easter_egg", config.rainbowEasterEgg);
     setBool("rainbow_unlocked", config.rainbowUnlocked);
     setBool("autoplay_next", config.autoplayNext);
     setBool("gamepad_off_in_video", config.gamepadOffInVideo);
+    setBool("allow_unaligned_video_geometry", config.allowUnalignedVideoGeometry);
 
     char* text = cJSON_Print(json);
     cJSON_Delete(json);

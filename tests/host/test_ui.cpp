@@ -341,14 +341,14 @@ static void testLookSettings() {
 
     // Animated background: visible between rows / in the header area, and
     // it moves.
-    ui::setAmbientBackground(true);
+    ui::setBackgroundEffect(ui::Background::Circles);
     SoftRender amb = renderScreen([&] { ui::drawBrowser(m); }, "ambient");
     int changed = 0;
     for (int y = 90; y < 120; y++)
         for (int x = 300; x < 1200; x += 4)
             if (amb.at(x, y) != blue.at(x, y)) changed++;
     CHECK(changed > 50);
-    ui::setAmbientBackground(false);
+    ui::setBackgroundEffect(ui::Background::Off);
 
     // Snow: white flakes on top.
     SoftRender snow = renderScreen([&] {
@@ -456,7 +456,7 @@ static void testSettingsPreview() {
                {"Snow", "Off", "Gentle snowfall over the menus", ui::Icon::Snow, 0, 0},
                {"Clock", "On", "The time in the top-right corner", ui::Icon::Clock, 0, 0},
                {"Signed in as alex", "Sign out", "192.168.1.100", ui::Icon::User, 0, 0},
-               {"About Ufin", "0.1.0", "A Jellyfin client for the Wii U", ui::Icon::Info, 0, 0}};
+               {"About Ufin", "1.1.0", "A Jellyfin client for the Wii U", ui::Icon::Info, 0, 0}};
     m.hints = {{"A", "Change"}, {"B", "Back"}};
     SoftRender sr = renderScreen([&] { ui::drawBrowser(m); }, "settings");
     CHECK_EQ(sr.at((int)ui::layout::listRow(0).x + 200, (int)ui::layout::listRow(0).y + 3), SELECTED);
@@ -535,6 +535,41 @@ static void testNowPlaying() {
     CHECK_EQ(sr.at(110 + 170 - 22, 150 + 170), bgr(0xFFFFFF)); // pause bar on the artwork
 }
 
+static void testMusicVisualizer() {
+    ui::VisualizerModel m;
+    m.title = "Nessun dorma";
+    m.bandCount = 8;
+    for (int i = 0; i < m.bandCount; i++) m.bands[i] = 0.0f;
+    m.hints = {{"A", "Pause"}, {"< >", "Seek"}, {"-", "Now Playing"}, {"B", "Stop"}};
+
+    // All-zero bands: still renders (the "warming up" / floor case), no crash.
+    renderScreen([&] { ui::drawMusicVisualizer(m); }, "visualizer_silent");
+
+    // One band clearly louder than its neighbours should paint taller
+    // (i.e. reaching higher, smaller y) than a quiet one at the same x.
+    m.bands[2] = 1.0f;
+    m.bands[5] = 0.05f;
+    SoftRender sr = renderScreen([&] { ui::drawMusicVisualizer(m); }, "visualizer_bars");
+
+    const float top = 240.0f, bottom = ui::layout::FOOTER_Y - 60.0f;
+    const float areaH = bottom - top;
+    const float gap = 18.0f;
+    const float barW = (ui::layout::SCREEN_W - 120.0f - gap * (m.bandCount - 1)) / (float)m.bandCount;
+    auto barCenterX = [&](int i) { return (int)(60.0f + i * (barW + gap) + barW * 0.5f); };
+    // Just above a loud bar's top should be filled; just above a quiet
+    // bar's (much lower) top should still be background.
+    int loudTopY = (int)(bottom - areaH * (0.03f + 0.97f * 1.0f)) + 4;
+    int quietAboveY = (int)(bottom - areaH * (0.03f + 0.97f * 0.05f)) - 20;
+    CHECK(sr.at(barCenterX(2), loudTopY) != BG);
+    CHECK_EQ(sr.at(barCenterX(5), quietAboveY), BG);
+
+    // Paused state and an empty band count both still render cleanly.
+    m.paused = true;
+    renderScreen([&] { ui::drawMusicVisualizer(m); }, "visualizer_paused");
+    m.bandCount = 0;
+    renderScreen([&] { ui::drawMusicVisualizer(m); }, "visualizer_empty");
+}
+
 static void testHud() {
     ui::VideoHudModel m;
     m.title = "Big Buck Bunny";
@@ -601,6 +636,7 @@ int main(int argc, char** argv) {
     testBadgesAndDialogs();
     testMessage();
     testNowPlaying();
+    testMusicVisualizer();
     testHud();
 
     ImGui::DestroyContext();

@@ -30,6 +30,18 @@ public:
     void frame(const std::function<void()>& build,
                const std::function<void(uint32_t width, uint32_t height)>& underlay = {});
 
+    // Draws two independent UI frames: one to the TV and one to the GamePad.
+    // This is used by the music visualizer so the TV can show the visualizer
+    // while the GamePad keeps the normal Now Playing controls, and by the
+    // movie "TV-only" mode, where `tvUnderlay` draws the video picture (as
+    // in frame() above) and `tvBuild` is left unset so the TV shows a clean
+    // picture with no ImGui HUD on top, while `drcBuild` draws the GamePad
+    // movie-remote UI. Unlike frame(), the GamePad is never a scaled copy
+    // of the TV here -- it always renders its own independent ImGui frame.
+    void frameTvDrc(const std::function<void()>& tvBuild,
+                   const std::function<void()>& drcBuild,
+                   const std::function<void(uint32_t width, uint32_t height)>& tvUnderlay = {});
+
 private:
     bool ready_ = false;
     bool crt_ = false;

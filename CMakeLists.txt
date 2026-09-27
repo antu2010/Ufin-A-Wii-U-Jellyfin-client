@@ -37,6 +37,7 @@ add_executable(ufin
     src/media/decoder.cpp
     src/media/video_output.cpp
     src/media/audio_output.cpp
+    src/media/audio_visualizer.cpp
     src/media/player.cpp
     src/media/menu_music.cpp
     src/ui/app_ui.cpp

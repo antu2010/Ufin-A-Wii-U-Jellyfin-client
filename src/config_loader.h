@@ -31,14 +31,33 @@ struct UfinConfig {
     // Look & feel (Settings)
     bool crt = false;              // scanlines + vignette over everything
     int accent = 0;                // ui::Accent index
-    bool ambient = false;          // drifting glow behind the menus
+    bool lightMode = false;        // light palette instead of the dark default
+    // Animated background effect. ui::Background index: 0=Off, 1=Circles
+    // (the original drifting glow), 2=Wii U-style bubbles, 3=Animated
+    // gradient, 4=Polygons, 5=Starfield. Out-of-range values are clamped
+    // back to Off by App::applyLook().
+    int backgroundEffect = 0;
     bool snow = false;             // falling snow over the menus
     bool clock = false;            // time in the header
-    bool rainbowUnlocked = false;  // hidden accent (tap About seven times)
+    bool rainbowEasterEgg = false; // found the hidden About easter egg -- reveals the toggle below
+    bool rainbowUnlocked = false;  // Rainbow accent toggle state (only shown/settable once the egg is found)
 
     // Playback
     bool autoplayNext = true;      // next episode after a countdown
     bool gamepadOffInVideo = false; // turn the GamePad screen off during TV playback
+
+    // Diagnostic/testing escape hatch for the h264_wiiu macroblock-alignment
+    // safety check in Decoder::open() (see decoder.cpp): that check refuses
+    // to open the hardware decoder for a stream whose width/height aren't
+    // 256/16-pixel aligned, since an unaligned stream previously meant an
+    // under-allocated framebuffer and a real hardware crash. Surfaced in
+    // Settings as "Strict video format check" (inverted there: On means
+    // this is false). Defaults to true (protection off) as of the
+    // FFmpeg-wiiu aligned-framebuffer fix in h264_wiiu.c -- real-hardware
+    // testing after that fix still showed an occasional crash (~1 in 3 on
+    // known-bad titles), so this is not a fully closed issue; a user who
+    // hits it can turn the check back on from Settings.
+    bool allowUnalignedVideoGeometry = true;
 
     // Optional video transcode settings (see JellyfinClient::
     // buildVideoStreamUrl for what they mean and why the defaults are

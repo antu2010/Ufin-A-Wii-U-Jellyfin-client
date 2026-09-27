@@ -23,14 +23,16 @@ enum class PlayResult {
 
 // What the poll callback wants Player to do.
 struct PlayerCommand {
-    enum class Kind { None, Stop, TogglePause, SeekTo };
+    enum class Kind { None, Stop, TogglePause, SeekTo, SetVolume };
     Kind kind = Kind::None;
     double seconds = 0.0; // SeekTo: absolute position in the item
+    double volume = 0.0;  // SetVolume: 0..1
 
     static PlayerCommand none() { return PlayerCommand(); }
     static PlayerCommand stop() { PlayerCommand c; c.kind = Kind::Stop; return c; }
     static PlayerCommand togglePause() { PlayerCommand c; c.kind = Kind::TogglePause; return c; }
     static PlayerCommand seekTo(double s) { PlayerCommand c; c.kind = Kind::SeekTo; c.seconds = s; return c; }
+    static PlayerCommand setVolume(double v) { PlayerCommand c; c.kind = Kind::SetVolume; c.volume = v; return c; }
 };
 
 // Stream time -> position in the item: see itemPositionFromStreamTime in seek.h.
@@ -46,6 +48,13 @@ struct PlayOptions {
     // StartTimeTicks. Makes positionSeconds()/onTick report positions in
     // the item rather than in the stream.
     double startOffsetSeconds = 0.0;
+
+    // Output volume (0..1) to start playback at -- e.g. carried over
+    // from a slider the user was already dragging on a previous track,
+    // or from a previous play() call before a seek restarted the
+    // stream (see PlayerCommand::SetVolume for changing it while this
+    // call is running).
+    double initialVolume = 1.0;
 
     // Draws each video frame as part of an app frame (see VideoPresenter
     // in video_output.h) so the app can put its HUD on top. Unset = bare
@@ -65,6 +74,12 @@ struct PlayOptions {
     // screen (Now Playing). Should render one frame; it's the loop's
     // pacing then (the frame waits for vsync).
     std::function<void()> onIdleFrame;
+
+    // Mirrors UfinConfig::allowUnalignedVideoGeometry (see config_loader.h
+    // for what it's for) -- forwarded to Decoder before it opens the
+    // codec. Default false: keep the h264_wiiu geometry safety check
+    // active unless the caller explicitly opted out.
+    bool allowUnalignedVideoGeometry = false;
 };
 
 class Player {
@@ -96,6 +111,27 @@ public:
     bool isPaused() const { return paused_; }
     double seekTarget() const { return seek_target_; }
 
+    // Current output volume (0..1) -- options.initialVolume until a
+    // PlayerCommand::SetVolume changes it. Valid at any time, including
+    // before/after play() so the caller can carry a user's chosen
+    // volume across a seek restart or into the next queued track.
+    double volume() const { return volume_; }
+
+    // Copies up to `capacity` samples of the most recently played mono
+    // PCM into `out` for a music visualizer or similar -- see
+    // AudioOutput::fetchVisualizerSamples for the format and threading
+    // notes. Returns how many were written; 0 if there's no active audio
+    // (video hasn't started playing audio yet, or play() isn't running)
+    // or nothing new since `lastSeq` was last passed in. Cheap enough to
+    // call every frame from onIdleFrame/presentVideo, which run on the
+    // same thread as play() itself -- no extra synchronization needed on
+    // this side beyond what AudioOutput's own snapshot lock provides.
+    int fetchVisualizerSamples(int16_t* out, int capacity, uint32_t* lastSeq) const;
+
+    // Output sample rate of the currently active audio, for the caller's
+    // frequency analysis; 0 if there's no active audio right now.
+    int visualizerSampleRate() const;
+
     const std::string& lastError() const { return last_error_; }
 
 private:
@@ -103,4 +139,6 @@ private:
     double last_position_ = 0.0;
     bool paused_ = false;
     double seek_target_ = 0.0;
+    double volume_ = 1.0;
+    class AudioOutput* active_audio_ = nullptr; // valid only while play() is running
 };

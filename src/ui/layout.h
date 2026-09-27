@@ -56,6 +56,34 @@ static const float NP_ART = 340.0f;
 static const float NP_ART_X = 110.0f;
 static const float NP_ART_Y = 150.0f;
 
+// Now Playing text column, and the fixed vertical rhythm within it:
+// label, a title block of constant height (regardless of how many
+// lines the title actually wraps to, so nothing below it ever moves),
+// subtitle, progress bar, time row, transport buttons. Shared by
+// drawNowPlaying (drawing) and the transport-button hit-test below, so
+// touch and drawing can never disagree -- same reasoning as the file
+// comment at the top for hitTestBrowser et al.
+static const float NP_TEXT_X = NP_ART_X + NP_ART + 60.0f;
+static const float NP_LABEL_Y = NP_ART_Y + 20.0f;
+static const float NP_TITLE_BLOCK_H = 110.0f;
+static const float NP_SUBTITLE_Y = NP_LABEL_Y + 36.0f + NP_TITLE_BLOCK_H;
+static const float NP_PROGRESS_Y = NP_SUBTITLE_Y + 60.0f;
+static const float NP_TEXT_W = SCREEN_W - 90.0f - NP_TEXT_X; // = progress bar width
+static const float NP_TIME_Y = NP_PROGRESS_Y + 22.0f;
+static const float NP_BUTTONS_Y = NP_TIME_Y + 40.0f;
+static const float NP_BUTTON_SIZE = 56.0f;
+static const float NP_BUTTON_SIZE_BIG = 78.0f; // play/pause, the primary action
+static const float NP_BUTTON_GAP = 26.0f;
+
+// Volume slider, directly under the transport buttons: a plain
+// horizontal drag-track the same width as the progress bar. NP_VOLUME_H
+// is the touchable height (see ui::npVolumeRect below), taller than the
+// thin line actually drawn, so it's comfortable to drag on the GamePad
+// touch screen.
+static const float NP_VOLUME_Y = NP_BUTTONS_Y + NP_BUTTON_SIZE_BIG + 30.0f;
+static const float NP_VOLUME_H = 28.0f;
+static const float NP_QUEUE_Y = NP_VOLUME_Y + NP_VOLUME_H + 24.0f;
+
 // Largest image size worth fetching for each spot (in pixels of the
 // 1080p TV buffer, the sharpest case -- 1.5x the layout size).
 static const int ROW_IMAGE_MAX_W = 96;
@@ -195,6 +223,61 @@ inline int hitTestChoice(float x, float y, int count) {
 inline int hitTestLogin(float x, float y, int rows) {
     for (int i = 0; i < rows; i++) if (layout::loginRow(i).contains(x, y)) return i;
     return -1;
+}
+
+// Now Playing transport buttons, under the progress bar: seek back,
+// play/pause, seek forward, stop -- in that order, left to right, the
+// row centred under the progress bar. Play/pause is drawn bigger, as
+// the primary action. Index order is the contract between
+// drawNowPlaying (draws them) and PlaybackControl::poll() (hit-tests
+// taps against them), for both the music Now Playing screen and the
+// movie remote (TV-only mode).
+enum class NpButton { SeekBack = 0, PlayPause = 1, SeekForward = 2, Stop = 3, Count = 4 };
+
+inline float npButtonSize(int index) {
+    return index == (int)NpButton::PlayPause ? layout::NP_BUTTON_SIZE_BIG : layout::NP_BUTTON_SIZE;
+}
+
+inline Rect npButtonRect(int index) {
+    float total = layout::NP_BUTTON_GAP * ((int)NpButton::Count - 1);
+    for (int i = 0; i < (int)NpButton::Count; i++) total += npButtonSize(i);
+    float x = layout::NP_TEXT_X + (layout::NP_TEXT_W - total) * 0.5f;
+    for (int i = 0; i < index; i++) x += npButtonSize(i) + layout::NP_BUTTON_GAP;
+    Rect r;
+    r.w = r.h = npButtonSize(index);
+    r.x = x;
+    // Vertically centred against the taller play/pause button, so every
+    // button's centre sits on the same line regardless of its size.
+    r.y = layout::NP_BUTTONS_Y + (layout::NP_BUTTON_SIZE_BIG - r.h) * 0.5f;
+    return r;
+}
+
+// -1 if the touch doesn't land on any transport button.
+inline int hitTestNowPlaying(float x, float y) {
+    for (int i = 0; i < (int)NpButton::Count; i++)
+        if (npButtonRect(i).contains(x, y)) return i;
+    return -1;
+}
+
+// Touch rect for the volume slider, below the transport buttons -- same
+// x/width as the progress bar, see NP_VOLUME_Y/NP_VOLUME_H. Kept
+// separate from hitTestNowPlaying (which is button hit-testing, edge
+// detected) since a slider is dragged continuously: the caller checks
+// Rect::contains() itself on every touched poll, not just on the first
+// touch-down.
+inline Rect npVolumeRect() {
+    return Rect{layout::NP_TEXT_X, layout::NP_VOLUME_Y, layout::NP_TEXT_W, layout::NP_VOLUME_H};
+}
+
+// Volume (0..1) that a touch at x along npVolumeRect() corresponds to,
+// clamped to the slider's ends. Shared by drawNowPlaying (drawing the
+// knob) and PlaybackControl::poll() (turning a drag into a volume),
+// same reasoning as the rest of this file.
+inline float npVolumeFraction(float x) {
+    Rect r = npVolumeRect();
+    if (r.w <= 0.0f) return 0.0f;
+    float f = (x - r.x) / r.w;
+    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
 }
 
 // "m:ss" or "h:mm:ss".

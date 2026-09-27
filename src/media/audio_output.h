@@ -77,6 +77,22 @@ public:
 
     void shutdown();
 
+    // Fixed output rate everything is resampled to (see the class
+    // comment) -- needed by anything analysing the PCM this hands out,
+    // e.g. AudioVisualizer, so the frequency math doesn't hardcode 48000
+    // in a second place.
+    int outputSampleRate() const { return out_sample_rate_; }
+
+    // Visualizer support: copies up to `capacity` of the most recently
+    // played PCM (downmixed to mono) into `out`. `lastSeq` should start
+    // at 0; pass the same variable back in each call and it's used to
+    // report "nothing new since your last call" (returns 0) so a reader
+    // polling faster than audio arrives doesn't redraw on stale data.
+    // Safe to call from any thread -- guarded by its own lock, separate
+    // from the A/V-sync clock's, so a visualizer read can never block or
+    // be blocked by clock bookkeeping on the audio/decode thread.
+    int fetchVisualizerSamples(int16_t* out, int capacity, uint32_t* lastSeq) const;
+
     const char* lastError() const { return last_error_; }
 
 private:
@@ -106,4 +122,16 @@ private:
     uint32_t clock_wall_ms_ = 0;
 
     double bytesPerSecond() const { return (double)out_sample_rate_ * out_channels_ * (int)sizeof(int16_t); }
+
+    // Visualizer snapshot: a small fixed-size ring of the most recently
+    // queued PCM (mono), written in queueFrame() (audio/decode thread)
+    // and read by fetchVisualizerSamples() (UI/render thread). Fixed
+    // size, no allocation; a plain array + a cheap lock is all this
+    // needs given how small and infrequent (once per decoded audio
+    // frame, a few dozen times a second at most) the writes are.
+    static const int VIS_SNAPSHOT_SAMPLES = 1024;
+    mutable std::mutex vis_mtx_;
+    int16_t vis_samples_[VIS_SNAPSHOT_SAMPLES] = {};
+    int vis_count_ = 0;
+    uint32_t vis_sequence_ = 0;
 };

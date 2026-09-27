@@ -11,16 +11,19 @@ namespace ui {
 // --- palette ---
 
 namespace col {
-static const ImU32 BG          = IM_COL32(0x14, 0x16, 0x1A, 0xFF);
-static const ImU32 SIDEBAR     = IM_COL32(0x1B, 0x1E, 0x24, 0xFF);
-static const ImU32 PANEL       = IM_COL32(0x23, 0x27, 0x2E, 0xFF);
-static const ImU32 PANEL_HI    = IM_COL32(0x2C, 0x31, 0x3A, 0xFF);
+// Mutable, not const: setLightMode() below reassigns the whole block in
+// place so every one of the ~100 call sites elsewhere in this file that
+// reads e.g. col::BG keeps working unchanged, dark or light. Semantic
+// colours (error/live/white) don't need a light variant and stay const.
+static ImU32 BG          = IM_COL32(0x14, 0x16, 0x1A, 0xFF);
+static ImU32 SIDEBAR     = IM_COL32(0x1B, 0x1E, 0x24, 0xFF);
+static ImU32 PANEL       = IM_COL32(0x23, 0x27, 0x2E, 0xFF);
+static ImU32 PANEL_HI    = IM_COL32(0x2C, 0x31, 0x3A, 0xFF);
 
-
-static const ImU32 TEXT        = IM_COL32(0xEC, 0xEE, 0xF1, 0xFF);
-static const ImU32 MUTED       = IM_COL32(0x9A, 0xA0, 0xA8, 0xFF);
-static const ImU32 DIM         = IM_COL32(0x5F, 0x65, 0x6E, 0xFF);
-static const ImU32 TRACK       = IM_COL32(0x3A, 0x3F, 0x48, 0xFF);
+static ImU32 TEXT        = IM_COL32(0xEC, 0xEE, 0xF1, 0xFF);
+static ImU32 MUTED       = IM_COL32(0x9A, 0xA0, 0xA8, 0xFF);
+static ImU32 DIM         = IM_COL32(0x5F, 0x65, 0x6E, 0xFF);
+static ImU32 TRACK       = IM_COL32(0x3A, 0x3F, 0x48, 0xFF);
 static const ImU32 ERROR_RED   = IM_COL32(0xD9, 0x48, 0x5F, 0xFF);
 static const ImU32 LIVE_RED    = IM_COL32(0xE5, 0x39, 0x35, 0xFF);
 static const ImU32 WHITE       = IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
@@ -34,14 +37,26 @@ struct AccentColours {
 static AccentColours g_accent = {IM_COL32(0x00, 0xA4, 0xDC, 0xFF), IM_COL32(0x0B, 0x7F, 0xB0, 0xFF),
                                  IM_COL32(0xAA, 0x5C, 0xC3, 0xFF)};
 static bool g_rainbow = false;
-static bool g_ambient = false;
+static Background g_background = Background::Off;
 static bool g_snow = false;
+static bool g_light = false; // false = dark palette (default), true = light
 
 static ImU32 accentMain() { return g_accent.main; }
 static ImU32 accentDeep() { return g_accent.deep; }
 static ImU32 accentSecond() { return g_accent.second; }
 
 static ImU32 rgb(uint32_t v, int a = 0xFF) { return IM_COL32((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, a); }
+
+// Linear blend between two packed colours, t in 0..1.
+static ImU32 lerpColor(ImU32 a, ImU32 b, float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    auto ch = [&](int shift) -> int {
+        int ca = (int)((a >> shift) & 0xFF), cb = (int)((b >> shift) & 0xFF);
+        return ca + (int)((cb - ca) * t);
+    };
+    return IM_COL32(ch(0), ch(8), ch(16), ch(24));
+}
 
 
 static ImU32 hsv(float h, float sat, float val) {
@@ -59,6 +74,10 @@ const char* accentName(Accent a) {
         case Accent::Green:   return "Green";
         case Accent::Orange:  return "Orange";
         case Accent::Pink:    return "Pink";
+        case Accent::Teal:    return "Teal";
+        case Accent::Crimson: return "Crimson";
+        case Accent::Amber:   return "Amber";
+        case Accent::Indigo:  return "Indigo";
         case Accent::Rainbow: return "Rainbow";
         default:              return "";
     }
@@ -68,12 +87,18 @@ void setAccent(Accent a) {
     g_accentStyle = a;
     g_rainbow = (a == Accent::Rainbow);
     switch (a) {
-        case Accent::Purple: g_accent = {rgb(0xAA5CC3), rgb(0x7E3F99), rgb(0x00A4DC)}; break;
-        case Accent::Green:  g_accent = {rgb(0x2ECC71), rgb(0x1E8C4E), rgb(0x00A4DC)}; break;
-        case Accent::Orange: g_accent = {rgb(0xFF9F43), rgb(0xC7702A), rgb(0xE84393)}; break;
-        case Accent::Pink:   g_accent = {rgb(0xFF6BB5), rgb(0xC2447F), rgb(0x7E57C2)}; break;
+        case Accent::Purple:  g_accent = {rgb(0xAA5CC3), rgb(0x7E3F99), rgb(0x00A4DC)}; break;
+        case Accent::Green:   g_accent = {rgb(0x2ECC71), rgb(0x1E8C4E), rgb(0x00A4DC)}; break;
+        case Accent::Orange:  g_accent = {rgb(0xFF9F43), rgb(0xC7702A), rgb(0xE84393)}; break;
+        case Accent::Pink:    g_accent = {rgb(0xFF6BB5), rgb(0xC2447F), rgb(0x7E57C2)}; break;
+        // Four new colourways, same {main, deep, secondary} shape as the
+        // originals above (secondary is only used for gradients/ambient).
+        case Accent::Teal:    g_accent = {rgb(0x1ABC9C), rgb(0x128F76), rgb(0x3498DB)}; break;
+        case Accent::Crimson: g_accent = {rgb(0xE74C3C), rgb(0xB03A2E), rgb(0xF39C12)}; break;
+        case Accent::Amber:   g_accent = {rgb(0xF1C40F), rgb(0xB7950B), rgb(0xE67E22)}; break;
+        case Accent::Indigo:  g_accent = {rgb(0x5C6BC0), rgb(0x3F4A8C), rgb(0x26C6DA)}; break;
         case Accent::Rainbow: tickTheme(0.0); break;
-        default:             g_accent = {rgb(0x00A4DC), rgb(0x0B7FB0), rgb(0xAA5CC3)}; break;
+        default:              g_accent = {rgb(0x00A4DC), rgb(0x0B7FB0), rgb(0xAA5CC3)}; break;
     }
 }
 
@@ -83,13 +108,51 @@ void tickTheme(double time) {
     g_accent = {hsv(h, 0.72f, 0.95f), hsv(h, 0.78f, 0.66f), hsv(h + 0.33f, 0.6f, 0.9f)};
 }
 
-void setAmbientBackground(bool on) { g_ambient = on; }
+const char* backgroundEffectName(Background b) {
+    switch (b) {
+        case Background::Off:        return "Off";
+        case Background::Circles:    return "Circles";
+        case Background::WiiBubbles: return "Bubbles";
+        case Background::Gradient:   return "Gradient";
+        case Background::Polygons:   return "Polygons";
+        case Background::Starfield:  return "Starfield";
+        default:                     return "";
+    }
+}
+
+void setBackgroundEffect(Background b) { g_background = b; }
+
+// Swaps the neutral half of the palette (col::BG/SIDEBAR/PANEL/PANEL_HI/
+// TEXT/MUTED/DIM/TRACK) between the dark defaults and a light set, so
+// every existing accent colourway gets a light counterpart for free --
+// nothing that draws with col::* needs to know or care which is active.
+void setLightMode(bool on) {
+    g_light = on;
+    if (on) {
+        col::BG       = IM_COL32(0xF6, 0xF7, 0xF9, 0xFF);
+        col::SIDEBAR  = IM_COL32(0xED, 0xEE, 0xF1, 0xFF);
+        col::PANEL    = IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
+        col::PANEL_HI = IM_COL32(0xE7, 0xE9, 0xED, 0xFF);
+        col::TEXT     = IM_COL32(0x1A, 0x1D, 0x21, 0xFF);
+        col::MUTED    = IM_COL32(0x6B, 0x72, 0x80, 0xFF);
+        col::DIM      = IM_COL32(0xC3, 0xC7, 0xCC, 0xFF);
+        col::TRACK    = IM_COL32(0xD8, 0xDB, 0xE0, 0xFF);
+    } else {
+        col::BG       = IM_COL32(0x14, 0x16, 0x1A, 0xFF);
+        col::SIDEBAR  = IM_COL32(0x1B, 0x1E, 0x24, 0xFF);
+        col::PANEL    = IM_COL32(0x23, 0x27, 0x2E, 0xFF);
+        col::PANEL_HI = IM_COL32(0x2C, 0x31, 0x3A, 0xFF);
+        col::TEXT     = IM_COL32(0xEC, 0xEE, 0xF1, 0xFF);
+        col::MUTED    = IM_COL32(0x9A, 0xA0, 0xA8, 0xFF);
+        col::DIM      = IM_COL32(0x5F, 0x65, 0x6E, 0xFF);
+        col::TRACK    = IM_COL32(0x3A, 0x3F, 0x48, 0xFF);
+    }
+    applyTheme(); // refresh ImGui's own style colours (little uses them)
+}
 
 // Soft drifting glows: each blob is a stack of faint circles, which reads
-// as one blurred shape.
-static void drawAmbient() {
-    if (!g_ambient) return;
-    const double t = ImGui::GetTime();
+// as one blurred shape. The original (and only) animated background.
+static void drawBgCircles(double t) {
     ImDrawList* d = ImGui::GetBackgroundDrawList();
     const ImU32 colours[3] = {accentMain(), accentSecond(), accentDeep()};
     for (int i = 0; i < 3; i++) {
@@ -100,6 +163,112 @@ static void drawAmbient() {
             float r = 320.0f - k * 40.0f;
             d->AddCircleFilled(ImVec2(cx, cy), r, ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 0.045f)), 48);
         }
+    }
+}
+
+// Wii U HOME Menu-style bubbles: small rings rising from the bottom of
+// the screen and looping back around, instead of the "Circles" mode's
+// slow-drifting glow blobs.
+static void drawBgWiiBubbles(double t) {
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    for (int i = 0; i < 26; i++) {
+        uint32_t hsh = (uint32_t)i * 2654435761u;
+        float r1 = (hsh & 0xFFFF) / 65535.0f, r2 = ((hsh >> 16) & 0xFFFF) / 65535.0f;
+        float speed = 14.0f + r2 * 22.0f;
+        float size = 10.0f + r1 * 34.0f;
+        float y = 720.0f - (float)std::fmod(r2 * 720.0 + t * speed, 800.0);
+        float x = r1 * 1280.0f + 26.0f * (float)std::sin(t * (0.25 + r2 * 0.4) + i * 1.7);
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4((i % 2 == 0) ? accentMain() : accentSecond());
+        d->AddCircle(ImVec2(x, y), size, ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 0.10f + 0.05f * r1)),
+                     24, 1.6f + r1 * 1.4f);
+        d->AddCircleFilled(ImVec2(x, y), size * 0.18f, ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 0.12f)), 12);
+    }
+}
+
+// A slowly rotating, low-alpha diagonal gradient wash across the whole
+// background. Kept faint (alpha ~0.14) and drawn before every panel/list
+// row, so it never competes with foreground text.
+static void drawBgGradient(double t) {
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    const float x0 = 0.0f, y0 = 0.0f, x1 = 1280.0f, y1 = 720.0f;
+    d->PathRect(ImVec2(x0, y0), ImVec2(x1, y1), 0.0f);
+    const int n = d->_Path.Size;
+    if (n < 3) { d->PathClear(); return; }
+    float angle = (float)std::fmod(t * 0.035, 1.0) * 6.2831853f;
+    ImVec2 dir(std::cos(angle), std::sin(angle));
+    ImVec4 ca = ImGui::ColorConvertU32ToFloat4(accentDeep());
+    ImVec4 cb = ImGui::ColorConvertU32ToFloat4(accentSecond());
+    const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+    const float diag = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) * 0.5f;
+    auto colourAt = [&](const ImVec2& p) {
+        float proj = ((p.x - cx) * dir.x + (p.y - cy) * dir.y) / diag;
+        float tt = proj * 0.5f + 0.5f;
+        tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(ca.x + (cb.x - ca.x) * tt, ca.y + (cb.y - ca.y) * tt,
+                                                     ca.z + (cb.z - ca.z) * tt, 0.14f));
+    };
+    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+    d->PrimReserve(n * 3, n + 1);
+    const ImDrawIdx base = (ImDrawIdx)d->_VtxCurrentIdx;
+    d->PrimWriteVtx(ImVec2(cx, cy), uv, colourAt(ImVec2(cx, cy)));
+    for (int i = 0; i < n; i++) d->PrimWriteVtx(d->_Path[i], uv, colourAt(d->_Path[i]));
+    for (int i = 0; i < n; i++) {
+        d->PrimWriteIdx(base);
+        d->PrimWriteIdx((ImDrawIdx)(base + 1 + i));
+        d->PrimWriteIdx((ImDrawIdx)(base + 1 + (i + 1) % n));
+    }
+    d->PathClear();
+}
+
+// Faint drifting, slowly rotating polygons (triangles through hexagons).
+static void drawBgPolygons(double t) {
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    for (int i = 0; i < 8; i++) {
+        uint32_t hsh = (uint32_t)i * 2654435761u;
+        float r1 = (hsh & 0xFFFF) / 65535.0f, r2 = ((hsh >> 16) & 0xFFFF) / 65535.0f;
+        float cx = 1280.0f * (0.1f + 0.8f * r1) + 40.0f * (float)std::sin(t * 0.05 + i * 1.9);
+        float cy = 720.0f * (0.15f + 0.75f * r2) + 30.0f * (float)std::cos(t * 0.045 + i * 1.3);
+        float rot = (float)(t * (0.08 + 0.05 * r1) + i);
+        float size = 46.0f + 30.0f * r2;
+        int sides = 3 + (i % 4); // 3..6
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4((i % 2 == 0) ? accentMain() : accentSecond());
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 0.07f));
+        ImVec2 pts[6];
+        for (int k = 0; k < sides; k++) {
+            float a = rot + k * (6.2831853f / (float)sides);
+            pts[k] = ImVec2(cx + std::cos(a) * size, cy + std::sin(a) * size);
+        }
+        d->AddConvexPolyFilled(pts, sides, col);
+    }
+}
+
+// A field of small, gently twinkling points drifting sideways.
+static void drawBgStarfield(double t) {
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    for (int i = 0; i < 70; i++) {
+        uint32_t hsh = (uint32_t)i * 2654435761u;
+        float r1 = (hsh & 0xFFFF) / 65535.0f, r2 = ((hsh >> 16) & 0xFFFF) / 65535.0f;
+        float speed = 4.0f + r2 * 10.0f;
+        float x = (float)std::fmod(r1 * 1280.0 + t * speed, 1320.0) - 20.0f;
+        float y = r2 * 720.0f;
+        float twinkle = 0.35f + 0.35f * (float)std::sin(t * (1.2 + r1 * 1.5) + i);
+        float size = 1.2f + r1 * 2.2f;
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4((i % 3 == 0) ? accentSecond() : col::TEXT);
+        d->AddCircleFilled(ImVec2(x, y), size,
+                            ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 0.10f + 0.12f * twinkle)), 8);
+    }
+}
+
+static void drawBackgroundEffect() {
+    if (g_background == Background::Off) return;
+    const double t = ImGui::GetTime();
+    switch (g_background) {
+        case Background::Circles:    drawBgCircles(t); break;
+        case Background::WiiBubbles: drawBgWiiBubbles(t); break;
+        case Background::Gradient:   drawBgGradient(t); break;
+        case Background::Polygons:   drawBgPolygons(t); break;
+        case Background::Starfield:  drawBgStarfield(t); break;
+        default: break;
     }
 }
 
@@ -424,7 +593,7 @@ static void drawArtBadges(const ListEntry& e, const layout::Fit& f) {
 
 void drawBrowser(const BrowserModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
 
     // Sidebar
     rect({0, 0, layout::SIDEBAR_W, layout::SCREEN_H}, col::SIDEBAR);
@@ -548,7 +717,7 @@ void drawBrowser(const BrowserModel& m) {
 
 void drawMessage(const MessageModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
     drawLogo(30.0f, 40.0f);
 
     const float cardW = 820.0f;
@@ -596,7 +765,7 @@ void drawMessage(const MessageModel& m) {
 
 void drawNowPlaying(const NowPlayingModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
     drawLogo(30.0f, 40.0f);
 
     // Artwork: the album art, or a gradient tile with a note.
@@ -616,32 +785,128 @@ void drawNowPlaying(const NowPlayingModel& m) {
         dl()->AddRectFilled(ImVec2(cx + 10, cy - 44), ImVec2(cx + 34, cy + 44), col::WHITE, 5.0f);
     }
 
-    const float tx = ax + art + 60.0f;
-    const float tw = layout::SCREEN_W - 90.0f - tx;
-    float y = ay + 20.0f;
-    text(TEXT_S, tx, y, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
-    y += 36.0f;
-    dl()->AddText(font(), 40.0f, ImVec2(tx, y), col::TEXT, m.title.c_str(), nullptr, tw);
-    y += std::min(100.0f, font()->CalcTextSizeA(40.0f, 1e9f, tw, m.title.c_str()).y) + 10.0f;
-    text(TEXT_M, tx, y, col::MUTED, m.subtitle, tw);
-    y += 60.0f;
+    const float tx = layout::NP_TEXT_X;
+    const float tw = layout::NP_TEXT_W;
+    text(TEXT_S, tx, layout::NP_LABEL_Y, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
+    dl()->AddText(font(), 40.0f, ImVec2(tx, layout::NP_LABEL_Y + 36.0f), col::TEXT, m.title.c_str(), nullptr, tw);
+    text(TEXT_M, tx, layout::NP_SUBTITLE_Y, col::MUTED, m.subtitle, tw);
 
-    drawProgress(tx, y, tw, 8.0f, m.positionSeconds, m.durationSeconds, false);
-    y += 22.0f;
-    text(TEXT_S, tx, y, col::MUTED, formatTime(m.positionSeconds));
-    if (m.durationSeconds > 0.0) textRight(TEXT_S, tx + tw, y, col::MUTED, formatTime(m.durationSeconds));
-    y += 52.0f;
+    drawProgress(tx, layout::NP_PROGRESS_Y, tw, 8.0f, m.positionSeconds, m.durationSeconds, false);
+    text(TEXT_S, tx, layout::NP_TIME_Y, col::MUTED, formatTime(m.positionSeconds));
+    if (m.durationSeconds > 0.0)
+        textRight(TEXT_S, tx + tw, layout::NP_TIME_Y, col::MUTED, formatTime(m.durationSeconds));
 
-    if (!m.queueText.empty()) {
-        text(TEXT_S, tx, y, col::TEXT, m.queueText, tw);
-        y += 30.0f;
+    // Transport buttons: seek back / play-pause / seek forward / stop,
+    // touch-tappable (see layout::npButtonRect / hitTestNowPlaying).
+    // Slightly transparent so they read as an overlay on the artwork
+    // row rather than solid chrome.
+    for (int i = 0; i < (int)ui::NpButton::Count; i++) {
+        ui::Rect r = ui::npButtonRect(i);
+        float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
+        dl()->AddCircleFilled(ImVec2(cx, cy), r.w * 0.5f, IM_COL32(0x2C, 0x31, 0x3A, 0xB0), 32);
+        dl()->AddCircle(ImVec2(cx, cy), r.w * 0.5f, IM_COL32(0x3A, 0x3F, 0x48, 0xA0), 32, 1.5f);
+        const ImU32 ic = IM_COL32(0xEC, 0xEE, 0xF1, 0xE6);
+        switch ((ui::NpButton)i) {
+            case ui::NpButton::SeekBack:
+            case ui::NpButton::SeekForward: {
+                const char* label = (ui::NpButton)i == ui::NpButton::SeekBack ? "-10" : "+30";
+                const float fs = r.w * 0.34f;
+                ImVec2 sz = font()->CalcTextSizeA(fs, 1e9f, 0.0f, label);
+                dl()->AddText(font(), fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, label);
+                break;
+            }
+            case ui::NpButton::PlayPause: {
+                const float s = r.w * 0.32f;
+                if (m.paused) {
+                    dl()->AddTriangleFilled(ImVec2(cx - s * 0.55f, cy - s), ImVec2(cx - s * 0.55f, cy + s),
+                                            ImVec2(cx + s * 0.85f, cy), ic);
+                } else {
+                    dl()->AddRectFilled(ImVec2(cx - s * 0.7f, cy - s * 0.85f), ImVec2(cx - s * 0.15f, cy + s * 0.85f), ic, 2.0f);
+                    dl()->AddRectFilled(ImVec2(cx + s * 0.15f, cy - s * 0.85f), ImVec2(cx + s * 0.7f, cy + s * 0.85f), ic, 2.0f);
+                }
+                break;
+            }
+            case ui::NpButton::Stop: {
+                const float s = r.w * 0.32f;
+                dl()->AddRectFilled(ImVec2(cx - s * 0.75f, cy - s * 0.75f), ImVec2(cx + s * 0.75f, cy + s * 0.75f), ic, 2.0f);
+                break;
+            }
+            default: break;
+        }
     }
-    if (!m.nextText.empty()) text(TEXT_S, tx, y, col::MUTED, m.nextText, tw);
+
+    // Volume: a plain draggable track, no label needed -- its position
+    // under the transport buttons and the speaker icon say what it is.
+    // Touch handling for the drag lives in PlaybackControl::poll() (see
+    // layout::npVolumeRect / npVolumeFraction).
+    {
+        float vol = m.volume < 0.0f ? 0.0f : (m.volume > 1.0f ? 1.0f : m.volume);
+        ui::Rect vr = ui::npVolumeRect();
+        float lineY = vr.y + vr.h * 0.5f;
+        const float lineH = 6.0f;
+        const float iconW = 30.0f;
+        float trackX = vr.x + iconW, trackW = vr.w - iconW;
+        drawIcon(Icon::Music, vr.x + iconW * 0.5f, lineY, iconW * 0.8f, IM_COL32(0xB8, 0xBC, 0xC4, 0xFF));
+        dl()->AddRectFilled(ImVec2(trackX, lineY - lineH * 0.5f), ImVec2(trackX + trackW, lineY + lineH * 0.5f),
+                            col::TRACK, lineH * 0.5f);
+        if (vol > 0.0f) {
+            dl()->AddRectFilled(ImVec2(trackX, lineY - lineH * 0.5f), ImVec2(trackX + trackW * vol, lineY + lineH * 0.5f),
+                                accentMain(), lineH * 0.5f);
+        }
+        dl()->AddCircleFilled(ImVec2(trackX + trackW * vol, lineY), lineH * 1.4f, col::WHITE, 20);
+    }
+
+    if (!m.queueText.empty()) text(TEXT_S, tx, layout::NP_QUEUE_Y, col::TEXT, m.queueText, tw);
+    if (!m.nextText.empty()) text(TEXT_S, tx, layout::NP_QUEUE_Y + 30.0f, col::MUTED, m.nextText, tw);
 
     drawHints(m.hints, 110.0f, layout::FOOTER_Y);
 }
 
-// --- video HUD ---
+// --- music visualizer ---
+
+void drawMusicVisualizer(const VisualizerModel& m) {
+    const float W = layout::SCREEN_W, H = layout::SCREEN_H;
+    rect({0, 0, W, H}, col::BG);
+    drawBackgroundEffect();
+    drawLogo(30.0f, 40.0f);
+
+    text(TEXT_S, 60.0f, 108.0f, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
+    text(TEXT_M, 60.0f, 140.0f, col::TEXT, m.title, W - 120.0f);
+
+    // Bars, centered, leaving room for the title above and hints below.
+    const int n = m.bandCount > 0 ? std::min(m.bandCount, VisualizerModel::MAX_BANDS) : 0;
+    if (n > 0) {
+        const float top = 240.0f, bottom = layout::FOOTER_Y - 60.0f;
+        const float areaH = bottom - top;
+        const float gap = 18.0f;
+        const float barW = (W - 120.0f - gap * (n - 1)) / (float)n;
+        for (int i = 0; i < n; i++) {
+            float level = m.bands[i];
+            if (level < 0.0f) level = 0.0f;
+            if (level > 1.0f) level = 1.0f;
+            // A small floor so a quiet passage still shows a sliver of
+            // every bar rather than the row looking dead/broken.
+            float h = areaH * (0.03f + 0.97f * level);
+            float x0 = 60.0f + i * (barW + gap);
+            float x1 = x0 + barW;
+            float y1 = bottom;
+            float y0 = bottom - h;
+            // Low bands lean toward the deep accent, high bands toward
+            // the secondary accent -- a cheap per-bar gradient rather
+            // than a full per-pixel one, matching the same two-colour
+            // palette used everywhere else (drawLogo, Now Playing art).
+            float t = (float)i / (float)std::max(1, n - 1);
+            ImU32 bandColor = lerpColor(accentDeep(), accentSecond(), t);
+            gradientRoundRect(x0, y0, x1, y1, std::min(10.0f, barW * 0.3f), accentMain(), bandColor);
+        }
+    } else {
+        // No audio data yet (e.g. right at track start) -- a calm empty
+        // state rather than a blank gap.
+        text(TEXT_S, 60.0f, 240.0f, col::MUTED, "Warming up...");
+    }
+
+    drawHints(m.hints, 110.0f, layout::FOOTER_Y);
+}
 
 void drawVideoHud(const VideoHudModel& m) {
     const float W = layout::SCREEN_W, H = layout::SCREEN_H;
@@ -727,7 +992,7 @@ static void drawBrandPanel() {
 
 void drawLogin(const LoginModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
     drawBrandPanel();
 
     text(TEXT_L + 6, layout::LOGIN_X, 70.0f, col::TEXT, "Sign in to Jellyfin");
@@ -771,7 +1036,7 @@ void drawLogin(const LoginModel& m) {
 
 void drawQuickConnect(const QuickConnectModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
     drawBrandPanel();
 
     text(TEXT_L + 6, layout::LOGIN_X, 70.0f, col::TEXT, "Quick Connect");
@@ -886,7 +1151,7 @@ void drawChoice(const ChoiceModel& m) {
 
 void drawUpNext(const UpNextModel& m) {
     rect({0, 0, layout::SCREEN_W, layout::SCREEN_H}, col::BG);
-    drawAmbient();
+    drawBackgroundEffect();
     drawLogo(30.0f, 40.0f);
     const float artW = 300, artH = 420, ax = 150, ay = 150;
     if (m.art) {
