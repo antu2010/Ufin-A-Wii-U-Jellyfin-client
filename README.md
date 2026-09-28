@@ -59,9 +59,12 @@ Ufin currently relies on Jellyfin server-side transcoding for its known-good vid
 
 ## Goals
 
-* 480p60 software playback
+* 480p60 software playback for h264 and non-h264 media
 * 1080p30 hardware playback if possible
 * Eventually, direct play where possible
+* Jellyfin Backdrop support in the default UI
+* Togglable Liquid glass theme
+* Custom theme support with custom assets and config files
 
 ## Installation
 
