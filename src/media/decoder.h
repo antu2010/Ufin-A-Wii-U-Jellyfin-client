@@ -37,6 +37,13 @@ public:
     // once open() has already run. Off by default.
     void setAllowUnalignedGeometry(bool allow) { allow_unaligned_geometry_ = allow; }
 
+    // Audio-only mode, for a standalone audio file such as the .m4a/.mp3 menu music. Must be called
+    // before open(). Ignores any video stream (embedded cover art shows up as one) and runs
+    // avformat_find_stream_info(), which a bare MP3 needs to learn its sample rate and channels
+    // (an .m4a has them in its moov box already, like the fragmented MP4 from Jellyfin). Never
+    // used for real playback: find_stream_info is exactly what crashes h264_wiiu (see open()).
+    void setAudioOnly(bool on) { audio_only_ = on; }
+
     // Decodes and returns the next available frame, whichever stream
     // (video or audio) it comes from first. The returned AVFrame* stays
     // owned by Decoder and is only valid until the next call to
@@ -70,9 +77,18 @@ public:
     DecodedFrameType decodeVideoFrame(AVFrame** outFrame);
     DecodedFrameType decodeAudioFrame(AVFrame** outFrame);
 
+    // hasQueued*Packets() touch the packet deques directly, so they are for
+    // the decode thread only (the one that also calls readPacket()).
     bool hasQueuedVideoPackets() const { return !video_packets_.empty(); }
     bool hasQueuedAudioPackets() const { return !audio_packets_.empty(); }
-    size_t queuedPacketBytes() const { return queued_packet_bytes_; }
+    // The four figures below (queuedPacketBytes, queuedVideoSeconds,
+    // queuedAudioSeconds, demuxFinished) are safe to read from any thread:
+    // the decode thread keeps its own exact accumulators and publishes them
+    // after every change as 32-bit atomics (millisecond resolution for the
+    // seconds). 32-bit on purpose -- the Wii U's Espresso has no lock-free
+    // 8-byte atomics, and a plain double shared between threads is a data race
+    // (Player's rebuffering decision reads these from the render thread).
+    size_t queuedPacketBytes() const { return pub_packet_bytes_.load(std::memory_order_relaxed); }
     // Seconds of stream time currently sitting in each stream's compressed
     // packet queue, i.e. how far ahead of the decoder the network read
     // has gotten -- NOT how much has been decoded. This is what a
@@ -81,9 +97,19 @@ public:
     // per-stream decoding above), but compressed packets are cheap, so
     // "buffered ahead" means packets sitting here, waiting to be decoded
     // closer to when they're actually needed.
-    double queuedVideoSeconds() const { return queued_video_seconds_; }
-    double queuedAudioSeconds() const { return queued_audio_seconds_; }
-    bool demuxFinished() const { return reachedEof_; }
+    double queuedVideoSeconds() const { return pub_video_ms_.load(std::memory_order_relaxed) / 1000.0; }
+    double queuedAudioSeconds() const { return pub_audio_ms_.load(std::memory_order_relaxed) / 1000.0; }
+    bool demuxFinished() const { return reachedEof_.load(std::memory_order_acquire); }
+    // False only when plenty of video packets have been read and none of them
+    // carried any usable timing (neither a duration nor a decode timestamp),
+    // i.e. queuedVideoSeconds() can never mean anything for this stream.
+    // Player then leaves rebuffering off instead of reading a permanent
+    // "0 seconds buffered". True when there is not enough evidence yet (too
+    // few packets read) or timing is present.
+    bool videoTimelineUsable() const {
+        return video_timed_packets_.load(std::memory_order_relaxed) > 0 ||
+               video_untimed_packets_.load(std::memory_order_relaxed) < 30;
+    }
     // True once the demuxer hit the end and every opened decoder has
     // given back its last frame.
     bool finished() const;
@@ -106,6 +132,12 @@ public:
     // without timestamps.
     double videoFrameDuration() const;
     const char* videoCodecName() const;
+    // H.264 profile_idc from the stream's avcC box (66 Baseline, 77 Main, 100 High...),
+    // 0 if unknown. Only Baseline is known to be free of B-frames.
+    int videoProfileIdc() const { return video_profile_idc_; }
+    // True unless the stream is known to be Baseline: its pictures may come out of the
+    // hardware decoder in decode order and need putting back in display order (FrameReorder).
+    bool videoNeedsReorder() const { return video_profile_idc_ != 66; }
 
     // Audio stream info (only meaningful once open() succeeds and an
     // audio stream was found).
@@ -129,6 +161,7 @@ public:
 private:
     AVFormatContext* fmt_ctx_ = nullptr;
 
+    int video_profile_idc_ = 0; // see videoProfileIdc()
     int video_stream_index_ = -1;
     int audio_stream_index_ = -1;
     AVCodecContext* video_ctx_ = nullptr;
@@ -137,16 +170,40 @@ private:
     AVPacket* packet_ = nullptr;
     AVFrame* frame_ = nullptr;
 
-    bool reachedEof_ = false;
+    std::atomic<bool> reachedEof_{false}; // set by the decode thread, read by Player's
     bool video_drained_ = false;
     bool audio_drained_ = false;
     bool video_flushed_ = false;
     bool audio_flushed_ = false;
     std::deque<AVPacket*> video_packets_;
     std::deque<AVPacket*> audio_packets_;
+    // Decode-thread-owned accumulators (exact). Other threads read the
+    // published copies below via the accessors above.
     size_t queued_packet_bytes_ = 0;
     double queued_video_seconds_ = 0.0;
     double queued_audio_seconds_ = 0.0;
+    std::atomic<int32_t> pub_video_ms_{0};
+    std::atomic<int32_t> pub_audio_ms_{0};
+    std::atomic<uint32_t> pub_packet_bytes_{0};
+    std::atomic<uint32_t> video_timed_packets_{0};   // video packets read with any usable timing
+    std::atomic<uint32_t> video_untimed_packets_{0}; // ...and with none
+
+    // Timeline span of each queue from packet timestamps: oldest and newest
+    // queued packet's DTS (stream time base units) plus the newest packet's
+    // duration when it has one. Needed because this FFmpeg's mov demuxer often
+    // leaves AVPacket::duration at 0 on a live fragmented stream (it derives
+    // it from the *next* index entry, which has not been read yet), which
+    // would make the duration sum above read 0 forever. Timestamps are always
+    // there. Decode-thread-owned like the accumulators.
+    struct QueueSpan {
+        int64_t front = AV_NOPTS_VALUE;
+        int64_t back = AV_NOPTS_VALUE;
+        int64_t backDuration = 0;
+    };
+    QueueSpan video_span_, audio_span_;
+    static int64_t packetTs(const AVPacket* pkt) { return pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts; }
+    double spanSeconds(const QueueSpan& span, int streamIndex) const;
+    void publishQueueStats();
 
     bool decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
                     bool& drained, bool isVideo, AVFrame** outFrame);
@@ -169,6 +226,7 @@ private:
 
     char last_error_[256] = {0};
     bool allow_unaligned_geometry_ = false;
+    bool audio_only_ = false; // see setAudioOnly()
 
     bool openCodecForStream(int streamIndex, AVCodecContext** outCtx);
 };

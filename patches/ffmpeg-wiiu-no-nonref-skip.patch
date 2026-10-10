@@ -1,0 +1,37 @@
+--- a/libavcodec/h264_wiiu.c
++++ b/libavcodec/h264_wiiu.c
+@@ -125,17 +125,25 @@
+     int res;
+     BOOL skippable = FALSE;
+ 
+-    res = H264DECCheckSkipableFrame(buf, buf_size, &skippable);
+-    if (res != 0)
++    // H264DECCheckSkipableFrame() reports non-reference pictures (nal_ref_idc == 0) as
++    // skippable. In a stream with B-frames (Main/High) that is every non-reference B-frame:
++    // honouring it unconditionally dropped them all, so such streams played back at half the
++    // frame rate. Only skip when the caller explicitly asked for it (-skip_frame nonref or
++    // higher); by default every picture is decoded and returned.
++    if (avctx->skip_frame >= AVDISCARD_NONREF)
+     {
+-        av_log(avctx, AV_LOG_ERROR, "h264_wiiu: Error checking for skippable frame");
+-        return -1;
+-    }
++        res = H264DECCheckSkipableFrame(buf, buf_size, &skippable);
++        if (res != 0)
++        {
++            av_log(avctx, AV_LOG_ERROR, "h264_wiiu: Error checking for skippable frame");
++            return -1;
++        }
+ 
+-    if (skippable)
+-    {
+-        // skip the frame
+-        return 0;
++        if (skippable)
++        {
++            // skip the frame
++            return 0;
++        }
+     }
+ 
+     res = H264DECSetBitstream(decoder, buf, buf_size, 0);

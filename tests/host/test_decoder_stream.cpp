@@ -11,9 +11,11 @@
 #include "media/decoder.h"
 #include "media/http_stream_io.h"
 
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 struct RunStats {
     int videoFrames = 0;
@@ -92,6 +94,62 @@ static void checkStats(const RunStats& st, const char* label) {
     CHECK_NEAR(st.lastAudioPts, 3.0, 0.1);
 }
 
+// The read-ahead figures Player's rebuffering decision reads from another
+// thread: published as 32-bit atomics by the decode thread. Checks they track
+// the packet queues, drain back to zero as packets are decoded, that
+// end-of-stream is reported only when the demuxer really hit it, and hammers
+// them from a second thread while the first reads and decodes (run under
+// -fsanitize=thread this would flag a plain shared double).
+static void testPublishedQueueStats(int port) {
+    HttpStreamIO io("127.0.0.1", port, "/chunked.mp4");
+    CHECK(io.open());
+    Decoder decoder;
+    CHECK(decoder.open(io.avioContext()));
+    CHECK_NEAR(decoder.queuedVideoSeconds(), 0.0, 1e-9);
+    CHECK_NEAR(decoder.queuedAudioSeconds(), 0.0, 1e-9);
+    CHECK_EQ((int)decoder.queuedPacketBytes(), 0);
+    CHECK(!decoder.demuxFinished());
+    CHECK(decoder.videoTimelineUsable()); // no evidence against it yet
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> outOfRange{0};
+    std::thread reader([&] {
+        while (!stop) {
+            const double v = decoder.queuedVideoSeconds(), a = decoder.queuedAudioSeconds();
+            if (v < 0.0 || v > 4.0 || a < 0.0 || a > 4.0) outOfRange++; // clip is 3 s long
+            (void)decoder.queuedPacketBytes();
+            (void)decoder.demuxFinished();
+        }
+    });
+
+    // Read the whole clip into the queues without decoding anything.
+    int packets = 0;
+    while (decoder.readPacket()) packets++;
+    CHECK(packets > 100);
+    CHECK(decoder.demuxFinished());
+    CHECK(decoder.queuedPacketBytes() > 10000);
+    // ~3 s of each stream is sitting there, measured on the timeline.
+    CHECK(decoder.queuedVideoSeconds() > 2.5 && decoder.queuedVideoSeconds() < 3.5);
+    CHECK(decoder.queuedAudioSeconds() > 2.5 && decoder.queuedAudioSeconds() < 3.5);
+    CHECK(decoder.videoTimelineUsable());
+
+    // Decoding consumes them: back to (about) nothing, never negative.
+    AVFrame* frame = nullptr;
+    while (decoder.decodeNextFrame(&frame) != DecodedFrameType::NONE) {}
+    CHECK(decoder.queuedVideoSeconds() < 0.05);
+    CHECK(decoder.queuedAudioSeconds() < 0.05);
+    CHECK_EQ((int)decoder.queuedPacketBytes(), 0);
+    CHECK(decoder.finished());
+
+    stop = true;
+    reader.join();
+    CHECK_EQ(outOfRange.load(), 0);
+
+    decoder.close();
+    CHECK(!decoder.demuxFinished()); // a closed Decoder starts clean
+    CHECK_NEAR(decoder.queuedVideoSeconds(), 0.0, 1e-9);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: test_decoder_stream <fragmented.mp4>\n");
@@ -120,6 +178,8 @@ int main(int argc, char** argv) {
 
     checkStats(run(server.port(), "/chunked.mp4?static=false&api_key=x"), "chunked");
     checkStats(run(server.port(), "/plain.mp4"), "content-length");
+
+    testPublishedQueueStats(server.port());
 
     // A 404 must surface as an open failure, not a hang or a crash.
     {

@@ -148,3 +148,22 @@ Test in this order, same as any Ufin change:
    doesn't model the hardware decoder's memory layout precisely enough to
    have caught the original bug, so it's not guaranteed to catch a
    remaining problem either.
+
+
+## Extra patch: `ffmpeg-wiiu-no-nonref-skip.patch` (needed for Main/High at full frame rate)
+
+`h264_wiiu_decode_frame()` called `H264DECCheckSkipableFrame()` on every packet and
+returned "no frame" when it said skippable. The hardware reports non-reference pictures
+as skippable, so for a stream with B-frames (Main/High) every non-reference B-frame was
+silently dropped -- a 24 fps film came out of the decoder at 12 fps. Baseline has no
+such pictures, so it was never affected.
+
+The patch only honours the check when the caller sets `skip_frame >= AVDISCARD_NONREF`
+(Ufin never does), so by default every picture is decoded and returned. Apply it to the
+fork after the other patch (it only touches the skip block, which the other patch leaves
+alone):
+
+    cd FFmpeg-wiiu
+    patch -p1 < /path/to/ufin/patches/ffmpeg-wiiu-no-nonref-skip.patch
+
+It was checked to apply cleanly to the fork's `h264_wiiu.c`; it has not been run on a console.

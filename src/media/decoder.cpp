@@ -1,8 +1,11 @@
 #include "decoder.h"
+#include "../h264_profile.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <coreinit/debug.h>
+#include "../ufin_log.h" // OSReport -> also the SD-card log file (see ufin_log.h)
 
 Decoder::Decoder() {
     packet_ = av_packet_alloc();
@@ -150,7 +153,14 @@ bool Decoder::open(AVIOContext* avioCtx) {
     }
     OSReport("Ufin: avformat_open_input ok (format=%s)\n", fmt_ctx_->iformat->name);
 
-    // NOT calling avformat_find_stream_info(): for H.264 it opens its own
+    if (audio_only_) {
+        // A bare audio file (MP3) has no moov box: ask the demuxer/decoder for the stream
+        // parameters. Safe here -- no H.264 involved (see the note just below).
+        int probe = avformat_find_stream_info(fmt_ctx_, nullptr);
+        if (probe < 0) OSReport("Ufin: avformat_find_stream_info failed (%d)\n", probe);
+    }
+
+    // NOT calling avformat_find_stream_info() otherwise: for H.264 it opens its own
     // throwaway decoder (h264_wiiu, the only H.264 decoder in our build)
     // and feeds it packets to guess the reorder delay -- and h264_wiiu
     // crashes in that half-initialised probe context. The mov demuxer
@@ -163,7 +173,7 @@ bool Decoder::open(AVIOContext* avioCtx) {
                  p->width, p->height, p->sample_rate, p->extradata_size);
     }
 
-    video_stream_index_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    video_stream_index_ = audio_only_ ? -1 : av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_index_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
     OSReport("Ufin: stream detection -- video_index=%d audio_index=%d (nb_streams=%d)\n",
@@ -175,6 +185,14 @@ bool Decoder::open(AVIOContext* avioCtx) {
     }
 
     if (video_stream_index_ >= 0) {
+        // What the server really produced, read from the avcC box (byte 1 = profile_idc, byte 3 =
+        // level_idc). codecpar->profile is not filled by the mov demuxer without find_stream_info.
+        const AVCodecParameters* vp = fmt_ctx_->streams[video_stream_index_]->codecpar;
+        video_profile_idc_ = (vp->extradata_size >= 4 && vp->extradata[0] == 1) ? vp->extradata[1] : 0;
+        OSReport("Ufin: stream h264 profile=%s (idc %d) level_idc=%d -- %s\n",
+                 h264::nameForProfileIdc(video_profile_idc_),
+                 video_profile_idc_, (vp->extradata_size >= 4 && vp->extradata[0] == 1) ? vp->extradata[3] : 0,
+                 videoNeedsReorder() ? "display-order reorder ON" : "baseline, no reorder");
         if (!openCodecForStream(video_stream_index_, &video_ctx_)) {
             return false; // last_error_ already set by openCodecForStream
         }
@@ -188,6 +206,31 @@ bool Decoder::open(AVIOContext* avioCtx) {
     return true;
 }
 
+double Decoder::spanSeconds(const QueueSpan& span, int streamIndex) const {
+    if (streamIndex < 0 || !fmt_ctx_ || span.front == AV_NOPTS_VALUE || span.back == AV_NOPTS_VALUE ||
+        span.back < span.front) {
+        return 0.0;
+    }
+    return (double)(span.back - span.front + (span.backDuration > 0 ? span.backDuration : 0)) *
+           av_q2d(fmt_ctx_->streams[streamIndex]->time_base);
+}
+
+void Decoder::publishQueueStats() {
+    auto ms = [](double seconds) -> int32_t {
+        const double v = seconds * 1000.0 + 0.5;
+        return v <= 0.0 ? 0 : (v >= 2147483647.0 ? 2147483647 : (int32_t)v);
+    };
+    // The larger of the two estimates: identical to the plain duration sum
+    // whenever packets carry durations, and still a real timeline figure when
+    // they do not.
+    pub_video_ms_.store(ms(std::max(queued_video_seconds_, spanSeconds(video_span_, video_stream_index_))),
+                        std::memory_order_relaxed);
+    pub_audio_ms_.store(ms(std::max(queued_audio_seconds_, spanSeconds(audio_span_, audio_stream_index_))),
+                        std::memory_order_relaxed);
+    pub_packet_bytes_.store(queued_packet_bytes_ > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)queued_packet_bytes_,
+                            std::memory_order_relaxed);
+}
+
 bool Decoder::readPacket() {
     if (reachedEof_ || !fmt_ctx_) return false;
     while (true) {
@@ -197,7 +240,7 @@ bool Decoder::readPacket() {
             // from EOF here). Decoders are flushed once their queues
             // drain, so buffered packets still get decoded.
             OSReport("Ufin: av_read_frame returned %d -- treating as end of stream\n", readRet);
-            reachedEof_ = true;
+            reachedEof_.store(true, std::memory_order_release);
             return false;
         }
         std::deque<AVPacket*>* queue = nullptr;
@@ -233,7 +276,22 @@ bool Decoder::readPacket() {
         if (copy->duration > 0) {
             *queuedSeconds += (double)copy->duration * av_q2d(timeBase);
         }
+        {
+            const bool isVideo = (queuedSeconds == &queued_video_seconds_);
+            QueueSpan& span = isVideo ? video_span_ : audio_span_;
+            const int64_t ts = packetTs(copy);
+            if (ts != AV_NOPTS_VALUE) {
+                if (queue->empty() || span.front == AV_NOPTS_VALUE) span.front = ts;
+                span.back = ts;
+                span.backDuration = copy->duration > 0 ? copy->duration : 0;
+            }
+            if (isVideo) {
+                if (copy->duration > 0 || ts != AV_NOPTS_VALUE) video_timed_packets_.fetch_add(1, std::memory_order_relaxed);
+                else video_untimed_packets_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         queue->push_back(copy);
+        publishQueueStats();
         return true;
     }
 }
@@ -300,6 +358,12 @@ bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool
             }
             av_packet_free(&pkt);
             queue.pop_front();
+            {
+                QueueSpan& span = isVideo ? video_span_ : audio_span_;
+                if (queue.empty()) span = QueueSpan();
+                else span.front = packetTs(queue.front());
+            }
+            publishQueueStats();
             continue;
         }
         if (reachedEof_ && !flushed) {
@@ -364,7 +428,12 @@ double Decoder::frameTimeSeconds(DecodedFrameType type, const AVFrame* frame) co
     // best_effort_timestamp is FFmpeg's reconciled pts/dts guess -- for a
     // clean transcode it simply equals pts, but it also copes with the
     // occasional missing pts without us having to.
-    int64_t ts = frame->best_effort_timestamp;
+    //
+    // Not for B-frame-capable video: pictures arrive in decode order, so pts is not monotonic and
+    // best_effort_timestamp then falls back to dts -- right order, wrong display times. Each
+    // picture's own pts is the true one; FrameReorder sorts them (Baseline is unchanged).
+    int64_t ts = (type == DecodedFrameType::VIDEO && videoNeedsReorder() && frame->pts != AV_NOPTS_VALUE)
+                     ? frame->pts : frame->best_effort_timestamp;
     if (ts == AV_NOPTS_VALUE) ts = frame->pts;
     if (ts == AV_NOPTS_VALUE) return NAN;
 
@@ -408,6 +477,9 @@ void Decoder::close() {
     queued_packet_bytes_ = 0;
     queued_video_seconds_ = 0.0;
     queued_audio_seconds_ = 0.0;
+    video_span_ = QueueSpan();
+    audio_span_ = QueueSpan();
+    publishQueueStats();
     video_drained_ = audio_drained_ = false;
     video_flushed_ = audio_flushed_ = false;
     if (video_ctx_) avcodec_free_context(&video_ctx_);
@@ -422,7 +494,9 @@ void Decoder::close() {
     }
     video_stream_index_ = -1;
     audio_stream_index_ = -1;
-    reachedEof_ = false;
+    reachedEof_.store(false, std::memory_order_release);
+    video_timed_packets_.store(0, std::memory_order_relaxed);
+    video_untimed_packets_.store(0, std::memory_order_relaxed);
     video_decode_errors_ = 0;
     consecutive_video_decode_errors_ = 0;
     fatal_decode_error_.store(false, std::memory_order_release);

@@ -37,7 +37,55 @@ int main() {
     std::string min = writeTemp("min", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\"}");
     CHECK(loadConfigFromFile(min.c_str(), minimal, err));
     CHECK_EQ(minimal.videoBitrate, 2500000);
-    CHECK_STR(minimal.videoProfile, "baseline");
+    CHECK_STR(minimal.videoProfile, h264::wireName(h264::kDefault)); // fresh install -> the single default
+    CHECK_EQ((int)minimal.usageSeconds, 0);        // the sidebar's use-time counter starts at zero
+    CHECK(!minimal.logging);                       // logging wears the SD card: off by default
+    CHECK(!minimal.jellyfinBackdrops);             // Jellyfin backdrops are opt-in
+    CHECK(minimal.menuMusicEnabled);               // menu music is on by default (plays assets/bgm.m4a)
+    CHECK(minimal.menuMusicItemId.empty());        // ...from the local file, until a library song is picked
+
+    // Total use time loads, survives a save/load round trip, and bad values fall back to 0.
+    {
+        UfinConfig u;
+        std::string up = writeTemp("usage", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"usage_seconds\":45245}");
+        CHECK(loadConfigFromFile(up.c_str(), u, err));
+        CHECK_EQ((int)u.usageSeconds, 45245);
+        std::string rt = writeTemp("usagert", "{}");
+        std::string serr;
+        u.usageSeconds = 8000000000LL; // > 2^31: must not truncate
+        CHECK(saveConfigToFile(rt.c_str(), u, serr));
+        UfinConfig back;
+        CHECK(loadConfigFromFile(rt.c_str(), back, err));
+        CHECK(back.usageSeconds == 8000000000LL);
+        UfinConfig bad;
+        std::string bp = writeTemp("usagebad", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"usage_seconds\":-5}");
+        CHECK(loadConfigFromFile(bp.c_str(), bad, err));
+        CHECK_EQ((int)bad.usageSeconds, 0);
+    }
+
+    // Both new switches load and survive a save/load round trip.
+    {
+        UfinConfig on;
+        std::string onPath = writeTemp("logon", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"logging\":true,\"jellyfin_backdrops\":true}");
+        CHECK(loadConfigFromFile(onPath.c_str(), on, err));
+        CHECK(on.logging);
+        CHECK(on.jellyfinBackdrops);
+        std::string rt = writeTemp("logrt", "{}");
+        std::string serr;
+        CHECK(saveConfigToFile(rt.c_str(), on, serr));
+        UfinConfig back;
+        CHECK(loadConfigFromFile(rt.c_str(), back, err));
+        CHECK(back.logging);
+        CHECK(back.jellyfinBackdrops);
+    }
+
+    // An explicit "menu_music": false is still honoured.
+    {
+        UfinConfig off;
+        std::string offPath = writeTemp("musicoff", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"menu_music\":false}");
+        CHECK(loadConfigFromFile(offPath.c_str(), off, err));
+        CHECK(!off.menuMusicEnabled);
+    }
 
     // Bad optional values are ignored, not fatal.
     UfinConfig odd;
@@ -45,7 +93,126 @@ int main() {
         "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_bitrate\":\"fast\",\"video_profile\":\"\"}");
     CHECK(loadConfigFromFile(oddPath.c_str(), odd, err));
     CHECK_EQ(odd.videoBitrate, 2500000);
-    CHECK_STR(odd.videoProfile, "baseline");
+    CHECK_STR(odd.videoProfile, h264::wireName(h264::kDefault));
+
+    // Profile names are normalised; unknown values fall back to the default.
+    {
+        UfinConfig hp;
+        std::string hi = writeTemp("hprof", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_profile\":\"HIGH\"}");
+        CHECK(loadConfigFromFile(hi.c_str(), hp, err));
+        CHECK_STR(hp.videoProfile, "high");
+        UfinConfig hq;
+        std::string bad = writeTemp("hprofbad", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_profile\":\"ultra\"}");
+        CHECK(loadConfigFromFile(bad.c_str(), hq, err));
+        CHECK_STR(hq.videoProfile, h264::wireName(h264::kDefault));
+
+        // Persistence round trip for all three choices (what Settings saves and a restart reloads).
+        const char* names[] = {"main", "baseline", "high"};
+        for (const char* n : names) {
+            UfinConfig out; out.host = "h"; out.port = 1; out.username = "u"; out.videoProfile = n;
+            std::string path = writeTemp((std::string("hrt_") + n).c_str(), "{}");
+            std::string serr;
+            CHECK(saveConfigToFile(path.c_str(), out, serr));
+            UfinConfig back;
+            CHECK(loadConfigFromFile(path.c_str(), back, err));
+            CHECK_STR(back.videoProfile, n);
+        }
+    }
+
+    // Video resolution: default is the stable 720p; 1080p is explicit opt-in.
+    {
+        CHECK_EQ(minimal.videoHeight, 720);
+        CHECK_EQ(minimal.videoWidth(), 1280);
+        UfinConfig d;
+        CHECK_EQ(d.videoHeight, 720);
+        CHECK_EQ(d.videoBitrate, 2500000);
+
+        UfinConfig h;
+        std::string p1080 = writeTemp("h1080",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":1080}");
+        CHECK(loadConfigFromFile(p1080.c_str(), h, err));
+        CHECK_EQ(h.videoHeight, 1080);
+        CHECK_EQ(h.videoWidth(), 1920);
+        CHECK_EQ(h.videoBitrate, 6000000);        // 1080p default, no video_bitrate given
+        CHECK_STR(h.videoProfile, h264::wireName(h264::kDefault));
+
+        UfinConfig hb;
+        std::string p1080b = writeTemp("h1080b",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":1080,\"video_bitrate\":8000000}");
+        CHECK(loadConfigFromFile(p1080b.c_str(), hb, err));
+        CHECK_EQ(hb.videoBitrate, 8000000);       // explicit bitrate still wins
+
+        UfinConfig hs;
+        std::string p720 = writeTemp("h720",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":720}");
+        CHECK(loadConfigFromFile(p720.c_str(), hs, err));
+        CHECK_EQ(hs.videoHeight, 720);
+        CHECK_EQ(hs.videoBitrate, 2500000);       // 720p default unchanged
+
+        // 480p: low-bandwidth opt-in, 768x480 (aligned), 1.5 Mbps unless a bitrate is given.
+        UfinConfig l;
+        std::string p480 = writeTemp("h480",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":480}");
+        CHECK(loadConfigFromFile(p480.c_str(), l, err));
+        CHECK_EQ(l.videoHeight, 480);
+        CHECK_EQ(l.videoWidth(), 768);
+        CHECK_EQ(l.videoBitrate, 1500000);
+        CHECK_STR(l.videoProfile, h264::wireName(h264::kDefault));
+        UfinConfig lb;
+        std::string p480b = writeTemp("h480b",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":480,\"video_bitrate\":750000}");
+        CHECK(loadConfigFromFile(p480b.c_str(), lb, err));
+        CHECK_EQ(lb.videoBitrate, 750000);        // explicit bitrate still wins
+        UfinConfig l480rt = lb;
+        std::string l480Path = "/tmp/ufin_test_h480_rt.json";
+        CHECK(saveConfigToFile(l480Path.c_str(), l480rt, err));
+        UfinConfig l480back;
+        CHECK(loadConfigFromFile(l480Path.c_str(), l480back, err));
+        CHECK_EQ(l480back.videoHeight, 480);
+        CHECK_EQ(l480back.videoBitrate, 750000);
+        CHECK_EQ(l480back.videoWidth(), 768);
+
+        UfinConfig hx;
+        std::string pOdd = writeTemp("hodd",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":2160}");
+        CHECK(loadConfigFromFile(pOdd.c_str(), hx, err));
+        CHECK_EQ(hx.videoHeight, 720);            // unsupported -> stable
+        CHECK_EQ(hx.videoBitrate, 2500000);
+        for (int odd : {0, 360, 540, 576, 854, 1440}) { // near misses are not silently accepted
+            UfinConfig ho;
+            std::string pn = writeTemp("hodd2", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_height\":" + std::to_string(odd) + "}");
+            CHECK(loadConfigFromFile(pn.c_str(), ho, err));
+            CHECK_EQ(ho.videoHeight, 720);
+            CHECK_EQ(ho.videoBitrate, 2500000);
+        }
+
+        // Round trip through save/load keeps the selection.
+        UfinConfig rt = h;
+        std::string rtPath = "/tmp/ufin_test_h1080_rt.json";
+        CHECK(saveConfigToFile(rtPath.c_str(), rt, err));
+        UfinConfig back;
+        CHECK(loadConfigFromFile(rtPath.c_str(), back, err));
+        CHECK_EQ(back.videoHeight, 1080);
+        CHECK_EQ(back.videoBitrate, 6000000);
+    }
+
+    // Optional buffering overrides: absent/out-of-range -> 0 (automatic).
+    {
+        CHECK_EQ(minimal.videoBufferMiB, 0);
+        CHECK_EQ(minimal.videoQueueFrames, 0);
+        UfinConfig b;
+        std::string pb = writeTemp("buf",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_buffer_mb\":200,\"video_queue_frames\":20}");
+        CHECK(loadConfigFromFile(pb.c_str(), b, err));
+        CHECK_EQ(b.videoBufferMiB, 200);
+        CHECK_EQ(b.videoQueueFrames, 20);
+        UfinConfig bad;
+        std::string pbad = writeTemp("bufbad",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"video_buffer_mb\":5000,\"video_queue_frames\":1}");
+        CHECK(loadConfigFromFile(pbad.c_str(), bad, err));
+        CHECK_EQ(bad.videoBufferMiB, 0);
+        CHECK_EQ(bad.videoQueueFrames, 0);
+    }
 
     // No password: still loads (the login screen fills the gap), but
     // isn't enough to sign in on its own.
@@ -73,7 +240,43 @@ int main() {
     CHECK_EQ(tok.backgroundEffect, 0);
     CHECK(!tok.lightMode);
     CHECK(!tok.snow);
+    CHECK(!tok.liquidGlass); // Liquid Glass UI is opt-in: off unless the setting says otherwise
+    CHECK(!tok.glassDebug);
+    CHECK(tok.glassRefraction);   // real refraction is on by default (it only matters once Liquid Glass is on)...
+    CHECK_EQ(tok.glassRefractionStage, 6); // ...at stage 6, the lowest that works on real hardware (3-5 blank the UI)
     CHECK(!tok.clock);
+    {
+        // Real refraction is opted into from config.json, with an optional bring-up stage.
+        UfinConfig on;
+        std::string pOn = writeTemp("glasson",
+            "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"liquid_glass\":true,\"glass_refraction\":true,\"glass_refraction_stage\":3}");
+        CHECK(loadConfigFromFile(pOn.c_str(), on, err));
+        CHECK(on.liquidGlass);
+        CHECK(on.glassRefraction);
+        CHECK_EQ(on.glassRefractionStage, 3);
+        for (int v : {-4, 0}) { // out of range clamps to the first step (textures only), never to "off by accident"
+            UfinConfig lo;
+            std::string pLo = writeTemp("stagelo", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_refraction_stage\":" + std::to_string(v) + "}");
+            CHECK(loadConfigFromFile(pLo.c_str(), lo, err));
+            CHECK_EQ(lo.glassRefractionStage, 1);
+        }
+        UfinConfig hi;
+        std::string pHi = writeTemp("stagehi", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_refraction_stage\":99}");
+        CHECK(loadConfigFromFile(pHi.c_str(), hi, err));
+        CHECK_EQ(hi.glassRefractionStage, 7);   // 7 is the highest rung of the bring-up ladder
+        CHECK(hi.glassRefraction);  // (a stage alone does not turn it off)
+        UfinConfig offc;
+        std::string pOffc = writeTemp("refroff", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_refraction\":false}");
+        CHECK(loadConfigFromFile(pOffc.c_str(), offc, err));
+        CHECK(!offc.glassRefraction);          // explicit opt-out is honoured
+        CHECK_EQ(offc.glassRefractionStage, 6); // and does not disturb the stage
+        for (int v : {3, 4, 5, 6, 7}) { // every rung of the bring-up ladder is accepted as-is
+            UfinConfig mid;
+            std::string pm = writeTemp("stagemid", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_refraction_stage\":" + std::to_string(v) + "}");
+            CHECK(loadConfigFromFile(pm.c_str(), mid, err));
+            CHECK_EQ(mid.glassRefractionStage, v);
+        }
+    }
     CHECK(!tok.rainbowUnlocked);
     CHECK(tok.autoplayNext);        // on unless turned off
     CHECK(!tok.gamepadOffInVideo);
@@ -99,6 +302,10 @@ int main() {
         c.backgroundEffect = 3;
         c.lightMode = true;
         c.snow = true;
+        c.liquidGlass = true;
+        c.glassDebug = true;
+        c.glassRefraction = true;
+        c.glassRefractionStage = 2;
         c.clock = true;
         c.rainbowUnlocked = true;
         c.autoplayNext = false;
@@ -115,6 +322,10 @@ int main() {
         CHECK_EQ(back.backgroundEffect, 3);
         CHECK(back.lightMode);
         CHECK(back.snow);
+        CHECK(back.liquidGlass);
+        CHECK(back.glassDebug);
+        CHECK(back.glassRefraction);
+        CHECK_EQ(back.glassRefractionStage, 2);
         CHECK(back.clock);
         CHECK(back.rainbowUnlocked);
         CHECK(!back.autoplayNext);

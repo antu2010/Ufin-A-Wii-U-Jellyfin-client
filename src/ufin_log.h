@@ -6,6 +6,11 @@
 // output to a plain text file on the SD card instead, which needs no
 // network at all: just pull the file off the card afterwards.
 //
+// Writing a log to the SD card wears it, so it is OFF by default (Settings > Logging, or
+// "logging": true in config.json). Until main() has read the config the log is "pending": lines
+// are held in a small memory buffer, then written out if logging turns out to be on and thrown
+// away if not. UfinLogSetEnabled() resolves that and can be called again at any time (Settings).
+//
 // UfinLogOpen() truncates and opens the file; every OSReport(...) call in
 // the codebase is redirected to UfinLog(...) below (same printf-style
 // signature) via the macro at the bottom of this header, which both keeps
@@ -20,7 +25,8 @@
 extern "C" {
 #endif
 
-void UfinLogOpen();
+void UfinLogOpen();                 // = UfinLogSetEnabled(true)
+void UfinLogSetEnabled(int on);     // open (truncate) / close the file; flushes the pending buffer
 void UfinLogClose();
 void UfinLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 

@@ -13,6 +13,8 @@
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <atomic>
+#include "playback_state.h"
 
 enum class PlayResult {
     Completed,     // reached end of stream normally
@@ -75,6 +77,28 @@ struct PlayOptions {
     // pacing then (the frame waits for vsync).
     std::function<void()> onIdleFrame;
 
+    // Optional tuning overrides, 0 = automatic (see Player::play). They exist
+    // so buffering can be tuned on a real console without a rebuild
+    // (config.json: video_buffer_mb / video_queue_frames).
+    size_t maxBufferedPacketBytes = 0; // compressed read-ahead cap
+    size_t videoQueueFrames = 0;       // decoded-frame queue depth
+
+    // Graceful rebuffering (video only; see PlaybackStateMachine). During
+    // playback, when the playable media ahead of the clock falls to
+    // rebufferLowWaterSeconds, Player holds audio and video *before* the
+    // buffer runs dry, keeps reading, and resumes at rebufferRecoverySeconds.
+    // 0 = automatic (2 s / 12 s, see player.cpp). prebufferSeconds overrides
+    // the startup prebuffer target the same way. Mainly for tests and for
+    // tuning on a console.
+    double rebufferLowWaterSeconds = 0.0;
+    double rebufferRecoverySeconds = 0.0;
+    double prebufferSeconds = 0.0;
+
+    // Called on the play() thread whenever the playback state changes
+    // (PLAYING <-> BUFFERING, and STARTUP_BUFFERING -> PLAYING), with the
+    // playable seconds that were measured at that moment (NAN if none).
+    std::function<void(PlaybackState from, PlaybackState to, double playableSeconds)> onPlaybackState;
+
     // Mirrors UfinConfig::allowUnalignedVideoGeometry (see config_loader.h
     // for what it's for) -- forwarded to Decoder before it opens the
     // codec. Default false: keep the h264_wiiu geometry safety check
@@ -111,6 +135,16 @@ public:
     bool isPaused() const { return paused_; }
     double seekTarget() const { return seek_target_; }
 
+    // True while playback is held for rebuffering (not the user's pause): the
+    // last picture stays up, audio is held, the read-ahead keeps filling.
+    // For the HUD's buffering wheel. Like isPaused(), meant to be read from
+    // the thread that calls play() (which is where presentVideo runs).
+    bool isBuffering() const { return buffering_.load(); }
+    // While isBuffering(): playable seconds accumulated so far and the amount
+    // at which playback resumes, for a "4 / 12 s" style readout.
+    double bufferedSeconds() const { return buffered_seconds_; }
+    double bufferingTargetSeconds() const { return buffering_target_seconds_; }
+
     // Current output volume (0..1) -- options.initialVolume until a
     // PlayerCommand::SetVolume changes it. Valid at any time, including
     // before/after play() so the caller can carry a user's chosen
@@ -140,5 +174,8 @@ private:
     bool paused_ = false;
     double seek_target_ = 0.0;
     double volume_ = 1.0;
+    std::atomic<bool> buffering_{false};
+    double buffered_seconds_ = 0.0;
+    double buffering_target_seconds_ = 0.0;
     class AudioOutput* active_audio_ = nullptr; // valid only while play() is running
 };

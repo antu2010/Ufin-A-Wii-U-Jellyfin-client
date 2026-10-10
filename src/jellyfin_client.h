@@ -1,4 +1,6 @@
 #pragma once
+#include "h264_profile.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,6 +24,11 @@ struct JellyfinItem {
     // series' (episodes, seasons). Empty = no artwork.
     std::string imageItemId;
     std::string imageTag;
+
+    // Backdrop (wide background artwork): the item's own, else its parent's (an episode shows
+    // its show's). Empty = none; the UI then falls back to the page's own backdrop.
+    std::string backdropItemId;
+    std::string backdropTag;
 
     std::string seriesId;       // Episode / Season: its show (for "up next")
 
@@ -57,7 +64,14 @@ struct StreamTarget {
 // config.json can override them (video_bitrate / video_profile).
 struct VideoStreamOptions {
     int videoBitrate = 2500000;       // bits/s. Wii U Wi-Fi is 2.4 GHz 802.11n only.
-    std::string profile = "baseline"; // H.264 profile: baseline | main | high
+    std::string profile = h264::wireName(h264::kDefault); // H.264 profile: baseline | main | high
+
+    // Requested transcode size. Only three pairs are honoured -- 768x480
+    // (low bandwidth), the stable 1280x720 and the experimental 1920x1080
+    // (see video_size.h); anything else falls back to 720p rather than
+    // producing an untested geometry.
+    int width = 1280;
+    int height = 720;
 
     // Optional, added to the URL when set. mediaSourceId picks one
     // version of a multi-version item; liveStreamId/playSessionId come
@@ -181,6 +195,9 @@ public:
     // Request path for an item's Primary image, scaled by the server to
     // fit inside width x height (keeping its shape), as JPEG -- what
     // stb_image decodes.
+    // Wide backdrop for the Jellyfin-backdrops setting; scaled on the server to fit maxW x maxH.
+    std::string buildBackdropPath(const std::string& backdropItemId, const std::string& backdropTag,
+                                  int maxW, int maxH) const;
     std::string buildImagePath(const std::string& imageItemId, const std::string& imageTag,
                                int width, int height) const;
 

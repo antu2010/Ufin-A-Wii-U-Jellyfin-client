@@ -6,21 +6,45 @@
 #include <cstring>
 
 // Same SD mount convention already used by config_loader.cpp.
-static const char* LOG_PATH = "/vol/external01/wiiu/apps/ufin/ufin_log.txt";
+#ifndef UFIN_LOG_PATH // overridden by the host test
+#define UFIN_LOG_PATH "/vol/external01/wiiu/apps/ufin/ufin_log.txt"
+#endif
+static const char* LOG_PATH = UFIN_LOG_PATH;
 
 static FILE* g_logFile = nullptr;
 
-void UfinLogOpen() {
-    // "w" truncates -- each run starts a fresh file rather than growing
-    // forever across runs. If the directory doesn't exist (e.g. config.json
-    // was never placed there either) this just silently stays file-less
-    // and UfinLog() below falls back to OSReport only.
-    g_logFile = fopen(LOG_PATH, "w");
-    if (g_logFile) {
-        fputs("Ufin log start\n", g_logFile);
-        fflush(g_logFile);
+// Before the config is read nobody knows whether logging is wanted: keep the early lines here.
+enum LogState { LOG_PENDING, LOG_ON, LOG_OFF };
+static LogState g_state = LOG_PENDING;
+static char g_pending[8192];
+static size_t g_pendingLen = 0;
+
+void UfinLogSetEnabled(int on) {
+    if (on) {
+        if (!g_logFile) {
+            // "w" truncates -- each run starts a fresh file rather than growing
+            // forever across runs. If the directory doesn't exist (e.g. config.json
+            // was never placed there either) this just silently stays file-less
+            // and UfinLog() below falls back to OSReport only.
+            g_logFile = fopen(LOG_PATH, "w");
+            if (g_logFile) {
+                fputs("Ufin log start\n", g_logFile);
+                if (g_pendingLen > 0) fwrite(g_pending, 1, g_pendingLen, g_logFile);
+                fflush(g_logFile);
+            }
+        }
+        g_state = LOG_ON;
+    } else {
+        if (g_logFile) {
+            fclose(g_logFile);
+            g_logFile = nullptr;
+        }
+        g_state = LOG_OFF;
     }
+    g_pendingLen = 0;
 }
+
+void UfinLogOpen() { UfinLogSetEnabled(1); }
 
 void UfinLogClose() {
     if (g_logFile) {
@@ -49,5 +73,12 @@ void UfinLog(const char* fmt, ...) {
         // guaranteed trailing newline per record -- less important than
         // keeping this file matching OSReport's own behaviour exactly.
         fflush(g_logFile); // flush every line: a hang shouldn't cost us the last lines
+    } else if (g_state == LOG_PENDING) {
+        // Startup only (single-threaded): remember the line until the config says yes or no.
+        size_t n = strlen(buf);
+        if (g_pendingLen + n < sizeof(g_pending)) {
+            memcpy(g_pending + g_pendingLen, buf, n);
+            g_pendingLen += n;
+        }
     }
 }

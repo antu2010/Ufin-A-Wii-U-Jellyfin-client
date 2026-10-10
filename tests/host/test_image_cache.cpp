@@ -89,6 +89,12 @@ int main() {
         CHECK_EQ(rgba[1], 200);
         CHECK(ImageCache::decode(makeImage(2000, 1000, 1, 2, 3, true), 0, 0, rgba, w, h));
         CHECK_EQ(w, 512); CHECK_EQ(h, 256); // capped
+        // A cache built for full-screen pictures (the backdrops) keeps them large: this was the
+        // "very low quality backdrops" bug -- everything was silently capped at 512 px.
+        CHECK(ImageCache::decode(makeImage(2000, 1000, 1, 2, 3, true), 1920, 1080, rgba, w, h, 1920));
+        CHECK_EQ(w, 1920); CHECK_EQ(h, 960);
+        CHECK(ImageCache::decode(makeImage(2000, 1000, 1, 2, 3, true), 1920, 1080, rgba, w, h));
+        CHECK_EQ(w, 512); CHECK_EQ(h, 256);  // the default cap is unchanged for posters
         CHECK(!ImageCache::decode("not an image at all", 64, 64, rgba, w, h));
         CHECK(!ImageCache::decode("", 64, 64, rgba, w, h));
     }

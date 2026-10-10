@@ -18,11 +18,9 @@
 // Frames a queued request may wait without being asked for again before
 // it's dropped (it scrolled off screen); it's re-queued if it comes back.
 static const uint64_t STALE_FRAMES = 30;
-// Longest side kept for any image, whatever the caller asks for.
-static const int MAX_SIDE = 512;
-
-ImageCache::ImageCache(Backend backend, size_t maxTextures)
-    : backend_(std::move(backend)), maxTextures_(maxTextures), worker_([this] { workerLoop(); }) {}
+ImageCache::ImageCache(Backend backend, size_t maxTextures, int maxSide)
+    : backend_(std::move(backend)), maxTextures_(maxTextures), maxSide_(maxSide > 0 ? maxSide : kDefaultMaxSide),
+      worker_([this] { workerLoop(); }) {}
 
 ImageCache::~ImageCache() {
     {
@@ -163,7 +161,7 @@ void ImageCache::workerLoop() {
         std::string bytes;
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
-        bool ok = backend_.fetch && backend_.fetch(path, bytes) && decode(bytes, maxW, maxH, rgba, w, h);
+        bool ok = backend_.fetch && backend_.fetch(path, bytes) && decode(bytes, maxW, maxH, rgba, w, h, maxSide_);
 
         lock.lock();
         auto it = entries_.find(path);
@@ -180,15 +178,15 @@ void ImageCache::workerLoop() {
 }
 
 bool ImageCache::decode(const std::string& bytes, int maxW, int maxH, std::vector<uint8_t>& rgba,
-                        int& width, int& height) {
+                        int& width, int& height, int maxSide) {
     int w = 0, h = 0, comp = 0;
     unsigned char* src = stbi_load_from_memory((const stbi_uc*)bytes.data(), (int)bytes.size(), &w, &h, &comp, 4);
     if (!src || w <= 0 || h <= 0) {
         if (src) stbi_image_free(src);
         return false;
     }
-    maxW = std::min(maxW > 0 ? maxW : MAX_SIDE, MAX_SIDE);
-    maxH = std::min(maxH > 0 ? maxH : MAX_SIDE, MAX_SIDE);
+    maxW = std::min(maxW > 0 ? maxW : maxSide, maxSide); // longest side kept, whatever the caller asks for
+    maxH = std::min(maxH > 0 ? maxH : maxSide, maxSide);
     double scale = std::min(1.0, std::min((double)maxW / w, (double)maxH / h));
     int dw = std::max(1, (int)(w * scale + 0.5)), dh = std::max(1, (int)(h * scale + 0.5));
     rgba.assign((size_t)dw * dh * 4, 0);

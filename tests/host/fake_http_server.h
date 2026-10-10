@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -24,6 +25,11 @@ struct FakeRoute {
     std::string body;
     bool chunked = false;
     size_t chunkSize = 64 * 1024;
+    // Optional bandwidth limit for chunked bodies, to starve a player on
+    // purpose: the first burstBytes go out as fast as possible, the rest at
+    // bytesPerSecond. 0 = unlimited.
+    size_t burstBytes = 0;
+    double bytesPerSecond = 0.0;
 };
 
 struct FakeRequest {
@@ -96,7 +102,7 @@ private:
 
     static bool sendAll(int fd, const char* data, size_t len) {
         while (len > 0) {
-            ssize_t n = send(fd, data, len, 0);
+            ssize_t n = send(fd, data, len, MSG_NOSIGNAL);
             if (n <= 0) return false;
             data += n;
             len -= (size_t)n;
@@ -178,6 +184,7 @@ private:
             head += "Transfer-Encoding: chunked\r\nAccept-Ranges: none\r\n\r\n";
             if (!sendAll(fd, head.data(), head.size())) return;
             size_t pos = 0;
+            const auto throttleStart = std::chrono::steady_clock::now();
             while (pos < route.body.size()) {
                 size_t n = std::min(route.chunkSize, route.body.size() - pos);
                 char sz[32];
@@ -186,6 +193,12 @@ private:
                 if (!sendAll(fd, route.body.data() + pos, n)) return;
                 if (!sendAll(fd, "\r\n", 2)) return;
                 pos += n;
+                if (route.bytesPerSecond > 0.0 && pos > route.burstBytes) {
+                    // Sleep until the throttled part has had time to be sent.
+                    const double due = (double)(pos - route.burstBytes) / route.bytesPerSecond;
+                    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - throttleStart).count();
+                    if (due > elapsed) std::this_thread::sleep_for(std::chrono::duration<double>(due - elapsed));
+                }
             }
             sendAll(fd, "0\r\n\r\n", 5);
         } else {

@@ -29,6 +29,38 @@ struct SoftRender {
     int w, h;
     std::vector<uint32_t> px; // 0xAABBGGRR like ImGui's IM_COL32
 
+    // The frame being rendered right now: draw-list callbacks (below) run in the
+    // middle of render() and need to see its pixels.
+    static SoftRender*& current() {
+        static SoftRender* c = nullptr;
+        return c;
+    }
+    static int& snapshotCalls() {
+        static int n = 0;
+        return n;
+    }
+
+    // Stands in for the GX2 colour-buffer copy: when the UI asks for a snapshot,
+    // copy everything drawn so far into the user texture named by UserCallbackData
+    // (an ImTextureID, as an integer). Pass this to ui::setGlassSnapshot().
+    static void snapshotCallback(const ImDrawList*, const ImDrawCmd* cmd) {
+        SoftRender* r = current();
+        if (!r) return;
+        snapshotCalls()++;
+        SoftUserTexture t;
+        t.w = r->w;
+        t.h = r->h;
+        t.rgba.resize((size_t)r->w * r->h * 4);
+        for (size_t i = 0; i < r->px.size(); i++) {
+            const uint32_t c = r->px[i];
+            t.rgba[i * 4 + 0] = (uint8_t)(c & 0xFF);
+            t.rgba[i * 4 + 1] = (uint8_t)((c >> 8) & 0xFF);
+            t.rgba[i * 4 + 2] = (uint8_t)((c >> 16) & 0xFF);
+            t.rgba[i * 4 + 3] = 255;
+        }
+        userTextures()[(ImTextureID)(intptr_t)cmd->UserCallbackData] = std::move(t);
+    }
+
     SoftRender(int width, int height) : w(width), h(height), px((size_t)width * height, 0xFF000000u) {}
 
     // Accept every texture request (the pixel data stays in ImTextureData).
@@ -99,10 +131,14 @@ struct SoftRender {
     }
 
     void render(ImDrawData* dd) {
+        current() = this;
         for (int n = 0; n < dd->CmdListsCount; n++) {
             const ImDrawList* list = dd->CmdLists[n];
             for (const ImDrawCmd& cmd : list->CmdBuffer) {
-                if (cmd.UserCallback) continue;
+                if (cmd.UserCallback) {
+                    if (cmd.UserCallback != ImDrawCallback_ResetRenderState) cmd.UserCallback(list, &cmd);
+                    continue;
+                }
                 TexView tex = resolve(cmd.GetTexID());
                 int cx0 = std::max(0, (int)cmd.ClipRect.x), cy0 = std::max(0, (int)cmd.ClipRect.y);
                 int cx1 = std::min(w, (int)std::ceil(cmd.ClipRect.z)), cy1 = std::min(h, (int)std::ceil(cmd.ClipRect.w));
@@ -114,6 +150,7 @@ struct SoftRender {
                 }
             }
         }
+        current() = nullptr;
     }
 
     void tri(const ImDrawVert& a, const ImDrawVert& b, const ImDrawVert& c, const TexView& tex,

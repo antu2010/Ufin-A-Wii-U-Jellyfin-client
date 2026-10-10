@@ -53,18 +53,39 @@ fi
 UI_FONT="${UI_FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
 [ -f "$UI_FONT" ] && RUN_ARGS="$UI_FONT"
 CXXFLAGS="$CXXFLAGS -I$IMGUI" LIBS="$OUT/libimgui.a" \
-    run test_ui "$HERE/test_ui.cpp" "$SRC/ui/app_ui.cpp" "$SRC/ui/format.cpp"
+    run test_ui "$HERE/test_ui.cpp" "$SRC/ui/app_ui.cpp" "$SRC/ui/format.cpp" "$SRC/ui/glass_core.cpp" \
+    "$SRC/ui/model3d.cpp" "$SRC/image_cache.cpp" "$SRC/vendor/cJSON.c"
 RUN_ARGS=""
 run test_config    "$HERE/test_config.cpp" "$SRC/config_loader.cpp" "$SRC/vendor/cJSON.c"
 run test_jellyfin  "$HERE/test_jellyfin.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c"
 run test_image_cache "$HERE/test_image_cache.cpp" "$SRC/image_cache.cpp"
 run test_input_map "$HERE/test_input_map.cpp"
+RUN_ARGS="$HERE/../../patches/ffmpeg-wiiu-fixes.patch" run test_h264_geometry "$HERE/test_h264_geometry.cpp"
 run test_playback_logic "$HERE/test_playback_logic.cpp"
 run test_login_utils "$HERE/test_login_utils.cpp"
+# Who's watching?: the rules, bounce and config round trip; then the screen itself (app_ui.cpp also links
+# model3d.cpp when the Help window's SD-card models are in the tree).
+run test_profiles "$HERE/test_profiles.cpp" "$SRC/config_loader.cpp" "$SRC/vendor/cJSON.c"
+PUI_EXTRA=""
+[ -f "$SRC/ui/model3d.cpp" ] && PUI_EXTRA="$SRC/ui/model3d.cpp $SRC/image_cache.cpp $SRC/vendor/cJSON.c"
+CXXFLAGS="$CXXFLAGS -I$IMGUI" LIBS="$OUT/libimgui.a" \
+    run test_profiles_ui "$HERE/test_profiles_ui.cpp" "$SRC/ui/app_ui.cpp" "$SRC/ui/format.cpp" "$SRC/ui/glass_core.cpp" $PUI_EXTRA
 run test_play_queue "$HERE/test_play_queue.cpp"
 run test_playback_controls "$HERE/test_playback_controls.cpp"
 run test_item_labels "$HERE/test_item_labels.cpp" "$SRC/item_labels.cpp" "$SRC/ui/format.cpp"
 run test_audio_visualizer "$HERE/test_audio_visualizer.cpp" "$SRC/media/audio_visualizer.cpp"
+run test_playback_state "$HERE/test_playback_state.cpp"
+run test_glass_core "$HERE/test_glass_core.cpp" "$SRC/ui/glass_core.cpp"
+run test_quality_presets "$HERE/test_quality_presets.cpp"
+run test_h264_profile "$HERE/test_h264_profile.cpp"
+run test_frame_reorder "$HERE/test_frame_reorder.cpp"
+run test_backdrop_tracker "$HERE/test_backdrop_tracker.cpp"
+run test_usage_timer "$HERE/test_usage_timer.cpp"
+run test_help_content "$HERE/test_help_content.cpp"
+run test_model3d "$HERE/test_model3d.cpp" "$SRC/ui/model3d.cpp" "$SRC/image_cache.cpp" "$SRC/vendor/cJSON.c"
+RUN_ARGS="on"; run test_ufin_log "$HERE/test_ufin_log.cpp"
+RUN_ARGS="off"; "$OUT/test_ufin_log" off || status=1   # same binary: the pending state lives per process
+RUN_ARGS=""
 
 if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
     CXXFLAGS="$CXXFLAGS -I$FFMPEG_HOST/include"
@@ -81,7 +102,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                   -c:a aac -b:a 128k -ac 2 \
                   -movflags frag_keyframe+empty_moov+delay_moov "$CLIP" 2>"$OUT/ffmpeg.log"; then
             RUN_ARGS="$CLIP"
-            run test_decoder_stream "$HERE/test_decoder_stream.cpp" "$SRC/media/decoder.cpp" \
+            run test_decoder_stream "$HERE/test_decoder_stream.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
                 "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
             RUN_ARGS=""
             LONG="$OUT/sample_long_frag.mp4"
@@ -92,7 +113,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                       -c:a aac -b:a 128k -ac 2 \
                       -movflags frag_keyframe+empty_moov+delay_moov "$LONG" 2>>"$OUT/ffmpeg.log"; then
                 RUN_ARGS="$LONG"
-                run test_playback_schedule "$HERE/test_playback_schedule.cpp" "$SRC/media/decoder.cpp" \
+                run test_playback_schedule "$HERE/test_playback_schedule.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
                     "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
                 RUN_ARGS=""
             fi
@@ -108,11 +129,22 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                 cp "$HERE/fake_media/video_output.h" "$H/video_output.h"
                 RUN_ARGS="$SRC60"
                 CXXFLAGS="$CXXFLAGS -I$H -I$SRC/media" \
-                    run test_player_seek "$HERE/test_player_seek.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" \
+                    run test_player_seek "$HERE/test_player_seek.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
                     "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
                     "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
             fi
+            # Graceful rebuffering: the real Player against a fake Jellyfin whose
+            # bandwidth is throttled below the stream's bitrate (needs ffmpeg with
+            # libx264; takes ~1-2 minutes because it plays in real time).
+            H2="$OUT/harness_rebuffer"
+            mkdir -p "$H2"
+            cp "$SRC/media/player.cpp" "$H2/player.cpp"
+            cp "$HERE/fake_media/video_output.h" "$H2/video_output.h"
+            CXXFLAGS="$CXXFLAGS -I$H2 -I$SRC/media" \
+                run test_player_rebuffer "$HERE/test_player_rebuffer.cpp" "$H2/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
+                "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
+                "$HERE/stubs/fake_sdl.cpp"
             SONG="$OUT/sample_song.m4a"
             # A short, loud tone as fragmented MP4 audio, like Jellyfin's
             # /Audio/.../stream.mp4 transcode.
@@ -120,8 +152,8 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                       -c:a aac -b:a 128k -ac 2 -movflags frag_keyframe+empty_moov+delay_moov "$SONG" \
                       2>>"$OUT/ffmpeg.log"; then
                 RUN_ARGS="$SONG"
-                run test_menu_music "$HERE/test_menu_music.cpp" "$SRC/media/menu_music.cpp" \
-                    "$SRC/media/decoder.cpp" "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" \
+                run test_menu_music "$HERE/test_menu_music.cpp" "$SRC/media/menu_music.cpp" "$SRC/media/file_stream_io.cpp" \
+                    "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" \
                     "$SRC/http_stream_reader.cpp" "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
             fi

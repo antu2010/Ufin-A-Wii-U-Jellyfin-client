@@ -43,17 +43,43 @@ public:
     // draining the queue and stalling playback.
     static const size_t MAX_SIZE = 24;
 
+    // Decoded frames are a poor use of RAM: one second of 1080p30 NV12 is
+    // ~89 MB, while the same second of compressed 6 Mbps video is 0.75 MB
+    // (see Player's packet buffer). So pictures larger than 720p get a
+    // fixed, moderate decoded-frame budget instead of MAX_SIZE slots of
+    // the bigger frame (24 x 3 MB = ~71 MB). 720p and smaller keep exactly
+    // MAX_SIZE, so the stable path is unchanged.
+    static const size_t BIG_PICTURE_BUDGET_BYTES = 48u * 1024u * 1024u;
+    static const size_t MIN_CAPACITY = 6; // never fewer than the old pre-tuning depth
+
+    // Slots to use for frames of `frameBytes` each. frameBytes == 0
+    // (unknown / no video) and anything at or below the 720p frame size
+    // keep MAX_SIZE.
+    static size_t capacityForFrameBytes(size_t frameBytes) {
+        if (frameBytes <= 1280u * 720u * 3u / 2u) return MAX_SIZE;
+        size_t n = BIG_PICTURE_BUDGET_BYTES / frameBytes;
+        if (n < MIN_CAPACITY) n = MIN_CAPACITY;
+        if (n > MAX_SIZE) n = MAX_SIZE;
+        return n;
+    }
+
+    FrameQueue() = default;
+    explicit FrameQueue(size_t capacity) : capacity_(capacity < 1 ? 1 : capacity) {}
+
+    size_t capacity() const { return capacity_; }
+
     // Blocks while the queue is full, which naturally paces the decode
     // thread to roughly the render thread's consumption rate. Takes
     // ownership of `frame` (frees it if the queue has been stopped).
     void push(AVFrame* frame, double pts) {
         std::unique_lock<std::mutex> lock(mtx_);
-        cv_not_full_.wait(lock, [this] { return queue_.size() < MAX_SIZE || stopped_; });
+        cv_not_full_.wait(lock, [this] { return queue_.size() < capacity_ || stopped_; });
         if (stopped_ || finished_) {
             av_frame_free(&frame);
             return;
         }
         queue_.push(QueuedVideoFrame{frame, pts});
+        last_pushed_pts_ = pts;
         lock.unlock();
         cv_not_empty_.notify_one();
     }
@@ -87,6 +113,16 @@ public:
         return queue_.size();
     }
 
+    // Timestamp (stream seconds) of the newest frame ever pushed, whether or
+    // not it has been popped since; NAN before the first push or if that
+    // frame had no timestamp. Player uses it to measure decoded video ahead
+    // of the playback clock on the timeline, instead of guessing from the
+    // number of queued frames.
+    double lastPushedPts() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return last_pushed_pts_;
+    }
+
     // Producer is done pushing (normal end of stream). Queued frames
     // remain deliverable.
     void finish() {
@@ -117,6 +153,8 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_not_empty_;
     std::condition_variable cv_not_full_;
+    size_t capacity_ = MAX_SIZE;
     bool stopped_ = false;
     bool finished_ = false;
+    double last_pushed_pts_ = NAN; // guarded by mtx_
 };

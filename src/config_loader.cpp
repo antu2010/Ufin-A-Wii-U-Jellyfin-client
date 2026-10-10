@@ -62,7 +62,43 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
     outConfig.userId = str("user_id");
     outConfig.accessToken = str("access_token");
     outConfig.deviceId = str("device_id");
-    outConfig.menuMusicEnabled = boolean("menu_music", false);
+    cJSON* usage = cJSON_GetObjectItem(json, "usage_seconds");
+    outConfig.usageSeconds = (cJSON_IsNumber(usage) && usage->valuedouble >= 0.0 && usage->valuedouble < 1e15)
+                                 ? (long long)usage->valuedouble : 0;
+    outConfig.profiles.clear();
+    outConfig.lastProfile = -1;
+    if (cJSON* list = cJSON_GetObjectItem(json, "profiles"); cJSON_IsArray(list)) {
+        cJSON* entry = nullptr;
+        cJSON_ArrayForEach(entry, list) {
+            if (!cJSON_IsObject(entry) || outConfig.profiles.size() >= profiles::kMax) continue;
+            auto field = [entry](const char* key) {
+                cJSON* v = cJSON_GetObjectItem(entry, key);
+                return cJSON_IsString(v) ? std::string(v->valuestring) : std::string();
+            };
+            Profile p;
+            p.name = field("name");
+            p.host = field("host");
+            p.userId = field("user_id");
+            p.accessToken = field("access_token");
+            cJSON* pp = cJSON_GetObjectItem(entry, "port");
+            p.port = cJSON_IsNumber(pp) ? pp->valueint : 0;
+            cJSON* keep = cJSON_GetObjectItem(entry, "keep_logged_in");
+            p.keepLoggedIn = cJSON_IsTrue(keep);
+            cJSON* color = cJSON_GetObjectItem(entry, "color");
+            p.color = cJSON_IsNumber(color) && color->valueint >= 0 ? color->valueint % profiles::kColors : -1;
+            if (p.name.empty() && p.userId.empty()) continue; // nothing to show or sign in with
+            if (p.name.empty()) p.name = "User";
+            if (p.color < 0) p.color = profiles::nextColor(outConfig.profiles);
+            outConfig.profiles.push_back(p);
+        }
+        cJSON* last = cJSON_GetObjectItem(json, "last_profile");
+        if (cJSON_IsNumber(last) && last->valueint >= 0 && (size_t)last->valueint < outConfig.profiles.size())
+            outConfig.lastProfile = last->valueint;
+        profiles::normalizeAutoLogin(outConfig.profiles, outConfig.lastProfile); // only one auto log in
+    }
+    outConfig.logging = boolean("logging", false);
+    outConfig.jellyfinBackdrops = boolean("jellyfin_backdrops", false);
+    outConfig.menuMusicEnabled = boolean("menu_music", true);
     outConfig.menuMusicItemId = str("menu_music_item");
     outConfig.menuMusicName = str("menu_music_name");
     outConfig.crt = boolean("crt", false);
@@ -84,6 +120,14 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
     }
     outConfig.lightMode = boolean("light_mode", false);
     outConfig.snow = boolean("snow", false);
+    outConfig.liquidGlass = boolean("liquid_glass", false);
+    outConfig.glassRefraction = boolean("glass_refraction", true);
+    {
+        cJSON* stage = cJSON_GetObjectItem(json, "glass_refraction_stage");
+        int v = cJSON_IsNumber(stage) ? stage->valueint : 6;
+        outConfig.glassRefractionStage = v < 1 ? 1 : (v > 7 ? 7 : v);
+    }
+    outConfig.glassDebug = boolean("glass_debug", false);
     outConfig.clock = boolean("clock", false);
     outConfig.rainbowEasterEgg = boolean("rainbow_easter_egg", false);
     outConfig.rainbowUnlocked = boolean("rainbow_unlocked", false);
@@ -91,13 +135,27 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
     outConfig.gamepadOffInVideo = boolean("gamepad_off_in_video", false);
     outConfig.allowUnalignedVideoGeometry = boolean("allow_unaligned_video_geometry", true);
 
+    cJSON* videoHeight = cJSON_GetObjectItem(json, "video_height");
+    if (cJSON_IsNumber(videoHeight) && videosize::supportedHeight(videoHeight->valueint)) {
+        outConfig.videoHeight = videoHeight->valueint; // 480 low-bandwidth, 720 stable, 1080 experimental
+    } else {
+        outConfig.videoHeight = 720;  // absent or anything unsupported
+    }
+    cJSON* bufMb = cJSON_GetObjectItem(json, "video_buffer_mb");
+    outConfig.videoBufferMiB = (cJSON_IsNumber(bufMb) && bufMb->valueint >= 16 && bufMb->valueint <= 512)
+                                   ? bufMb->valueint : 0;
+    cJSON* qFrames = cJSON_GetObjectItem(json, "video_queue_frames");
+    outConfig.videoQueueFrames = (cJSON_IsNumber(qFrames) && qFrames->valueint >= 4 && qFrames->valueint <= 48)
+                                     ? qFrames->valueint : 0;
     cJSON* videoBitrate = cJSON_GetObjectItem(json, "video_bitrate");
     if (cJSON_IsNumber(videoBitrate) && videoBitrate->valueint > 0) {
         outConfig.videoBitrate = videoBitrate->valueint;
+    } else if (outConfig.videoHeight != 720) {
+        outConfig.videoBitrate = videosize::defaultBitrateFor(outConfig.videoHeight); // 720 keeps the struct default
     }
     cJSON* videoProfile = cJSON_GetObjectItem(json, "video_profile");
     if (cJSON_IsString(videoProfile) && videoProfile->valuestring[0] != '\0') {
-        outConfig.videoProfile = videoProfile->valuestring;
+        outConfig.videoProfile = h264::wireName(h264::parse(videoProfile->valuestring)); // unknown -> default
     }
 
     cJSON_Delete(json);
@@ -155,8 +213,28 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setStr("user_id", config.userId);
     setStr("access_token", config.accessToken);
     setStr("device_id", config.deviceId);
+    cJSON_DeleteItemFromObject(json, "profiles");
+    if (!config.profiles.empty()) {
+        cJSON* list = cJSON_AddArrayToObject(json, "profiles");
+        for (const Profile& p : config.profiles) {
+            cJSON* e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "name", p.name.c_str());
+            cJSON_AddStringToObject(e, "host", p.host.c_str());
+            cJSON_AddNumberToObject(e, "port", p.port);
+            cJSON_AddStringToObject(e, "user_id", p.userId.c_str());
+            cJSON_AddStringToObject(e, "access_token", p.accessToken.c_str());
+            cJSON_AddBoolToObject(e, "keep_logged_in", p.keepLoggedIn);
+            cJSON_AddNumberToObject(e, "color", p.color);
+            cJSON_AddItemToArray(list, e);
+        }
+    }
+    setNum("last_profile", config.lastProfile);
     setNum("video_bitrate", config.videoBitrate);
+    setNum("video_height", config.videoHeight);
     setStr("video_profile", config.videoProfile);
+    setNum("usage_seconds", (double)config.usageSeconds);
+    setBool("logging", config.logging);
+    setBool("jellyfin_backdrops", config.jellyfinBackdrops);
     setBool("menu_music", config.menuMusicEnabled);
     setStr("menu_music_item", config.menuMusicItemId);
     setStr("menu_music_name", config.menuMusicName);
@@ -166,6 +244,10 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setNum("background_effect", config.backgroundEffect);
     setBool("light_mode", config.lightMode);
     setBool("snow", config.snow);
+    setBool("liquid_glass", config.liquidGlass);
+    setBool("glass_refraction", config.glassRefraction);
+    setNum("glass_refraction_stage", config.glassRefractionStage);
+    setBool("glass_debug", config.glassDebug);
     setBool("clock", config.clock);
     setBool("rainbow_easter_egg", config.rainbowEasterEgg);
     setBool("rainbow_unlocked", config.rainbowUnlocked);

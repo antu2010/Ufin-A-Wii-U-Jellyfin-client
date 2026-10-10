@@ -140,6 +140,17 @@ inline Rect sidebarItem(int index) {
     return r;
 }
 
+// The "Time used" counter at the bottom of the sidebar, above the user@server footnote. Generous
+// for a finger: tapping it five times is the hidden celebration.
+inline Rect usageCounter() {
+    Rect r;
+    r.x = SIDEBAR_PAD;
+    r.y = SCREEN_H - 92.0f;
+    r.w = SIDEBAR_W - 2 * SIDEBAR_PAD;
+    r.h = 44.0f;
+    return r;
+}
+
 inline Rect scrollTrack() {
     Rect r;
     r.x = CONTENT_RIGHT - SCROLLBAR_W;

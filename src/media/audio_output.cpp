@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <coreinit/core.h>
+#include "../ufin_log.h"
 
 AudioOutput::AudioOutput() {}
 
@@ -11,7 +13,10 @@ AudioOutput::~AudioOutput() {
 }
 
 bool AudioOutput::init(int sourceSampleRate, int sourceChannels, AVSampleFormat sourceFormat) {
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+    OSReport("Ufin: DBG AudioOutput::init core=%u -> SDL_InitSubSystem(AUDIO)\n", (unsigned)OSGetCoreId());
+    const int dbgInit = SDL_InitSubSystem(SDL_INIT_AUDIO);
+    OSReport("Ufin: DBG SDL_InitSubSystem returned %d (driver=%s)\n", dbgInit, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none");
+    if (dbgInit != 0) {
         snprintf(last_error_, sizeof(last_error_), "SDL_InitSubSystem(AUDIO) failed: %s",
                  SDL_GetError());
         return false;
@@ -25,7 +30,9 @@ bool AudioOutput::init(int sourceSampleRate, int sourceChannels, AVSampleFormat 
     want.samples = 4096; // buffer size in samples per channel; on the
                          // smaller side balances latency vs. underrun risk
 
+    OSReport("Ufin: DBG -> SDL_OpenAudioDevice\n");
     device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0 /* no format changes allowed */);
+    OSReport("Ufin: DBG SDL_OpenAudioDevice returned %u\n", (unsigned)device_);
     if (device_ == 0) {
         snprintf(last_error_, sizeof(last_error_), "SDL_OpenAudioDevice failed: %s", SDL_GetError());
         return false;
@@ -224,7 +231,9 @@ void AudioOutput::shutdown() {
         vis_count_ = 0;
         vis_sequence_ = 0;
     }
+    OSReport("Ufin: DBG AudioOutput::shutdown core=%u -> SDL_QuitSubSystem\n", (unsigned)OSGetCoreId());
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    OSReport("Ufin: DBG SDL_QuitSubSystem done\n");
 }
 
 int AudioOutput::fetchVisualizerSamples(int16_t* out, int capacity, uint32_t* lastSeq) const {

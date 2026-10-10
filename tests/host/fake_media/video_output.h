@@ -18,6 +18,7 @@ public:
     void renderFrame(AVFrame* frame) {
         if (!frame) return;
         framesShown++;
+        if (onFrame) onFrame(frame);
         if (presenter_) presenter_([](uint32_t, uint32_t) {});
     }
     void renderTestPattern() {}
@@ -27,6 +28,9 @@ public:
     const char* lastError() const { return "fake video output"; }
 
     static inline int framesShown = 0;
+    // Optional hook: called (on Player's thread) for every frame shown, so a
+    // test can record when it was shown and which frame it was.
+    static inline std::function<void(AVFrame*)> onFrame;
 
 private:
     int width_ = 0, height_ = 0;

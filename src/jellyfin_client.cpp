@@ -1,5 +1,6 @@
 #include "jellyfin_client.h"
 #include "http_client.h"
+#include "video_size.h"
 #include "vendor/cJSON.h"
 
 #include <cstdlib>
@@ -239,6 +240,19 @@ static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
             ji.imageItemId = jsonString(item, "SeriesId");
             ji.imageTag = jsonString(item, "SeriesPrimaryImageTag");
         }
+
+        // Backdrop: the item's own first, else the parent's that Jellyfin points to
+        // (ParentBackdropItemId -- an episode or season shows its show's).
+        cJSON* ownBackdrops = cJSON_GetObjectItem(item, "BackdropImageTags");
+        cJSON* parentBackdrops = cJSON_GetObjectItem(item, "ParentBackdropImageTags");
+        if (cJSON_IsArray(ownBackdrops) && cJSON_IsString(cJSON_GetArrayItem(ownBackdrops, 0))) {
+            ji.backdropItemId = ji.id;
+            ji.backdropTag = cJSON_GetArrayItem(ownBackdrops, 0)->valuestring;
+        } else if (cJSON_IsArray(parentBackdrops) && cJSON_IsString(cJSON_GetArrayItem(parentBackdrops, 0)) &&
+                   !jsonString(item, "ParentBackdropItemId").empty()) {
+            ji.backdropItemId = jsonString(item, "ParentBackdropItemId");
+            ji.backdropTag = cJSON_GetArrayItem(parentBackdrops, 0)->valuestring;
+        }
         out.push_back(ji);
     }
 }
@@ -301,7 +315,7 @@ bool JellyfinClient::getLiveTvChannels(std::vector<JellyfinItem>& out) {
 
 bool JellyfinClient::search(const std::string& term, std::vector<JellyfinItem>& out) {
     std::string path = "/Users/" + user_id_ + "/Items?SearchTerm=" + urlEncode(term) +
-                       "&Recursive=true&Limit=100&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=true"
+                       "&Recursive=true&Limit=100&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1&EnableUserData=true"
                        "&IncludeItemTypes=Movie,Series,Episode,MusicAlbum,MusicArtist,Audio,BoxSet,Video";
     HttpResponse resp = http_get(host_, port_, path, authHeader());
     if (!resp.success) {
@@ -341,7 +355,7 @@ static bool getItemList(const std::string& host, int port, const std::string& au
     return true;
 }
 
-static const char* LIST_FIELDS = "&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=true";
+static const char* LIST_FIELDS = "&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1&EnableUserData=true";
 
 bool JellyfinClient::getResume(std::vector<JellyfinItem>& out) {
     return getItemList(host_, port_, authHeader(),
@@ -585,16 +599,6 @@ StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId, int6
     return target;
 }
 
-// Only letters end up in the URL, whatever the config file says.
-static std::string sanitizeProfile(const std::string& profile) {
-    std::string out;
-    for (char c : profile) {
-        if (isalpha((unsigned char)c)) out += (char)tolower((unsigned char)c);
-    }
-    if (out != "baseline" && out != "main" && out != "high") out = "baseline";
-    return out;
-}
-
 StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
                                                  const VideoStreamOptions& options) const {
     StreamTarget target;
@@ -604,12 +608,21 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     int bitrate = options.videoBitrate;
     if (bitrate < 300000) bitrate = 300000;
     if (bitrate > 20000000) bitrate = 20000000;
-    std::string profile = sanitizeProfile(options.profile);
+    const h264::Profile profileId = h264::parse(options.profile); // only the three known names reach the URL
+    const std::string profile = h264::wireName(profileId);
+    // Exact target size: 768x480 (low bandwidth), 1280x720 (stable) or
+    // 1920x1080 (experimental, opt-in). Any other pair is treated as 720p.
+    const videosize::Size target_size = videosize::forRequest(options.width, options.height);
+    const int targetWidth = target_size.width;
+    const int targetHeight = target_size.height;
 
     // Every parameter here is load-bearing for the Wii U hardware
     // decoder wrapper (h264_wiiu in the FFmpeg-wiiu fork):
     //
-    // Width=1280&Height=720 (exact, not MaxWidth/MaxHeight):
+    // Width=1280&Height=720 (exact, not MaxWidth/MaxHeight; 768x480 in the
+    // 480p low-bandwidth mode -- chosen because it is aligned on both axes,
+    // unlike 854x480 -- and 1920x1080 in the experimental 1080p30 mode, same
+    // reasoning; see video_size.h):
     //   h264_wiiu sizes its decode framebuffer as width*height*1.5, but
     //   the hardware writes rows at a 256-pixel-aligned pitch and a
     //   16-row-aligned height. The two only agree when width is a
@@ -622,14 +635,19 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     //   VideoOutput un-squeezes them at draw time using the aspect
     //   ratio from the item's metadata (getVideoInfo).
     //
-    // Profile=baseline (default):
+    // Profile=baseline (default, see h264_profile.h; Settings > H.264 profile):
     //   With the "output per frame" setting h264_wiiu uses, the hardware
     //   hands back exactly one picture per H264DECExecute call, in
     //   decode order. B-frames (Main/High profile) would come out in the
     //   wrong order with the wrong timestamps. Baseline has no B-frames,
     //   so decode order == display order and every frame lines up with
-    //   its packet's timestamp. Costs some compression efficiency; can
-    //   be overridden via config.json (video_profile) for experiments.
+    //   its packet's timestamp. Costs some compression efficiency. Main
+    //   and High are opt-in: Jellyfin offers no B-frame switch in the
+    //   stream URL, so Ufin cannot guarantee they come without B-frames.
+    //
+    // MaxRefFrames=2 (Main/High only; the Baseline URL is unchanged):
+    //   keeps the decoded-picture buffer small for the hardware decoder.
+    //   Level stays 4.1 for every profile: that covers 1080p30 and 720p30.
     //
     // MaxFramerate=30: 60 fps sources get decimated to 30 -- the CPU
     //   side (frame copy + upload) is sized for 720p30, per the README.
@@ -643,12 +661,13 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     char pathBuf[1024];
     snprintf(pathBuf, sizeof(pathBuf),
         "/Videos/%s/stream.mp4?static=false&VideoCodec=h264&AudioCodec=aac"
-        "&Width=1280&Height=720&VideoBitrate=%d&AudioBitrate=192000"
+        "&Width=%d&Height=%d&VideoBitrate=%d&AudioBitrate=192000"
         "&Profile=%s&Level=41&MaxFramerate=30&MaxAudioChannels=2"
         "&AllowVideoStreamCopy=false&AllowAudioStreamCopy=false"
         "&ApiKey=%s",
-        itemId.c_str(), bitrate, profile.c_str(), token_.c_str());
+        itemId.c_str(), targetWidth, targetHeight, bitrate, profile.c_str(), token_.c_str());
     target.path = pathBuf;
+    if (profileId != h264::Profile::Baseline) target.path += "&MaxRefFrames=2";
 
     // ApiKey (not api_key): Jellyfin 12 only accepts the new spelling
     // once legacy authorization is off; 10.8+ read it too.
@@ -668,6 +687,14 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
         target.path += "&SubtitleStreamIndex=-1"; // explicitly none
     }
     return target;
+}
+
+std::string JellyfinClient::buildBackdropPath(const std::string& backdropItemId, const std::string& backdropTag,
+                                              int maxW, int maxH) const {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "/Items/%s/Images/Backdrop/0?maxWidth=%d&maxHeight=%d&quality=85&format=Jpg&tag=%s",
+             backdropItemId.c_str(), maxW, maxH, urlEncode(backdropTag).c_str());
+    return buf;
 }
 
 std::string JellyfinClient::buildImagePath(const std::string& imageItemId, const std::string& imageTag,

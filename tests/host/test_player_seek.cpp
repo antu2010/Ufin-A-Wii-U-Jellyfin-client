@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     PlayOptions options;
     options.displayAspect = 16.0 / 9.0;
     std::vector<double> starts;
+    int ticks = 0; // onTick also drives the once-a-second buffer/timing log line
     uint32_t session = 0;
     for (int round = 0; round < 5; round++) {
         std::string path = "/Videos/v1/stream.mp4?static=false&PlaySessionId=" +
@@ -118,7 +119,7 @@ int main(int argc, char** argv) {
         options.startOffsetSeconds = startAt;
         starts.push_back(startAt);
         framesAtRestart = VideoOutput::framesShown;
-        PlayResult r = player.play("127.0.0.1", server.port(), path, poll, {}, options);
+        PlayResult r = player.play("127.0.0.1", server.port(), path, poll, [&](double) { ticks++; }, options);
         if (r != PlayResult::SeekRequested) {
             CHECK(r == PlayResult::Stopped);
             break;
@@ -155,5 +156,6 @@ int main(int argc, char** argv) {
     }
 
     server.stop();
+    CHECK(ticks > 0);
     return check::finish("test_player_seek");
 }

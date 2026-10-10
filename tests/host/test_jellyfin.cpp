@@ -2,6 +2,7 @@
 // against a fake Jellyfin server: authentication, browsing, item
 // metadata, stream URL construction, and playback reporting.
 #include "check.h"
+#include <cstring>
 #include "fake_http_server.h"
 #include "jellyfin_client.h"
 
@@ -157,7 +158,7 @@ int main() {
     CHECK(contains(video.path, "&Width=1280&Height=720&"));
     CHECK(!contains(video.path, "MaxWidth"));
     CHECK(contains(video.path, "VideoBitrate=2500000"));
-    CHECK(contains(video.path, "Profile=baseline"));
+    CHECK(contains(video.path, "Profile=baseline"));  // the default profile
     CHECK(contains(video.path, "Level=41"));
     CHECK(contains(video.path, "MaxFramerate=30"));
     CHECK(contains(video.path, "MaxAudioChannels=2"));
@@ -173,9 +174,20 @@ int main() {
     video = client.buildVideoStreamUrl("m1", opts);
     CHECK(contains(video.path, "VideoBitrate=4000000"));
     CHECK(contains(video.path, "Profile=high"));
+    CHECK(contains(video.path, "Level=41"));
+    CHECK(contains(video.path, "MaxRefFrames=2"));
+    opts.profile = "main";
+    video = client.buildVideoStreamUrl("m1", opts);
+    CHECK(contains(video.path, "Profile=main"));
+    CHECK(contains(video.path, "MaxRefFrames=2"));
+    opts.profile = "baseline";
+    video = client.buildVideoStreamUrl("m1", opts);
+    CHECK(contains(video.path, "Profile=baseline"));
+    CHECK(!contains(video.path, "MaxRefFrames"));   // the Baseline request is unchanged
+    opts.profile = "High";
 
     opts.videoBitrate = 10;                    // clamped up
-    opts.profile = "ultra&evil=1";             // unknown -> baseline, nothing injected
+    opts.profile = "ultra&evil=1";             // unknown -> the default (baseline), nothing injected
     video = client.buildVideoStreamUrl("m1", opts);
     CHECK(contains(video.path, "VideoBitrate=300000"));
     CHECK(contains(video.path, "Profile=baseline"));
@@ -184,6 +196,85 @@ int main() {
     opts.videoBitrate = 999999999;             // clamped down
     video = client.buildVideoStreamUrl("m1", opts);
     CHECK(contains(video.path, "VideoBitrate=20000000"));
+
+    // Experimental 1080p30: exact 1920x1080, everything else as for 720p.
+    {
+        VideoStreamOptions o;
+        o.width = 1920; o.height = 1080; o.videoBitrate = 6000000;
+        StreamTarget t = client.buildVideoStreamUrl("m1", o);
+        CHECK(contains(t.path, "/Videos/m1/stream.mp4?"));
+        CHECK(contains(t.path, "&Width=1920&Height=1080&"));
+        CHECK(!contains(t.path, "Width=1280"));
+        CHECK(!contains(t.path, "MaxWidth"));
+        CHECK(contains(t.path, "VideoCodec=h264"));
+        CHECK(contains(t.path, "AudioCodec=aac"));
+        CHECK(contains(t.path, "VideoBitrate=6000000"));
+        CHECK(contains(t.path, "Profile=baseline"));
+        CHECK(contains(t.path, "Level=41"));
+        CHECK(contains(t.path, "MaxFramerate=30"));
+        CHECK(contains(t.path, "AllowVideoStreamCopy=false"));
+        CHECK(contains(t.path, "AllowAudioStreamCopy=false"));
+        CHECK(contains(t.path, "/stream.mp4?"));
+        // Only the size differs from the 720p request (same bitrate).
+        VideoStreamOptions o720; o720.videoBitrate = 6000000;
+        std::string a = t.path, b = client.buildVideoStreamUrl("m1", o720).path;
+        size_t wa = a.find("Width=1920&Height=1080"), wb = b.find("Width=1280&Height=720");
+        CHECK(wa != std::string::npos && wb != std::string::npos && wa == wb);
+        a.replace(wa, strlen("Width=1920&Height=1080"), "Width=1280&Height=720");
+        CHECK_STR(a, b);
+        // Unsupported sizes fall back to the stable 720p request.
+        VideoStreamOptions odd;
+        odd.width = 1920; odd.height = 800;
+        CHECK(contains(client.buildVideoStreamUrl("m1", odd).path, "&Width=1280&Height=720&"));
+        odd.width = 4096; odd.height = 2160;
+        CHECK(contains(client.buildVideoStreamUrl("m1", odd).path, "&Width=1280&Height=720&"));
+    }
+    // 480p low-bandwidth: exact 768x480 (aligned on both axes), nothing else changes.
+    {
+        VideoStreamOptions o;
+        o.width = 768; o.height = 480; o.videoBitrate = 750000;
+        StreamTarget t = client.buildVideoStreamUrl("m1", o);
+        CHECK(contains(t.path, "&Width=768&Height=480&"));
+        CHECK(!contains(t.path, "Width=1280"));
+        CHECK(!contains(t.path, "MaxWidth"));
+        CHECK(contains(t.path, "VideoBitrate=750000"));
+        CHECK(contains(t.path, "Profile=baseline"));
+        CHECK(contains(t.path, "Level=41"));
+        CHECK(contains(t.path, "MaxFramerate=30"));
+        CHECK(contains(t.path, "AllowVideoStreamCopy=false"));
+        VideoStreamOptions o720; o720.videoBitrate = 750000;
+        std::string a = t.path, b = client.buildVideoStreamUrl("m1", o720).path;
+        size_t wa = a.find("Width=768&Height=480"), wb = b.find("Width=1280&Height=720");
+        CHECK(wa != std::string::npos && wb != std::string::npos && wa == wb);
+        a.replace(wa, strlen("Width=768&Height=480"), "Width=1280&Height=720");
+        CHECK_STR(a, b); // only the size differs
+        // 750 kbps and 1.5 Mbps are above the builder's floor and pass through unchanged.
+        o.videoBitrate = 1500000;
+        CHECK(contains(client.buildVideoStreamUrl("m1", o).path, "VideoBitrate=1500000"));
+        // The textbook 854x480 (unaligned) and mixed-up pairs are NOT honoured.
+        VideoStreamOptions odd;
+        odd.width = 854; odd.height = 480;
+        CHECK(contains(client.buildVideoStreamUrl("m1", odd).path, "&Width=1280&Height=720&"));
+        odd.width = 768; odd.height = 720;
+        CHECK(contains(client.buildVideoStreamUrl("m1", odd).path, "&Width=1280&Height=720&"));
+        odd.width = 1280; odd.height = 480;
+        CHECK(contains(client.buildVideoStreamUrl("m1", odd).path, "&Width=1280&Height=720&"));
+    }
+    // New 1080p bitrates pass through unclamped too.
+    for (int br : {4000000, 6000000, 8000000}) {
+        VideoStreamOptions o;
+        o.width = 1920; o.height = 1080; o.videoBitrate = br;
+        std::string want = "VideoBitrate=" + std::to_string(br);
+        CHECK(contains(client.buildVideoStreamUrl("m1", o).path, want.c_str()));
+        CHECK(contains(client.buildVideoStreamUrl("m1", o).path, "&Width=1920&Height=1080&"));
+    }
+    // Defaults are still the untouched 720p request.
+    {
+        VideoStreamOptions d;
+        CHECK_EQ(d.width, 1280);
+        CHECK_EQ(d.height, 720);
+        CHECK_EQ(d.videoBitrate, 2500000);
+    }
 
     // Playback reporting posts JSON with the position in ticks.
     CHECK(client.reportPlaybackStart("m1"));
@@ -355,6 +446,27 @@ int main() {
 
         std::string p = client.buildImagePath("m1", "t 1", 96, 90);
         CHECK_STR(p, "/Items/m1/Images/Primary?maxWidth=96&maxHeight=90&quality=85&format=Jpg&tag=t%201");
+
+        // Backdrops: own first, else the parent Jellyfin points to, else none.
+        std::string bp = client.buildBackdropPath("m1", "b 1", 1920, 1080);
+        CHECK_STR(bp, "/Items/m1/Images/Backdrop/0?maxWidth=1920&maxHeight=1080&quality=85&format=Jpg&tag=b%201");
+        {
+            FakeRoute bd;
+            bd.body = "{\"Items\":["
+                "{\"Id\":\"m1\",\"Type\":\"Movie\",\"BackdropImageTags\":[\"bt1\",\"bt2\"]},"
+                "{\"Id\":\"e1\",\"Type\":\"Episode\",\"BackdropImageTags\":[],\"ParentBackdropItemId\":\"se4\",\"ParentBackdropImageTags\":[\"pt3\"]},"
+                "{\"Id\":\"f1\",\"Type\":\"Folder\",\"BackdropImageTags\":[]},"
+                "{\"Id\":\"x1\",\"Type\":\"Movie\",\"ParentBackdropImageTags\":[\"orphan\"]}]}";
+            server.addRoute("/Users/user1/Items", bd);
+            std::vector<JellyfinItem> bl;
+            CHECK(client.getItems("x", bl));
+            CHECK_EQ((int)bl.size(), 4);
+            CHECK_STR(bl[0].backdropItemId, "m1"); CHECK_STR(bl[0].backdropTag, "bt1");
+            CHECK_STR(bl[1].backdropItemId, "se4"); CHECK_STR(bl[1].backdropTag, "pt3");
+            CHECK_STR(bl[2].backdropItemId, ""); CHECK_STR(bl[2].backdropTag, "");
+            CHECK_STR(bl[3].backdropItemId, ""); // a parent tag without the parent's id is unusable
+            server.addRoute("/Users/user1/Items", art);
+        }
 
         // Binary-safe fetch (JPEG bytes contain NULs).
         FakeRoute jpg;

@@ -6,9 +6,20 @@
 #include "check.h"
 #include "soft_render.h"
 #include "ui/app_ui.h"
+#include "ui/glass_core.h"
+#include "glb_builder.h"
+#include <sys/stat.h>
+#include <thread>
+#include <chrono>
+namespace glass = ui::glass;
 
 #include <imgui.h>
 
+#include <cmath>
+#include <map>
+#include <set>
+#include "help_content.h"
+#include <string>
 #include <cstdlib>
 #include <functional>
 
@@ -20,6 +31,8 @@ static uint32_t bgr(uint32_t rgb) {
 }
 static const uint32_t BG = bgr(0x14161A), SIDEBAR = bgr(0x1B1E24), PANEL = bgr(0x23272E),
                       SELECTED = bgr(0x0B7FB0);
+
+static bool sr_at_differs(const SoftRender& a, const SoftRender& b, int x, int y) { return a.at(x, y) != b.at(x, y); }
 
 static SoftRender renderScreen(const std::function<void()>& draw, const char* name) {
     ImGuiIO& io = ImGui::GetIO();
@@ -610,6 +623,853 @@ static void testHud() {
     withVideo(m, "hud_live");
 }
 
+// The rebuffering wheel: drawn over the picture (which stays visible) only
+// while buffering and not user-paused, it spins, and it draws nothing when off.
+static void testBufferingWheel() {
+    ui::VideoHudModel m;
+    m.title = "Movie";
+    m.durationSeconds = 600;
+    m.positionSeconds = 100;
+    auto withVideo = [&](const ui::VideoHudModel& hud, const char* name) {
+        return renderScreen([&] {
+            ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(90, 110, 130, 255));
+            ui::drawVideoHud(hud);
+        }, name);
+    };
+    const int cx = 640, cy = 324; // where the pause icon sits
+    auto red = [](uint32_t c) { return (int)(c & 0xFF); };
+
+    SoftRender off = withVideo(m, "hud_no_buffering");
+    CHECK_EQ(off.at(cx, cy), bgr(0x5A6E82)); // nothing drawn, picture untouched
+
+    m.buffering = true;
+    m.bufferedSeconds = 4.0;
+    m.bufferingTargetSeconds = 12.0;
+    SoftRender on = withVideo(m, "hud_buffering");
+    CHECK(on.at(cx, cy) != bgr(0x5A6E82));                 // disc behind the wheel
+    CHECK(red(on.at(cx, cy)) < red(bgr(0x5A6E82)) - 10);   // dimmed, not opaque: the picture shows through
+    CHECK(red(on.at(cx + 30, cy)) > red(on.at(cx, cy)) + 10); // the ring is brighter than the disc
+    CHECK(red(on.at(cx + 100, cy)) == red(bgr(0x5A6E82)));  // far from it the picture is untouched
+    CHECK(red(on.at(cx, cy + 64 + 12 - 6)) == red(bgr(0x5A6E82))); // just outside the label pill
+    CHECK(red(on.at(cx - 60, cy + 64 + 12 + 4)) < red(bgr(0x5A6E82))); // label pill under it
+
+    // It spins: the bright arc sits at a different place ~0.2 s later.
+    auto ringMask = [&](const SoftRender& sr) {
+        uint32_t mask = 0;
+        for (int i = 0; i < 24; i++) {
+            const float a = i * 6.2831853f / 24.0f;
+            const int x = cx + (int)std::lround(std::cos(a) * 30.0f), y = cy + (int)std::lround(std::sin(a) * 30.0f);
+            if (red(sr.at(x, y)) > 200) mask |= 1u << i; // near-white: the arc, not the dim track
+        }
+        return mask;
+    };
+    const uint32_t before = ringMask(on);
+    SoftRender later = on;
+    for (int i = 0; i < 12; i++) later = withVideo(m, "hud_buffering_later");
+    const uint32_t after = ringMask(later);
+    CHECK(before != 0 && after != 0);
+    CHECK(before != after);
+
+    // The user's pause wins: pause icon, no wheel.
+    m.paused = true;
+    SoftRender paused = withVideo(m, "hud_buffering_paused");
+    CHECK_EQ(paused.at(cx - 15, cy), bgr(0xFFFFFF));
+    CHECK(red(paused.at(cx + 30, cy + 40)) == red(on.at(cx, cy))); // disc only, no ring/label there
+
+    // The standalone indicator (TV-only mode) draws the same wheel.
+    SoftRender tv = renderScreen([&] {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(90, 110, 130, 255));
+        ui::drawBufferingIndicator(4.0, 12.0);
+    }, "tv_buffering");
+    CHECK(red(tv.at(cx + 30, cy)) > red(tv.at(cx, cy)) + 10);
+    // Without a target it still draws (just no seconds readout).
+    renderScreen([&] { ui::drawBufferingIndicator(0.0, 0.0); }, "tv_buffering_plain");
+}
+
+// ---- Liquid Glass -----------------------------------------------------------
+
+static int g_glassUpdates = 0, g_glassCreates = 0;
+static std::map<uint64_t, std::vector<uint8_t>> g_glassTex; // what the fake GPU holds
+
+static glass::TextureSink fakeGlassSink(bool registerMagenta) {
+    glass::TextureSink s;
+    s.create = [registerMagenta](const uint8_t* px, int w, int h) -> uint64_t {
+        static uint64_t next = 5000;
+        g_glassCreates++;
+        uint64_t id = next++;
+        g_glassTex[id].assign(px, px + (size_t)w * h * 4);
+        if (registerMagenta && !getenv("UFIN_GLASS_REAL")) { // the rasterizer samples this: hot magenta, impossible to mistake
+            SoftUserTexture t;
+            t.w = 4; t.h = 4;
+            t.rgba.assign(4 * 4 * 4, 0);
+            for (size_t i = 0; i < 16; i++) { t.rgba[i * 4] = 255; t.rgba[i * 4 + 1] = 0; t.rgba[i * 4 + 2] = 255; t.rgba[i * 4 + 3] = 255; }
+            SoftRender::userTextures()[(ImTextureID)id] = t;
+        } else if (registerMagenta) {
+            SoftUserTexture t;
+            t.w = w; t.h = h;
+            t.rgba.assign(px, px + (size_t)w * h * 4);
+            SoftRender::userTextures()[(ImTextureID)id] = t;
+        }
+        return id;
+    };
+    s.update = [](uint64_t id, const uint8_t* px, int w, int h) -> bool {
+        g_glassUpdates++;
+        g_glassTex[id].assign(px, px + (size_t)w * h * 4);
+        if (getenv("UFIN_GLASS_REAL")) { // preview mode: the rasterizer shows the real blurred backdrop
+            SoftUserTexture t;
+            t.w = w; t.h = h;
+            t.rgba.assign(px, px + (size_t)w * h * 4);
+            SoftRender::userTextures()[(ImTextureID)id] = t;
+        }
+        return true;
+    };
+    s.release = [](uint64_t id) {
+        g_glassTex.erase(id);
+        SoftRender::userTextures().erase((ImTextureID)id);
+    };
+    return s;
+}
+
+// Number of hot-magenta pixels inside a rectangle (the fake backdrop's colour).
+static int magentaIn(const SoftRender& sr, int x0, int y0, int x1, int y1) {
+    int n = 0;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            uint32_t c = sr.at(x, y);
+            // Magenta, possibly darkened by a translucent tint: R and B high and alike, G low.
+            const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)((c >> 16) & 0xFF);
+            if (r > 100 && b > 100 && g < 80 && std::abs(r - b) < 60) n++;
+        }
+    return n;
+}
+
+static void testLiquidGlass() {
+    auto sameImage = [](const SoftRender& a, const SoftRender& b) { return a.px == b.px; };
+    ui::BrowserModel m = sampleBrowser(12, 2);
+
+    // OFF: glassFrame/backdrop do nothing and every screen is as it always was.
+    ui::setGlass(false);
+    CHECK(!ui::glassEnabled());
+    int updatesBefore = g_glassUpdates;
+    ui::glassFrame(1.0, false);
+    CHECK_EQ(g_glassUpdates, updatesBefore); // no work, no texture writes
+    SoftRender off = renderScreen([&] { ui::drawBrowser(m); }, "glass_off");
+
+    // Set up the shared blur the way Gfx::setGlass does (fake GPU).
+    auto& bd = glass::backdrop();
+    CHECK(bd.enable(glass::sharedDims(1280, 720, 854, 480), fakeGlassSink(true), 2));
+    CHECK_EQ(g_glassCreates, 3);
+    CHECK(ui::glassBlurAvailable());
+
+    // ON: a different, glassy picture; the selected row is lit; the sidebar is
+    // a floating rounded panel (its far-left strip is no longer sidebar-flat).
+    ui::setGlass(true);
+    CHECK(ui::glassEnabled());
+    SoftRender on = renderScreen([&] { ui::drawBrowser(m); }, "glass_browser");
+    CHECK(!sameImage(off, on));
+    CHECK(sr_at_differs(off, on, 5, 400));
+    ui::Rect sel = ui::layout::listRow(2);
+    CHECK(sr_at_differs(off, on, (int)sel.x + 60, (int)sel.y + 3));
+    // Frosted panels sample the shared blur: magenta shows through the sidebar
+    // panel and the rows (menus DO use the backdrop)...
+    CHECK(magentaIn(on, 20, 200, ui::layout::SIDEBAR_W - 20, 240) > 100);
+    ui::Rect plain = ui::layout::listRow(4); // an unfocused row
+    CHECK(magentaIn(on, (int)plain.x + 400, (int)plain.y + 6, (int)plain.x + 500, (int)plain.y + 20) > 50);
+    // ...and it is a full soft backdrop behind everything, not flat BG.
+    CHECK(!(on.at(ui::layout::SIDEBAR_W + 8, 700) == BG && on.at(ui::layout::SIDEBAR_W + 8, 20) == BG) ||
+          magentaIn(on, ui::layout::SIDEBAR_W + 8, 690, ui::layout::SIDEBAR_W + 60, 710) > 0);
+
+    // Rounder: the row's corner is cut further than the flat theme's 12 px.
+    ui::Rect r0 = ui::layout::listRow(0);
+    CHECK(off.at((int)r0.x + 4, (int)r0.y + 4) == PANEL);   // flat row: inside the corner
+    CHECK(on.at((int)r0.x + 4, (int)r0.y + 4) != PANEL);    // glass row: rounded away
+
+    // Over video the backdrop is NEVER sampled: no magenta anywhere in the HUD,
+    // whatever it draws (pause icon, seek banner, notice, track menu, buffering).
+    ui::VideoHudModel hud;
+    hud.title = "Movie"; hud.durationSeconds = 600; hud.positionSeconds = 100;
+    hud.visible = true; hud.paused = true; hud.seekDelta = 30; hud.seekTarget = 130;
+    hud.notice = "GamePad screen off"; hud.trackMenu = true; hud.audioLabel = "English"; hud.subtitleLabel = "Off";
+    SoftRender vid = renderScreen([&] {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(90, 110, 130, 255));
+        ui::drawVideoHud(hud);
+    }, "glass_hud_over_video");
+    CHECK_EQ(magentaIn(vid, 0, 0, 1280, 720), 0);
+    hud.paused = false; hud.seekDelta = 0; hud.trackMenu = false; hud.notice.clear();
+    hud.buffering = true; hud.bufferedSeconds = 3; hud.bufferingTargetSeconds = 12;
+    SoftRender buf = renderScreen([&] {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(90, 110, 130, 255));
+        ui::drawVideoHud(hud);
+    }, "glass_buffering_over_video");
+    CHECK_EQ(magentaIn(buf, 0, 0, 1280, 720), 0);
+    // The buffering wheel still renders under glass: ring pixel brighter than disc.
+    auto redOf = [](uint32_t c) { return (int)(c & 0xFF); };
+    CHECK(redOf(buf.at(640 + 30, 324)) > redOf(buf.at(640, 324)) + 10);
+    SoftRender tv = renderScreen([&] {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(90, 110, 130, 255));
+        ui::drawBufferingIndicator(3.0, 12.0);
+    }, "glass_tv_buffering");
+    CHECK_EQ(magentaIn(tv, 0, 0, 1280, 720), 0);
+    CHECK(redOf(tv.at(640 + 30, 324)) > redOf(tv.at(640, 324)) + 10);
+
+    // Buttons: pressed is deeper (darker) than normal; the layout is unchanged.
+    ui::NowPlayingModel np;
+    np.title = "Song"; np.durationSeconds = 200; np.positionSeconds = 20;
+    SoftRender npNormal = renderScreen([&] { ui::drawNowPlaying(np); }, "glass_np");
+    np.pressedButton = (int)ui::NpButton::Stop;
+    SoftRender npPressed = renderScreen([&] { ui::drawNowPlaying(np); }, "glass_np_pressed");
+    ui::Rect stop = ui::npButtonRect((int)ui::NpButton::Stop);
+    const int sx = (int)(stop.x + stop.w * 0.5f), sy = (int)(stop.y + 10);
+    auto lum = [](uint32_t c) { return (int)(c & 0xFF) + (int)((c >> 8) & 0xFF) + (int)((c >> 16) & 0xFF); };
+    CHECK(lum(npPressed.at(sx, sy)) < lum(npNormal.at(sx, sy)));
+    CHECK(magentaIn(npNormal, (int)stop.x + 4, (int)stop.y + 4, (int)stop.x + 14, (int)stop.y + 14) > 0); // buttons frost the backdrop
+    ui::hitTestNowPlaying(sx, sy); // hit-testing untouched by the look
+    CHECK(ui::hitTestNowPlaying(sx, sy) == (int)ui::NpButton::Stop);
+
+    // Artwork colour: a red poster in the cache tints the backdrop, faintly.
+    {
+        std::vector<uint8_t> red(32 * 32 * 4);
+        for (size_t i = 0; i < red.size(); i += 4) { red[i] = 230; red[i + 1] = 20; red[i + 2] = 20; red[i + 3] = 255; }
+        const uint64_t tex = 777;
+        ui::glassNoteArtwork(tex, red.data(), 32, 32);
+        ui::BrowserModel a = sampleBrowser(4, 1);
+        a.items[1].art = tex;
+        auto avgRed = [&]() {
+            // Mean red of the most recently written backdrop texture.
+            long sum = 0, n = 0;
+            for (auto& kv : g_glassTex) if (kv.first == bd.texture()) for (size_t i = 0; i < kv.second.size(); i += 4) { sum += kv.second[i]; n++; }
+            return n ? (double)sum / (double)n : 0.0;
+        };
+        double t = 100.0;
+        for (int i = 0; i < 200; i++) { t += 1.0 / 60.0; ui::glassFrame(t, false); renderScreen([&] { ui::drawBrowser(sampleBrowser(4, 0)); }, "glass_noart"); }
+        const double before = avgRed();
+        for (int i = 0; i < 400; i++) { t += 1.0 / 60.0; ui::glassFrame(t, false); renderScreen([&] { ui::drawBrowser(a); }, "glass_art"); }
+        const double after = avgRed();
+        CHECK(after > before + 0.3);   // it shows up...
+        CHECK(after < before + 40.0);  // ...but faintly
+        ui::glassForgetArtwork(tex);
+    }
+
+    // Video frames: the blur is neither recomputed nor written (playback wins).
+    {
+        int u = g_glassUpdates;
+        for (int i = 0; i < 300; i++) ui::glassFrame(500.0 + i / 60.0, true);
+        CHECK_EQ(g_glassUpdates, u);
+    }
+
+    // Smooth motion: the glass backdrop changes on (nearly) every frame, not in
+    // ~1 Hz steps -- the blur is cross-faded on the GPU between regenerations.
+    {
+        ui::MessageModel sm; // a still screen: nothing animates here except the backdrop
+        sm.title = "Still"; sm.lines = {"Nothing moves on this screen."};
+        double t = 2000.0;
+        setenv("UFIN_GLASS_REAL", "1", 1); // the fake GPU now shows the real blur (all 3 textures get rewritten while settling)
+        for (int i = 0; i < 400; i++) { t += 1.0 / 60.0; ui::glassFrame(t, false); } // settle
+        int changedFrames = 0;
+        SoftRender prevF = renderScreen([&] { ui::drawMessage(sm); }, "glass_smooth_a");
+        for (int i = 0; i < 120; i++) { // 2 s
+            t += 1.0 / 60.0;
+            ui::glassFrame(t, false);
+            SoftRender cur = renderScreen([&] { ui::drawMessage(sm); }, "glass_smooth_b");
+            bool differs = false;
+            for (int y = 0; y < 720 && !differs; y++)
+                for (int x = 0; x < 1280; x++) if (prevF.at(x, y) != cur.at(x, y)) { differs = true; break; }
+            if (differs) changedFrames++;
+            prevF = cur;
+        }
+        unsetenv("UFIN_GLASS_REAL");
+        CHECK(changedFrames >= 24); // >= 24 different frames per 2 s (stepping at 1 Hz would give ~2)
+    }
+
+    // Rounded-corner clipping: nothing inside a glass bubble may reach outside
+    // its rounded outline.
+    {
+        // (1) The accent strip on a card follows the card's corners. The error
+        // strip is pure ERROR_RED; it must not cover the corner that the card's
+        // radius cuts away, yet still span the straight top edge.
+        ui::MessageModel mm;
+        mm.title = "Oops"; mm.isError = true; mm.lines = {"Something failed."};
+        SoftRender card = renderScreen([&] { ui::drawMessage(mm); }, "glass_message_error");
+        auto isStrip = [&](int x, int y) {
+            const uint32_t c = card.at(x, y);
+            return (int)(c & 0xFF) > 200 && (int)((c >> 8) & 0xFF) < 100 && (int)((c >> 16) & 0xFF) < 120;
+        };
+        int topY = -1;
+        for (int y = 0; y < 720 && topY < 0; y++) if (isStrip(640, y)) topY = y;
+        CHECK(topY > 0);
+        const int cardX = (1280 - 820) / 2; // drawMessage's card geometry
+        CHECK(isStrip(640, topY + 2));
+        CHECK(!isStrip(cardX + 1, topY + 1));     // the corner the radius cuts away
+        CHECK(!isStrip(cardX + 3, topY + 1));
+        CHECK(!isStrip(1280 - cardX - 2, topY + 1));
+        CHECK(isStrip(cardX + 40, topY + 2));     // past the curve it is there again
+
+        // (2) The focus highlight drifts across a focused button; between frames
+        // only pixels INSIDE the button's rounded outline may change.
+        ui::LoginModel lm;
+        lm.rows = {{"Server", "a", "", false, false, false}, {"Sign in", "", "", false, true, true}};
+        lm.focused = 1;
+        ui::Rect r = ui::layout::loginRow(1);
+        const float rad = 14.0f * 1.45f;
+        auto outside = [&](float px, float py) { // outside the rounded rect r (radius rad)?
+            const float cx = std::min(std::max(px, r.x + rad), r.right() - rad);
+            const float cy = std::min(std::max(py, r.y + rad), r.bottom() - rad);
+            const float dx = px - cx, dy = py - cy;
+            return dx * dx + dy * dy > (rad + 0.75f) * (rad + 0.75f);
+        };
+        SoftRender prev = renderScreen([&] { ui::drawLogin(lm); }, "glass_login_focus");
+        int changed = 0, leaked = 0;
+        for (int f = 0; f < 120; f++) { // ~2 s: the highlight crosses the whole button
+            SoftRender cur = renderScreen([&] { ui::drawLogin(lm); }, "glass_login_focus_next");
+            for (int y = (int)r.y - 8; y < (int)r.bottom() + 8; y++)
+                for (int x = (int)r.x - 8; x < (int)r.right() + 8; x++) {
+                    if (prev.at(x, y) == cur.at(x, y)) continue;
+                    changed++;
+                    if (outside((float)x + 0.5f, (float)y + 0.5f)) leaked++;
+                }
+            prev = cur;
+        }
+        CHECK(changed > 200); // it does animate...
+        CHECK_EQ(leaked, 0);  // ...and only inside the bubble
+    }
+
+    // Glass is see-through: a bright object behind a panel stays clearly visible.
+    {
+        SoftRender clear = renderScreen([&] {
+            ui::drawBrowser(m);
+            ImGui::GetBackgroundDrawList(); // (panel drawn above; nothing else)
+        }, "glass_clear");
+        ui::Rect plain2 = ui::layout::listRow(4);
+        auto lumOf = [](uint32_t c) { return (int)(c & 0xFF) + (int)((c >> 8) & 0xFF) + (int)((c >> 16) & 0xFF); };
+        // Under a row, the picture is still mostly the backdrop: not a flat opaque slab.
+        const int a = lumOf(clear.at((int)plain2.x + 300, (int)plain2.y + 30));
+        const int b = lumOf(clear.at((int)plain2.x + 300, (int)plain2.bottom() + 3));
+        CHECK(std::abs(a - b) < 140);
+    }
+
+    // Flat glass (blur unavailable): still glass, still readable, no texture.
+    bd.disable();
+    CHECK(!ui::glassBlurAvailable());
+    SoftRender flat = renderScreen([&] { ui::drawBrowser(m); }, "glass_flat");
+    CHECK(!sameImage(off, flat));
+    CHECK(!sameImage(on, flat));
+    CHECK_EQ(magentaIn(flat, 0, 0, 1280, 720), 0);
+    CHECK_EQ((int)g_glassTex.size(), 0); // nothing left on the fake GPU
+
+    // Turned off again: byte-for-byte the original picture.
+    ui::setGlass(false);
+    SoftRender back = renderScreen([&] { ui::drawBrowser(m); }, "glass_off_again");
+    CHECK(sameImage(off, back));
+    ui::glassFrame(9999.0, false); // still a no-op
+}
+
+// --- Liquid Glass: real refraction ------------------------------------------
+//
+// The software renderer runs the UI's snapshot callback the way the GX2 backend
+// does (copies everything drawn so far into a texture), so this exercises the
+// whole path through the real UI code: when snapshots are requested, that the glass
+// is drawn from them, that the picture really bends at the rim, and that nothing
+// reaches outside the rounded shape.
+
+static void drawChecker() { // high-contrast, 17 px squares (no relation to the lens' pixel shifts)
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    d->AddRectFilled(ImVec2(0, 0), ImVec2(1280, 720), IM_COL32(20, 20, 30, 255));
+    for (int y = 0; y < 720; y += 17)
+        for (int x = 0; x < 1280; x += 17)
+            if (((x / 17) + (y / 17)) & 1) d->AddRectFilled(ImVec2((float)x, (float)y), ImVec2(x + 17.0f, y + 17.0f), IM_COL32(240, 240, 255, 255));
+}
+
+static double lumaAt(const SoftRender& r, int x, int y) {
+    const uint32_t c = r.at(x, y);
+    return 0.299 * (double)(c & 0xFF) + 0.587 * (double)((c >> 8) & 0xFF) + 0.114 * (double)((c >> 16) & 0xFF);
+}
+
+// Pearson correlation of two renders' brightness over a region: 1 = same picture, ~0 = unrelated.
+static double correlation(const SoftRender& a, const SoftRender& b, int x0, int y0, int x1, int y1) {
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, n = 0;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            const double va = lumaAt(a, x, y), vb = lumaAt(b, x, y);
+            sa += va; sb += vb; saa += va * va; sbb += vb * vb; sab += va * vb; n += 1;
+        }
+    const double cov = sab / n - (sa / n) * (sb / n), va = saa / n - (sa / n) * (sa / n), vb = sbb / n - (sb / n) * (sb / n);
+    return (va > 1e-9 && vb > 1e-9) ? cov / std::sqrt(va * vb) : 1.0;
+}
+
+struct DiffBox { int x0 = 1 << 30, y0 = 1 << 30, x1 = -1, y1 = -1; };
+static DiffBox diffBox(const SoftRender& a, const SoftRender& b) {
+    DiffBox r;
+    for (int y = 0; y < 720; y++)
+        for (int x = 0; x < 1280; x++)
+            if (a.at(x, y) != b.at(x, y)) {
+                r.x0 = std::min(r.x0, x); r.y0 = std::min(r.y0, y);
+                r.x1 = std::max(r.x1, x + 1); r.y1 = std::max(r.y1, y + 1);
+            }
+    return r;
+}
+
+static void testGlassRefraction() {
+    const intptr_t SNAP = 7777;
+    ui::setGlass(true);
+    ui::setGlassSnapshot(0, nullptr, nullptr);
+    // A dialog card (it has no full-screen backdrop of its own, unlike the message
+    // screen, so the checkerboard behind it shows through the glass).
+    ui::ChoiceModel cm;
+    cm.title = "Play movie";
+    cm.subtitle = "Resume from 12:30?";
+    cm.options = {"Resume", "Play from start", "Cancel"};
+    cm.selected = 0;
+    cm.hints = {{"A", "Select"}, {"B", "Back"}};
+    auto scene = [&] { drawChecker(); ui::drawChoice(cm); };
+
+    // Without a snapshot hook nothing is requested and glass behaves as before.
+    CHECK(!ui::glassRefractionActive());
+    SoftRender::snapshotCalls() = 0;
+    SoftRender flat = renderScreen(scene, "refr_flat");
+    CHECK_EQ(SoftRender::snapshotCalls(), 0);
+    CHECK_EQ(ui::glassSnapshotsThisFrame(), 0);
+
+    // With one: the frame is captured (at least once, a bounded number of times) and used.
+    ui::setGlassSnapshot((uint64_t)SNAP, &SoftRender::snapshotCallback, (void*)SNAP);
+    CHECK(ui::glassRefractionActive());
+    SoftRender refr = renderScreen(scene, "refr_on");
+    CHECK(SoftRender::snapshotCalls() >= 1 && SoftRender::snapshotCalls() <= glass::SnapshotPlanner::MAX_PER_FRAME);
+    CHECK_EQ(SoftRender::snapshotCalls(), ui::glassSnapshotsThisFrame());
+
+    // Only the card changes -- and never outside its rounded outline.
+    const DiffBox box = diffBox(flat, refr);
+    CHECK(box.x1 > box.x0 && box.y1 > box.y0);
+    CHECK(box.x0 >= 339 && box.x1 <= 941);                          // inside the 600 px card (340..940)
+    CHECK(box.x1 - box.x0 >= 580);                                  // ...and it does cover the card
+    CHECK(flat.at(box.x0, box.y0) == refr.at(box.x0, box.y0));      // the four corners of the changed area
+    CHECK(flat.at(box.x1 - 1, box.y0) == refr.at(box.x1 - 1, box.y0)); //  are cut away by the corner radius,
+    CHECK(flat.at(box.x0, box.y1 - 1) == refr.at(box.x0, box.y1 - 1)); //  so nothing square shows up there
+    CHECK(flat.at(box.x1 - 1, box.y1 - 1) == refr.at(box.x1 - 1, box.y1 - 1));
+    CHECK(flat.at(box.x0 + 2, box.y0 + 2) == refr.at(box.x0 + 2, box.y0 + 2));
+
+    // The picture bends at the rim and is (almost) undisturbed in the middle.
+    const int midY0 = box.y0 + (box.y1 - box.y0) / 2 - 40, midY1 = midY0 + 80;
+    const double rim = correlation(flat, refr, box.x0 + 3, midY0, box.x0 + 14, midY1);
+    const double inner = correlation(flat, refr, box.x0 + 200, midY0, box.x0 + 400, midY1);
+    CHECK(inner > 0.75);       // the middle still shows the checkerboard where it is
+    CHECK(rim < 0.45);         // ...but along the rim it is displaced
+    CHECK(inner - rim > 0.4);
+
+    // The rim light is actually drawn: brightest at the top-left corner, faint along the
+    // middle of the side. (Regression: the rim and its inner glow are stitched from rings
+    // that must share one vertex count; when they did not, they were silently skipped.)
+    {
+        auto maxLuma = [&](const SoftRender& r, int x0, int y0, int x1, int y1) {
+            double m = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++) m = std::max(m, lumaAt(r, x, y));
+            return m;
+        };
+        const double corner = maxLuma(flat, box.x0, box.y0 + 3, box.x0 + 16, box.y0 + 19);
+        const double side = maxLuma(flat, box.x0, midY0, box.x0 + 3, midY1);
+        CHECK(corner > side + 40.0);
+    }
+
+    // The same for a small pill (the toast): bent at its ends, shape intact.
+    auto toast = [&] { drawChecker(); ui::drawToast("Added to favourites and some more", 0.2); };
+    ui::setGlassSnapshot(0, nullptr, nullptr);
+    SoftRender tFlat = renderScreen(toast, "refr_toast_flat");
+    ui::setGlassSnapshot((uint64_t)SNAP, &SoftRender::snapshotCallback, (void*)SNAP);
+    SoftRender tRefr = renderScreen(toast, "refr_toast_on");
+    const DiffBox tb = diffBox(tFlat, tRefr);
+    CHECK(tb.x1 > tb.x0 && tb.y1 > tb.y0);
+    CHECK(tFlat.at(tb.x0, tb.y0) == tRefr.at(tb.x0, tb.y0));          // pill corners stay clear
+    CHECK(tFlat.at(tb.x1 - 1, tb.y1 - 1) == tRefr.at(tb.x1 - 1, tb.y1 - 1));
+    const int tMid = tb.y0 + (tb.y1 - tb.y0) / 2;
+    CHECK(correlation(tFlat, tRefr, tb.x0 + (tb.x1 - tb.x0) / 2 - 40, tMid - 6, tb.x0 + (tb.x1 - tb.x0) / 2 + 40, tMid + 6) >
+          correlation(tFlat, tRefr, tb.x0 + 2, tMid - 6, tb.x0 + 10, tMid + 6) + 0.2);
+
+    // Glass on glass: the rows of a browser sit on the sidebar panel and need their own
+    // snapshot (so they refract the panel as well), yet the count stays small.
+    ui::BrowserModel bm = sampleBrowser(6, 2);
+    SoftRender::snapshotCalls() = 0;
+    renderScreen([&] { drawChecker(); ui::drawBrowser(bm); }, "refr_browser");
+    CHECK(SoftRender::snapshotCalls() >= 2); // panel, then the glass on top of it
+    CHECK(SoftRender::snapshotCalls() <= glass::SnapshotPlanner::MAX_PER_FRAME);
+
+    // Frames are independent: the next frame starts with one snapshot again.
+    SoftRender::snapshotCalls() = 0;
+    renderScreen(scene, "refr_again");
+    CHECK(SoftRender::snapshotCalls() >= 1 && SoftRender::snapshotCalls() <= 2);
+
+    // Nothing to refract with: no texture, no callback, or glass off -> no snapshots, no change.
+    ui::setGlassSnapshot(0, &SoftRender::snapshotCallback, (void*)SNAP);
+    CHECK(!ui::glassRefractionActive());
+    ui::setGlassSnapshot((uint64_t)SNAP, nullptr, (void*)SNAP);
+    CHECK(!ui::glassRefractionActive());
+    ui::setGlassSnapshot((uint64_t)SNAP, &SoftRender::snapshotCallback, (void*)SNAP);
+    ui::setGlass(false);
+    CHECK(!ui::glassRefractionActive());
+    SoftRender::snapshotCalls() = 0;
+    renderScreen(scene, "refr_glass_off");
+    CHECK_EQ(SoftRender::snapshotCalls(), 0);
+
+    ui::setGlassSnapshot(0, nullptr, nullptr);
+    ui::setGlass(false);
+}
+
+// The Liquid Glass showcase backgrounds (Grid..Waves): each draws something, stays faint enough
+// to read over, and changes the picture again once glass refraction is on. The original modes
+// keep their names and indices.
+static void testShowcaseBackgrounds() {
+    const intptr_t SNAP = 7778;
+    ui::BrowserModel m = sampleBrowser(12, 2);
+    ui::setGlass(false);
+    ui::setGlassSnapshot(0, nullptr, nullptr);
+    ui::setBackgroundEffect(ui::Background::Off);
+    SoftRender off = renderScreen([&] { ui::drawBrowser(m); }, "bg_off");
+
+    const ui::Background fx[] = {ui::Background::Grid,   ui::Background::Aurora, ui::Background::Ripples,
+                                 ui::Background::Beams,  ui::Background::Orbs,   ui::Background::Waves};
+    std::set<std::string> names;
+    for (ui::Background b : fx) {
+        const std::string name = ui::backgroundEffectName(b);
+        CHECK(!name.empty());
+        names.insert(name);
+
+        ui::setGlass(false);
+        ui::setBackgroundEffect(b);
+        SoftRender flat = renderScreen([&] { ui::drawBrowser(m); }, ("bg_" + name + "_flat").c_str());
+        int changed = 0, maxDelta = 0;
+        for (int y = 0; y < 720; y += 4)
+            for (int x = 0; x < 1280; x += 4) {
+                const uint32_t a = flat.at(x, y), c = off.at(x, y);
+                if (a == c) continue;
+                changed++;
+                for (int sh = 0; sh < 24; sh += 8) {
+                    const int d = std::abs((int)((a >> sh) & 0xFF) - (int)((c >> sh) & 0xFF));
+                    if (d > maxDelta) maxDelta = d;
+                }
+            }
+        CHECK(changed > 150);   // it is really drawn
+        CHECK(maxDelta < 140);  // ...but faint: text and rows stay readable
+
+        ui::setGlass(true);
+        ui::setGlassSnapshot((uint64_t)SNAP, &SoftRender::snapshotCallback, (void*)SNAP);
+        SoftRender glassy = renderScreen([&] { ui::drawBrowser(m); }, ("bg_" + name + "_glass").c_str());
+        CHECK(glassy.px != flat.px); // glass changes the picture over this background too
+        ui::setGlassSnapshot(0, nullptr, nullptr);
+    }
+    CHECK_EQ((int)names.size(), 6); // six distinct names
+
+    // The originals are unchanged: same indices and names.
+    CHECK_EQ((int)ui::Background::Circles, 1);
+    CHECK_EQ((int)ui::Background::Starfield, 5);
+    CHECK_EQ((int)ui::Background::Grid, 6);
+    CHECK_EQ((int)ui::Background::COUNT, 12);
+    CHECK_STR(ui::backgroundEffectName(ui::Background::Circles), "Circles");
+    CHECK_STR(ui::backgroundEffectName(ui::Background::WiiBubbles), "Bubbles");
+    CHECK_STR(ui::backgroundEffectName(ui::Background::Gradient), "Gradient");
+    CHECK_STR(ui::backgroundEffectName(ui::Background::Polygons), "Polygons");
+    CHECK_STR(ui::backgroundEffectName(ui::Background::Starfield), "Starfield");
+
+    ui::setBackgroundEffect(ui::Background::Off);
+    ui::setGlass(false);
+}
+
+// A Jellyfin backdrop is laid over the normal background, darkened, cover-fitted, and the normal
+// background is skipped once it is fully covered. Without one nothing changes.
+static void testScreenBackdrop() {
+    ui::BrowserModel m = sampleBrowser(12, 2);
+    ui::setGlass(false);
+    ui::setBackgroundEffect(ui::Background::Off);
+    ui::setScreenBackdrop(0, 0, 0, 0, 0);
+    SoftRender none = renderScreen([&] { ui::drawBrowser(m); }, "bd_none");
+
+    // A 16:9 bright red picture, fully faded in.
+    ui::Texture red = makeTexture(0x3001, 160, 90, 250, 20, 20);
+    ui::setScreenBackdrop(0, 0, red, 160.0f / 90.0f, 1.0f);
+    SoftRender full = renderScreen([&] { ui::drawBrowser(m); }, "bd_full");
+    // Empty spot in the gap above the list, right of the title: picture shows through, but darkened.
+    const uint32_t a = full.at(1000, 24), b = none.at(1000, 24);
+    CHECK(a != b);
+    CHECK((a & 0xFF) > (b & 0xFF));      // red channel (BGR packing: low byte) rose
+    CHECK((a & 0xFF) < 200);             // ...but the scrim kept it well under the raw 250
+    // The same image at alpha 0 is exactly "no backdrop".
+    ui::setScreenBackdrop(0, 0, red, 160.0f / 90.0f, 0.0f);
+    SoftRender zero = renderScreen([&] { ui::drawBrowser(m); }, "bd_zero");
+    CHECK(zero.px == none.px);
+    // Half faded sits between the two.
+    ui::setScreenBackdrop(0, 0, red, 160.0f / 90.0f, 0.5f);
+    SoftRender half = renderScreen([&] { ui::drawBrowser(m); }, "bd_half");
+    CHECK((half.at(1000, 24) & 0xFF) > (b & 0xFF) && (half.at(1000, 24) & 0xFF) < (a & 0xFF));
+    // A cross-fade: an opaque previous layer plus a new one at 0 shows the previous picture.
+    ui::Texture blue = makeTexture(0x3002, 160, 90, 20, 20, 250);
+    ui::setScreenBackdrop(red, 160.0f / 90.0f, blue, 160.0f / 90.0f, 0.0f);
+    SoftRender xf = renderScreen([&] { ui::drawBrowser(m); }, "bd_xfade");
+    CHECK(xf.at(1000, 24) == a);
+    // A very wide / very tall picture is cropped, not stretched, and still covers everything.
+    ui::setScreenBackdrop(0, 0, makeTexture(0x3003, 400, 90, 250, 20, 20), 400.0f / 90.0f, 1.0f);
+    SoftRender wide = renderScreen([&] { ui::drawBrowser(m); }, "bd_wide");
+    CHECK(wide.at(1000, 24) == a);
+    ui::setScreenBackdrop(0, 0, makeTexture(0x3004, 60, 160, 250, 20, 20), 60.0f / 160.0f, 1.0f);
+    SoftRender tall = renderScreen([&] { ui::drawBrowser(m); }, "bd_tall");
+    CHECK(tall.at(1000, 24) == a);
+
+    ui::setScreenBackdrop(0, 0, 0, 0, 0);
+}
+
+// The sidebar's "Time used" counter and the hidden celebration it starts (confetti + glass bubble).
+static void testUsageCelebration() {
+    ui::setGlass(false);
+    ui::setBackgroundEffect(ui::Background::Off);
+    ui::setScreenBackdrop(0, 0, 0, 0, 0);
+    ui::BrowserModel m = sampleBrowser(12, 2);
+    m.usageLabel = "";
+    SoftRender none = renderScreen([&] { ui::drawBrowser(m); }, "usage_none");
+
+    // The counter is drawn in the sidebar when there is a label, and only then.
+    m.usageLabel = "12h 34m";
+    SoftRender label = renderScreen([&] { ui::drawBrowser(m); }, "usage_label");
+    const ui::Rect u = ui::layout::usageCounter();
+    int diff = 0;
+    for (int y = (int)u.y; y < (int)u.bottom(); y++)
+        for (int x = (int)u.x; x < (int)u.right(); x++)
+            if (label.at(x, y) != none.at(x, y)) diff++;
+    CHECK(diff > 40);
+    CHECK(u.x >= 0 && u.right() <= ui::layout::SIDEBAR_W && u.bottom() <= ui::layout::SCREEN_H);
+    // It sits clear of the sidebar entries and of the user@server footnote line.
+    CHECK(u.y > ui::layout::sidebarItem(3).bottom());
+    CHECK(u.bottom() <= ui::layout::SCREEN_H - 44.0f + 4.0f);
+
+    // Hit test: the counter yes, a sidebar entry / the list / outside no.
+    CHECK(ui::hitUsageCounter(u.x + u.w * 0.5f, u.y + u.h * 0.5f));
+    CHECK(!ui::hitUsageCounter(u.x + u.w * 0.5f, ui::layout::sidebarItem(0).y + 10.0f));
+    CHECK(!ui::hitUsageCounter(700.0f, u.y + 10.0f));
+    CHECK(!ui::hitUsageCounter(-1.0f, -1.0f));
+
+    // Celebration: not running until asked; the first tap cannot close it; it shows the figures.
+    CHECK(!ui::usageCelebrationActive());
+    ui::showUsageCelebration("12h 34m", "45,245 seconds in total");
+    CHECK(ui::usageCelebrationActive());
+    ui::dismissUsageCelebration();
+    CHECK(ui::usageCelebrationActive());          // too early: ignored
+    ui::advanceUsageCelebration(70);              // ~1.2 s in: bubble settled, confetti falling
+    SoftRender party = renderScreen([&] { ui::drawBrowser(m); }, "usage_party");
+    CHECK(ui::usageCelebrationActive());
+    // The bubble covers the centre of the screen; it differs from the plain browser there.
+    int centre = 0, corner = 0;
+    for (int y = 300; y < 420; y += 2)
+        for (int x = 560; x < 720; x += 2)
+            if (party.at(x, y) != label.at(x, y)) centre++;
+    CHECK(centre > 1500);
+    // Confetti is spread over the screen, not only in the middle.
+    for (int y = 0; y < 720; y += 3)
+        for (int x = 250; x < 1280; x += 3) {
+            const bool inBubble = (x - 640) * (x - 640) + (y - 360) * (y - 360) < 240 * 240;
+            if (!inBubble && party.at(x, y) != label.at(x, y)) corner++;
+        }
+    CHECK(corner > 400);
+    // Now any press closes it.
+    ui::dismissUsageCelebration();
+    CHECK(!ui::usageCelebrationActive());
+    SoftRender after = renderScreen([&] { ui::drawBrowser(m); }, "usage_after");
+    CHECK(after.px == label.px);                  // back to the plain browser, nothing left behind
+
+    // It ends on its own, and a glass bubble draws too.
+    ui::showUsageCelebration("5m 07s", "307 seconds in total");
+    ui::setGlass(true);
+    ui::advanceUsageCelebration(90);
+    SoftRender glassy = renderScreen([&] { ui::drawBrowser(m); }, "usage_party_glass");
+    CHECK(ui::usageCelebrationActive());
+    int gc = 0;
+    for (int y = 300; y < 420; y += 2)
+        for (int x = 560; x < 720; x += 2)
+            if (glassy.at(x, y) != label.at(x, y)) gc++;
+    CHECK(gc > 500);
+    ui::setGlass(false);
+    ui::advanceUsageCelebration(2000);
+    renderScreen([&] { ui::drawBrowser(m); }, "usage_end");
+    CHECK(!ui::usageCelebrationActive());         // auto-dismissed after ~16 s
+}
+
+// The Help window: one page per controller, a rotating 3D model, rows that scroll with the cursor,
+// and hit testing -- in flat and in Liquid Glass mode.
+static ui::HelpModel makeHelpModel(int tab, int cursor, int frame) {
+    ui::HelpModel hm;
+    for (int i = 0; i < help::kControllerCount; i++) hm.tabs.push_back(help::controllerName(help::controllerAt(i)));
+    hm.tab = tab;
+    help::Controller c = help::controllerAt(tab);
+    hm.name = help::controllerName(c);
+    hm.note = help::controllerNote(c);
+    for (const help::Row& r : help::rowsFor(c)) {
+        ui::HelpRow row;
+        row.header = r.header; row.button = r.button; row.action = r.action; row.highlight = r.highlight;
+        hm.rows.push_back(row);
+    }
+    hm.cursor = cursor < 0 ? help::firstEntry(help::rowsFor(c)) : cursor;
+    hm.hints = {{"< >", "Controller"}, {"Up Down", "Scroll"}, {"B", "Close"}};
+    hm.frame = frame;
+    return hm;
+}
+
+static void testHelpWindow() {
+    ui::setModelDir("/tmp/ufin_no_models/");
+    ui::resetHelpModels();
+    ui::setScreenBackdrop(0, 0, 0, 0, 0);
+    ui::setBackgroundEffect(ui::Background::Off);
+    ui::BrowserModel b = sampleBrowser(12, 2);
+    ui::setGlass(false);
+    SoftRender plain = renderScreen([&] { ui::drawBrowser(b); }, "help_base");
+
+    // Every page draws over the browser, flat and glass, and the pages differ from each other.
+    std::vector<std::vector<uint32_t>> pages;
+    for (int glass = 0; glass < 2; glass++) {
+        ui::setGlass(glass == 1);
+        if (glass) ui::setGlassSnapshot((uint64_t)7779, &SoftRender::snapshotCallback, (void*)(intptr_t)7779);
+        for (int tab = 0; tab < help::kControllerCount; tab++) {
+            ui::HelpModel hm = makeHelpModel(tab, -1, 30);
+            const std::string nm = std::string("help_") + (glass ? "glass_" : "flat_") + std::to_string(tab);
+            SoftRender r = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, nm.c_str());
+            int changed = 0;
+            for (int y = 0; y < 720; y += 4)
+                for (int x = 0; x < 1280; x += 4)
+                    if (r.at(x, y) != plain.at(x, y)) changed++;
+            CHECK(changed > 30000);                  // a big card over the dimmed screen
+            if (!glass) pages.push_back(r.px);
+        }
+        ui::setGlassSnapshot(0, nullptr, nullptr);
+    }
+    ui::setGlass(false);
+    for (size_t i = 0; i < pages.size(); i++)
+        for (size_t j = i + 1; j < pages.size(); j++) CHECK(pages[i] != pages[j]);
+
+    // Models come from .glb files on the SD card. With none there, every page says so (instead of a model).
+    {
+        const int before = (int)pages.size();
+        CHECK(before == help::kControllerCount);
+        ui::HelpModel hm = makeHelpModel(0, -1, 30);
+        SoftRender miss = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, "help_missing");
+        // Same page drawn again some frames later: nothing rotates, so the picture is identical.
+        hm.frame = 100;
+        SoftRender miss2 = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, "help_missing2");
+        CHECK(miss.px == miss2.px);
+    }
+
+    // With .glb files in place the models appear, rotate with the frame counter and are textured.
+    {
+        const std::string dir = "/tmp/ufin_help_models/";
+        mkdir(dir.c_str(), 0777);
+        const char* names[4] = {"gamepad.glb", "wiiu_pro.glb", "wii_classic.glb", "wiimote.glb"};
+        for (int i = 0; i < 4; i++) {
+            glbtest::BoxOpts o;
+            o.texture = true; o.texRGB[0] = 40; o.texRGB[1] = 220; o.texRGB[2] = 60;
+            if (i == 3) { o.dx = 1; o.dy = 4; o.dz = 0.5f; } else { o.dx = 4; o.dy = 2; o.dz = 0.8f; }
+            CHECK(glbtest::writeFile(dir + names[i], glbtest::box(o)));
+        }
+        static uint64_t nextTex = 5000;
+        ui::setModelDir(dir);
+        ui::setModelBackend(
+            [](const uint8_t* rgba, int w, int h) {
+                SoftUserTexture t; t.w = w; t.h = h; t.rgba.assign(rgba, rgba + (size_t)w * h * 4);
+                SoftRender::userTextures()[(ImTextureID)nextTex] = std::move(t);
+                return nextTex++;
+            },
+            [](uint64_t) {});
+        ui::resetHelpModels();
+        ui::HelpModel hm = makeHelpModel(0, -1, 0);
+        SoftRender r0(1280, 720);
+        // The first frames show "Loading model..." until the worker thread has the file.
+        SoftRender first = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, "help_loading");
+        bool ready = false;
+        for (int tries = 0; tries < 400 && !ready; tries++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            SoftRender t = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, "help_model_f0");
+            // green pixels on the stage = the textured model is on screen
+            int green = 0;
+            for (int y = 120; y < 520; y += 2) for (int x = 90; x < 460; x += 2) {
+                const uint32_t c = t.at(x, y);
+                const int rr = c & 0xFF, gg = (c >> 8) & 0xFF, bb = (c >> 16) & 0xFF;
+                if (gg > 100 && gg > rr + 40 && gg > bb + 40) green++;
+            }
+            if (green > 300) { ready = true; r0 = t; }
+        }
+        CHECK(ready);
+        if (ready) {
+            hm.frame = 70;
+            SoftRender r1 = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hm); }, "help_model_f70");
+            int moved = 0;
+            for (int y = 120; y < 520; y += 2) for (int x = 90; x < 460; x += 2) if (r0.at(x, y) != r1.at(x, y)) moved++;
+            CHECK(moved > 400);                          // it really turns
+            for (int tab = 1; tab < 4; tab++) {          // every page loads its own file
+                ui::HelpModel h2 = makeHelpModel(tab, -1, 20);
+                bool got = false;
+                for (int tries = 0; tries < 400 && !got; tries++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    const std::string nm = "help_model_tab" + std::to_string(tab);
+                    SoftRender t = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(h2); }, nm.c_str());
+                    int green = 0;
+                    for (int y = 120; y < 520; y += 2) for (int x = 90; x < 460; x += 2) {
+                        const uint32_t c = t.at(x, y);
+                        if (((c >> 8) & 0xFF) > 100 && ((c >> 8) & 0xFF) > (int)(c & 0xFF) + 40) green++;
+                    }
+                    got = green > 150;
+                }
+                CHECK(got);
+            }
+        }
+        // Delete one file and reload: only that page falls back to "Missing model".
+        remove((dir + "wiimote.glb").c_str());
+        ui::resetHelpModels();
+        ui::HelpModel hw = makeHelpModel(3, -1, 20);
+        for (int tries = 0; tries < 50; tries++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hw); }, "help_model_gone");
+        }
+        SoftRender gone = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(hw); }, "help_model_gone");
+        int green = 0;
+        for (int y = 120; y < 520; y += 2) for (int x = 90; x < 460; x += 2) if (((gone.at(x, y) >> 8) & 0xFF) > 150 && (gone.at(x, y) & 0xFF) < 100) green++;
+        CHECK(green < 20);
+        ui::setModelBackend(nullptr, nullptr);
+        ui::setModelDir("/tmp/ufin_no_models/");
+        ui::resetHelpModels();
+    }
+
+    // Scrolling: a cursor far down the list scrolls the rows (and the picture changes), hit testing follows.
+    ui::HelpModel top = makeHelpModel(0, -1, 30);
+    ui::HelpModel low = makeHelpModel(0, (int)top.rows.size() - 1, 30);
+    SoftRender st = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(top); }, "help_top");
+    SoftRender sl = renderScreen([&] { ui::drawBrowser(b); ui::drawHelp(low); }, "help_low");
+    int listDiff = 0;
+    for (int y = 130; y < 600; y += 3)
+        for (int x = 500; x < 1180; x += 3)
+            if (st.at(x, y) != sl.at(x, y)) listDiff++;
+    CHECK(listDiff > 800);
+
+    // Hit testing: outside the card closes; a tab selects; a list row selects; a header does not.
+    ui::HelpHit h = ui::hitTestHelp(top, 10, 10);
+    CHECK(h.kind == ui::HelpHit::Close);
+    h = ui::hitTestHelp(top, 1270, 710);
+    CHECK(h.kind == ui::HelpHit::Close);
+    bool tabHit[4] = {false, false, false, false};
+    for (int x = 600; x < 1210; x += 3) {
+        ui::HelpHit t = ui::hitTestHelp(top, (float)x, 80.0f); // the tab row
+        if (t.kind == ui::HelpHit::Tab && t.index >= 0 && t.index < 4) tabHit[t.index] = true;
+    }
+    for (int i = 0; i < 4; i++) CHECK(tabHit[i]);
+    bool sawRow = false, rowIsEntry = true;
+    for (int y = 130; y < 600; y += 2) {
+        ui::HelpHit r = ui::hitTestHelp(top, 700.0f, (float)y);
+        if (r.kind == ui::HelpHit::Row) {
+            sawRow = true;
+            if (r.index < 0 || r.index >= (int)top.rows.size() || top.rows[(size_t)r.index].header) rowIsEntry = false;
+        }
+    }
+    CHECK(sawRow && rowIsEntry);
+    CHECK(ui::hitTestHelp(top, 640.0f, 300.0f).kind != ui::HelpHit::Close);   // inside the card
+
+    // The sidebar icon exists (drawn without crashing).
+    ui::BrowserModel withHelp = sampleBrowser(12, 2);
+    withHelp.sidebar.push_back({"Help", ui::Icon::Help});
+    renderScreen([&] { ui::drawBrowser(withHelp); }, "help_sidebar");
+    ui::setGlass(false);
+}
+
 int main(int argc, char** argv) {
     previewDir = getenv("UFIN_UI_PREVIEW");
     IMGUI_CHECKVERSION();
@@ -638,6 +1498,13 @@ int main(int argc, char** argv) {
     testNowPlaying();
     testMusicVisualizer();
     testHud();
+    testBufferingWheel();
+    testLiquidGlass();
+    testGlassRefraction();
+    testShowcaseBackgrounds();
+    testScreenBackdrop();
+    testUsageCelebration();
+    testHelpWindow();
 
     ImGui::DestroyContext();
     return check::finish("test_ui");

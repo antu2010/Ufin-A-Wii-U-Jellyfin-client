@@ -34,7 +34,10 @@ public:
         std::function<void(Handle)> release;
     };
 
-    explicit ImageCache(Backend backend, size_t maxTextures = 96);
+    // maxSide: the longest side any image in THIS cache may keep, whatever callers ask for. The
+    // default suits posters and covers; the Jellyfin-backdrop cache raises it to full-screen size.
+    static constexpr int kDefaultMaxSide = 512;
+    explicit ImageCache(Backend backend, size_t maxTextures = 96, int maxSide = kDefaultMaxSide);
     ~ImageCache(); // stops the worker; releases every texture
 
     // Main thread. Texture for `path` if loaded, else 0 (and it's queued).
@@ -52,7 +55,7 @@ public:
     // Decodes JPEG/PNG bytes to RGBA8 and box-shrinks to fit. Exposed for
     // tests. Returns false for data stb_image can't read.
     static bool decode(const std::string& bytes, int maxW, int maxH, std::vector<uint8_t>& rgba,
-                       int& width, int& height);
+                       int& width, int& height, int maxSide = kDefaultMaxSide);
 
 private:
     enum class State { Queued, Loading, Decoded, Ready, Failed };
@@ -70,6 +73,7 @@ private:
 
     Backend backend_;
     size_t maxTextures_;
+    int maxSide_;
     std::map<std::string, Entry> entries_;
     uint64_t frame_ = 1;
     mutable std::mutex mutex_;

@@ -8,7 +8,11 @@
 // on Linux), so the same config.json works in the emulator too.
 
 #pragma once
+#include "h264_profile.h"
+#include "profiles.h"
+#include "video_size.h"
 #include <string>
+#include <vector>
 
 struct UfinConfig {
     std::string host;
@@ -22,9 +26,17 @@ struct UfinConfig {
     std::string accessToken;
     std::string deviceId;    // generated once, so Jellyfin sees one device
 
+    // "Who's watching?" profiles: every saved sign-in (see profiles.h). host / user_id / access_token
+    // above always mirror the profile used last, so an older Ufin still finds a sign-in.
+    std::vector<Profile> profiles;
+    int lastProfile = -1;    // index into `profiles` of the one used last, -1 = none
+
     // Menu music: a song from the user's own library, looped quietly in
     // the menus.
-    bool menuMusicEnabled = false;
+    long long usageSeconds = 0;     // total time Ufin has been used, in seconds (sidebar counter); saved every 30 min
+    bool logging = false;           // write ufin_log.txt to the SD card (off: spares the card)
+    bool jellyfinBackdrops = false; // show the selected title's Jellyfin backdrop behind the whole UI
+    bool menuMusicEnabled = true; // default on: plays assets/bgm.m4a unless a library song is chosen
     std::string menuMusicItemId;
     std::string menuMusicName;
 
@@ -34,10 +46,28 @@ struct UfinConfig {
     bool lightMode = false;        // light palette instead of the dark default
     // Animated background effect. ui::Background index: 0=Off, 1=Circles
     // (the original drifting glow), 2=Wii U-style bubbles, 3=Animated
-    // gradient, 4=Polygons, 5=Starfield. Out-of-range values are clamped
+    // gradient, 4=Polygons, 5=Starfield, then the Liquid Glass showcases 6=Grid, 7=Aurora,
+    // 8=Ripples, 9=Beams, 10=Orbs, 11=Waves. Out-of-range values are clamped
     // back to Off by App::applyLook().
     int backgroundEffect = 0;
     bool snow = false;             // falling snow over the menus
+    bool liquidGlass = false;      // Liquid Glass UI: frosted, rounded, softly lit panels (default off)
+    // Liquid Glass bends the real picture behind it (needs a GPU copy of the frame per glass
+    // layer). On by default; "glass_refraction": false falls back to the soft blurred glass.
+    bool glassRefraction = true;
+    // Which steps of the frame-copy are performed (config.json only; ignored unless
+    // glass_refraction is on). A bring-up ladder from real-hardware testing -- the default,
+    // 6, is the lowest that works on a console (verified on a Wii U with a 1080p TV):
+    //   1 allocate the snapshot textures only        2 + insert the draw-list callbacks (copies nothing)
+    //   3 + copy the frame (bare GX2CopySurface)     4 + cache invalidation and render-target restore
+    //   5 + re-assert shader mode, viewport and scissor after the copy
+    //   6 + re-enter the display's libwhb render pass (context state) after the copy   (default)
+    //   7 + snapshot textures made without the colour-buffer flag (also works)
+    // 3, 4 and 5 blank the UI on real hardware (Cemu is fine with all of them); they are kept
+    // so a console that misbehaves can be bisected. Each stage includes the ones before it,
+    // except that 7 also changes how the textures are created.
+    int glassRefractionStage = 6;
+    bool glassDebug = false;       // log the glass blur's cost every few seconds (config.json only)
     bool clock = false;            // time in the header
     bool rainbowEasterEgg = false; // found the hidden About easter egg -- reveals the toggle below
     bool rainbowUnlocked = false;  // Rainbow accent toggle state (only shown/settable once the egg is found)
@@ -63,7 +93,22 @@ struct UfinConfig {
     // buildVideoStreamUrl for what they mean and why the defaults are
     // what they are). Missing from config.json -> these defaults.
     int videoBitrate = 2500000;
-    std::string videoProfile = "baseline";
+    std::string videoProfile = h264::wireName(h264::kDefault); // Settings > H.264 profile
+    // Transcode height: 480 (low bandwidth), 720 (stable, the default) or 1080
+    // (experimental 1080p30). Opt in via Settings > Video quality or
+    // "video_height" in config.json. The width follows (768 / 1280 / 1920; see
+    // video_size.h for why 480p is 768x480). Any other value in config.json is
+    // ignored and stays 720. When video_height is 480 or 1080 and video_bitrate
+    // is not set, the bitrate defaults to 1.5 Mbps / 6 Mbps.
+    int videoHeight = 720;
+    int videoWidth() const { return videosize::forHeight(videoHeight).width; }
+    static constexpr int kDefault480Bitrate = videosize::defaultBitrateFor(480);
+    static constexpr int kDefault1080Bitrate = videosize::defaultBitrateFor(1080);
+    // Optional buffering overrides for tuning on a real console, 0 = automatic
+    // (see Player::play): compressed read-ahead cap in MiB, and decoded-frame
+    // queue depth. Absent/invalid values stay 0.
+    int videoBufferMiB = 0;
+    int videoQueueFrames = 0;
 };
 
 // True if there is enough to connect: a server plus a token or a password.

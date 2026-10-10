@@ -33,6 +33,7 @@ add_executable(ufin
     src/image_cache.cpp
     src/input.cpp
     src/vendor/cJSON.c
+    src/media/file_stream_io.cpp
     src/media/http_stream_io.cpp
     src/media/decoder.cpp
     src/media/video_output.cpp
@@ -43,8 +44,10 @@ add_executable(ufin
     src/ui/app_ui.cpp
     src/ui/format.cpp
     src/ui/gfx.cpp
+    src/ui/glass_core.cpp
     src/ui/gpu_image.cpp
     src/ui/keyboard.cpp
+    src/ui/model3d.cpp
     src/vendor/imgui/imgui.cpp
     src/vendor/imgui/imgui_draw.cpp
     src/vendor/imgui/imgui_tables.cpp

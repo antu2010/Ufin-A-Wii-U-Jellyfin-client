@@ -257,6 +257,12 @@ void ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
                     ImGui_ImplGX2_SetupRenderState(draw_data, fb_width, fb_height);
                 else
                     pcmd->UserCallback(cmd_list, pcmd);
+                // Ufin: the vertex attribute buffer is bound once, before this loop, and
+                // SetupRenderState does not restore it. A callback that does its own GX2 work
+                // (Ufin's Liquid Glass copies the colour buffer into a texture here) can leave
+                // another buffer bound, which would make every later draw read the wrong
+                // vertices -- so bind ours again after every callback.
+                GX2SetAttribBuffer(0, vtx_buffer_size, sizeof(ImDrawVert), bd->VertexBuffer);
             }
             else
             {

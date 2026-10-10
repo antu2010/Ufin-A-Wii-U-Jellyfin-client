@@ -1,4 +1,5 @@
 # Build output
+/Backup/
 /FFmpeg-wiiu/
 /build/
 *.rpx
