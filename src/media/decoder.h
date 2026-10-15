@@ -135,6 +135,9 @@ public:
     // H.264 profile_idc from the stream's avcC box (66 Baseline, 77 Main, 100 High...),
     // 0 if unknown. Only Baseline is known to be free of B-frames.
     int videoProfileIdc() const { return video_profile_idc_; }
+    // Height the hardware decoder works with when that differs from videoHeight()
+    // (stream coded taller than its 16-aligned visible size); 0 otherwise.
+    int videoHardwareHeight() const { return video_hw_height_; }
     // True unless the stream is known to be Baseline: its pictures may come out of the
     // hardware decoder in decode order and need putting back in display order (FrameReorder).
     bool videoNeedsReorder() const { return video_profile_idc_ != 66; }
@@ -207,6 +210,13 @@ private:
 
     bool decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
                     bool& drained, bool isVideo, AVFrame** outFrame);
+    // Set only when the stream is coded taller than h264_wiiu would assume (see
+    // h264diag::hardwareHeightOverride): the height the hardware decoder was told,
+    // and the visible height frames are cropped back to. Both 0 for every other stream.
+    int video_hw_height_ = 0;
+    int video_visible_height_ = 0;
+    int video_diag_packets_ = 0;   // first few video packets are described in the log before they are decoded
+    int video_nal_length_size_ = 4; // from the avcC record, for that description
     int video_decode_errors_ = 0; // total, for logging -- never reset except by close()
 
     // Consecutive-failure circuit breaker: unlike video_decode_errors_

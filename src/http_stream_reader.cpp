@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <cerrno>
+#include <chrono>
 #include <coreinit/debug.h>
 
 static bool resolveHost(const std::string& host, struct in_addr* out) {
@@ -48,6 +49,32 @@ static bool waitReadable(int sock, int timeoutSeconds) {
 
     int result = select(sock + 1, &readSet, nullptr, nullptr, &tv);
     return result > 0;
+}
+
+enum class WaitResult { Readable, TimedOut, Aborted };
+
+// waitReadable() with an optional way out: with an abort check, the wait runs
+// in 50 ms slices and the check is polled between them, so a long wait (see
+// HttpStreamReader::setStartupTimeoutSeconds) never leaves the user stuck on a
+// loading screen. Without one it is exactly the single select() it always was.
+static WaitResult waitReadableOrAbort(int sock, int timeoutSeconds, const std::function<bool()>& abortCheck) {
+    if (!abortCheck) return waitReadable(sock, timeoutSeconds) ? WaitResult::Readable : WaitResult::TimedOut;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+    while (true) {
+        if (abortCheck()) return WaitResult::Aborted;
+
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(sock, &readSet);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 50 * 1000;
+        int result = select(sock + 1, &readSet, nullptr, nullptr, &tv);
+        if (result > 0) return WaitResult::Readable;
+        if (result < 0 && errno != EINTR) return WaitResult::TimedOut; // select itself failed: same as before, "not readable"
+        if (std::chrono::steady_clock::now() >= deadline) return WaitResult::TimedOut;
+    }
 }
 
 // The comment above explains why recv() needed a manual timeout;
@@ -96,17 +123,33 @@ HttpStreamReader::~HttpStreamReader() {
 bool HttpStreamReader::fillSockBuf() {
     if (sock_buf_pos_ < sock_buf_len_) return true; // still have unconsumed bytes
 
-    // 15 seconds is generous enough to cover a slow transcode start-up,
-    // but still finite -- if this is ever too short/long in practice,
-    // this constant is the first thing to tune.
-    if (!waitReadable(sock_, 15)) {
-        last_error_ = "timed out waiting for data from server (15s)";
+    // 15 seconds (DEFAULT_TIMEOUT_SECONDS) is generous enough to cover a slow
+    // transcode start-up, but still finite -- if this is ever too short/long
+    // in practice, this constant is the first thing to tune. The very first
+    // wait after the request can be given longer (setStartupTimeoutSeconds)
+    // and be cancelled (setAbortCheck); see open().
+    const WaitResult waited = waitReadableOrAbort(sock_, wait_seconds_, wait_abortable_ ? abort_check_ : std::function<bool()>());
+    if (waited == WaitResult::Aborted) {
+        cancelled_ = true;
+        fill_error_ = "cancelled";
+        last_error_ = "cancelled while waiting for the server";
+        return false;
+    }
+    if (waited == WaitResult::TimedOut) {
+        fill_error_ = "timed out after " + std::to_string(wait_seconds_) + "s";
+        last_error_ = "timed out waiting for data from server (" + std::to_string(wait_seconds_) + "s)";
         return false;
     }
 
     sock_buf_.resize(4096);
     ssize_t n = recv(sock_, sock_buf_.data(), sock_buf_.size(), 0);
-    if (n <= 0) return false; // 0 = peer closed, <0 = error -- both mean "no more data" here
+    if (n <= 0) {
+        // 0 = peer closed, <0 = error -- both mean "no more data" to the
+        // caller, but they are different stories in the log.
+        fill_error_ = n == 0 ? "connection closed by the server"
+                             : "recv() failed (errno " + std::to_string(errno) + ")";
+        return false;
+    }
     sock_buf_len_ = (size_t)n;
     sock_buf_pos_ = 0;
     return true;
@@ -206,12 +249,36 @@ bool HttpStreamReader::open() {
     }
     OSReport("Ufin: request sent ok\n");
 
+    // The first response bytes may take a while: Jellyfin does its
+    // preparation (starting FFmpeg and, for a burned-in subtitle track,
+    // extracting that track and the fonts from the media file) *before* it
+    // sends the status line. Only this wait is stretched / cancellable;
+    // everything after it uses the normal 15 s again.
+    cancelled_ = false;
+    fill_error_.clear();
+    wait_seconds_ = startup_timeout_seconds_;
+    wait_abortable_ = (bool)abort_check_;
+    const auto waitStart = std::chrono::steady_clock::now();
     std::string statusLine;
-    if (!readLine(statusLine)) {
-        last_error_ = "failed reading status line";
-        OSReport("Ufin: readLine(statusLine) failed: %s\n", last_error_.c_str());
+    const bool gotStatusLine = readLine(statusLine);
+    const double waitedSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
+    wait_seconds_ = DEFAULT_TIMEOUT_SECONDS;
+    wait_abortable_ = false;
+    if (!gotStatusLine) {
+        if (cancelled_) {
+            last_error_ = "cancelled while waiting for the server to start the stream";
+        } else {
+            // Keep the reason, not only the stage: a 15 s (or longer) silence
+            // from a server that is still busy and a connection the server
+            // dropped are different problems and used to read the same.
+            last_error_ = "failed reading status line";
+            if (!fill_error_.empty()) last_error_ += ": " + fill_error_;
+        }
+        OSReport("Ufin: readLine(statusLine) failed after %.1fs: %s\n", waitedSeconds, last_error_.c_str());
         return false;
     }
+    if (waitedSeconds >= 1.0) OSReport("Ufin: server started answering after %.1fs\n", waitedSeconds);
     OSReport("Ufin: status line: %s\n", statusLine.c_str());
 
     size_t sp1 = statusLine.find(' ');
@@ -239,11 +306,13 @@ bool HttpStreamReader::open() {
         return false;
     }
 
+    std::string contentType;
     while (true) {
         std::string headerLine;
         if (!readLine(headerLine)) {
             last_error_ = "connection closed while reading headers";
-            OSReport("Ufin: connection closed while reading headers\n");
+            if (!fill_error_.empty()) last_error_ += ": " + fill_error_;
+            OSReport("Ufin: %s\n", last_error_.c_str());
             return false;
         }
         if (headerLine.empty()) break; // blank line = end of headers
@@ -252,8 +321,14 @@ bool HttpStreamReader::open() {
         if (lower.rfind("transfer-encoding:", 0) == 0 && lower.find("chunked") != std::string::npos) {
             is_chunked_ = true;
         }
+        if (lower.rfind("content-type:", 0) == 0) {
+            size_t v = headerLine.find(':') + 1;
+            while (v < headerLine.size() && headerLine[v] == ' ') v++;
+            contentType = headerLine.substr(v, 80); // for the log only
+        }
     }
-    OSReport("Ufin: headers parsed ok, is_chunked=%d\n", (int)is_chunked_);
+    OSReport("Ufin: headers parsed ok, is_chunked=%d content-type=%s\n", (int)is_chunked_,
+             contentType.empty() ? "(none)" : contentType.c_str());
 
     // If Jellyfin ever serves this non-chunked (e.g. a future version
     // that supports direct play here), read()/readRawBytes() below fall
@@ -282,6 +357,7 @@ int HttpStreamReader::read(uint8_t* buf, int len) {
             std::string sizeLine;
             if (!readLine(sizeLine)) {
                 last_error_ = "failed reading chunk size line";
+                if (!fill_error_.empty()) last_error_ += ": " + fill_error_;
                 return totalRead > 0 ? totalRead : -1;
             }
             size_t semi = sizeLine.find(';'); // chunk extensions, if any
@@ -305,6 +381,7 @@ int HttpStreamReader::read(uint8_t* buf, int len) {
         if (toRead > 0) {
             if (!readRawBytes(buf + totalRead, toRead)) {
                 last_error_ = "failed reading chunk data";
+                if (!fill_error_.empty()) last_error_ += ": " + fill_error_;
                 return totalRead > 0 ? totalRead : -1;
             }
             totalRead += toRead;
@@ -315,6 +392,7 @@ int HttpStreamReader::read(uint8_t* buf, int len) {
             uint8_t crlf[2];
             if (!readRawBytes(crlf, 2)) {
                 last_error_ = "failed reading chunk trailing CRLF";
+                if (!fill_error_.empty()) last_error_ += ": " + fill_error_;
                 return totalRead > 0 ? totalRead : -1;
             }
             need_chunk_header_ = true;

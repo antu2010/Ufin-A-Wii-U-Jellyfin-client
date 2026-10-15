@@ -32,6 +32,7 @@ static void drain() {
 extern "C" {
 int SDL_InitSubSystem(Uint32) { return 0; }
 void SDL_QuitSubSystem(Uint32) {}
+const char* SDL_GetCurrentAudioDriver(void) { return "fake"; }
 
 SDL_AudioDeviceID SDL_OpenAudioDevice(const char*, int, const SDL_AudioSpec* desired, SDL_AudioSpec* obtained,
                                       int) {

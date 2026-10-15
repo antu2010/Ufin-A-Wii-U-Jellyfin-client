@@ -96,6 +96,16 @@ static const double REBUFFER_RECOVERY_SECONDS = 12.0;
 // Redraw cadence for the buffering wheel while playback is held.
 static const double BUFFERING_REDRAW_SECONDS = 1.0 / 30.0;
 
+// Diagnostics only (nothing here changes what is shown or played). A video
+// frame normally sits well under a second from the audio clock. When a picture
+// has to be held for longer than this because its timestamp is that far ahead
+// of the clock, the video and audio timelines of the stream disagree -- the
+// picture then looks frozen while the sound plays on -- and the log says so,
+// at most once per HOLD_WARN_INTERVAL_SECONDS. The same threshold flags a
+// first frame that starts this far from the audio.
+static const double TIMELINE_SKEW_WARN_SECONDS = 2.0;
+static const double HOLD_WARN_INTERVAL_SECONDS = 5.0;
+
 static double nowSeconds() {
     return SDL_GetTicks() / 1000.0;
 }
@@ -110,7 +120,19 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     volume_ = options.initialVolume < 0.0 ? 0.0 : (options.initialVolume > 1.0 ? 1.0 : options.initialVolume);
 
     HttpStreamIO io(host, port, path);
+    if (options.startupTimeoutSeconds > 0) {
+        // A slow-starting stream (see PlayOptions::startupTimeoutSeconds): wait
+        // longer, but keep B working while we do. Only Stop is acted on here;
+        // any other command in this window is dropped, as there is nothing
+        // playing yet for it to apply to.
+        io.setStartupTimeoutSeconds(options.startupTimeoutSeconds);
+        if (poll) io.setAbortCheck([&poll]() { return poll().kind == PlayerCommand::Kind::Stop; });
+    }
     if (!io.open()) {
+        if (io.cancelled()) {
+            OSReport("Ufin: stream start cancelled by the user\n");
+            return PlayResult::Stopped;
+        }
         last_error_ = "HttpStreamIO::open failed: " + std::string(io.lastError());
         return PlayResult::Error;
     }
@@ -308,7 +330,9 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
                              frame->width, frame->height, frame->linesize[0], frame->linesize[1],
                              frame->format);
                     OSReport("Ufin: H264 expected hw layout coded=%dx%d pitch=%d Y=%u UV=%u write=%u alloc=%u aligned=%d\n",
-                             frame->width, h264geom::alignedHeightFor(frame->height),
+                             frame->width,
+                             decoder.videoHardwareHeight() > 0 ? decoder.videoHardwareHeight()
+                                                                : h264geom::alignedHeightFor(frame->height),
                              h264geom::pitchFor(frame->width),
                              (unsigned)h264geom::yPlaneBytes(frame->width, frame->height),
                              (unsigned)h264geom::uvPlaneBytes(frame->width, frame->height),
@@ -514,6 +538,8 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     const double loopStartTime = nowSeconds();
     double lastTickTime = loopStartTime;
 
+    bool loggedFirstFrameSkew = false;     // diagnostics, see TIMELINE_SKEW_WARN_SECONDS
+    double lastHoldWarnAt = -HOLD_WARN_INTERVAL_SECONDS;
     double firstStreamTime = NAN;  // first clock value seen, for itemPositionFromStreamTime
     double pauseStartedAt = NAN;   // wall time the current hold began (video-only clock)
     double lastPausedRedraw = 0.0;
@@ -767,8 +793,25 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
         bool audioNotStartedYet = hasAudio && !audio.started();
         double clock = masterClock();
 
+        if (!loggedFirstFrameSkew && hasAudio && !std::isnan(clock)) {
+            // Once per stream start: where the first picture sits against the
+            // first audio. Close together is normal; seconds apart means the
+            // server sent video and audio on different timelines.
+            loggedFirstFrameSkew = true;
+            OSReport("Ufin: first video pts=%.3fs, audio clock=%.3fs, video leads audio by %.3fs\n", pts, clock, pts - clock);
+            if (std::fabs(pts - clock) > TIMELINE_SKEW_WARN_SECONDS) {
+                OSReport("Ufin: WARNING video and audio timelines start %.1fs apart -- the picture will be held until the audio clock reaches it\n",
+                         pts - clock);
+            }
+        }
+
         if (!audioNotStartedYet && !std::isnan(clock)) {
             double delay = pts - clock;
+            if (delay > TIMELINE_SKEW_WARN_SECONDS && now - lastHoldWarnAt >= HOLD_WARN_INTERVAL_SECONDS) {
+                lastHoldWarnAt = now;
+                OSReport("Ufin: holding the picture: next frame pts=%.2fs is %.1fs ahead of the playback clock (%.2fs); video looks frozen until then\n",
+                         pts, delay, clock);
+            }
             if (delay > 0.005) {
                 // Not time yet. Sleep in short slices so poll()
                 // stays responsive even if the timestamps jump.

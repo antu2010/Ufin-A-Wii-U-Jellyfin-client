@@ -19,16 +19,21 @@
 #include <coreinit/time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "config.h"
+#include "version.h"
+#include "update_check.h"
+#include "https_client.h"
 #include "ufin_log.h"
 #include "config_loader.h"
 #include "h264_profile.h"
@@ -189,6 +194,11 @@ static bool loadFrame(JellyfinClient& client, Frame& f) {
 // for the life of the app without needing a config write on every drag.
 static float g_playbackVolume = 1.0f;
 
+// Music queue modes the user last chose with the Shuffle / Repeat buttons (X / Y, or the on-screen buttons).
+// Session-only, like the volume: every queue started afterwards begins with them.
+static bool g_shuffleOn = false;
+static PlayQueue::Repeat g_repeatMode = PlayQueue::Repeat::Off;
+
 // Reads the GamePad for Player many times a second (which also keeps
 // ProcUI serviced -- pressing HOME mid-playback otherwise leaves the
 // system waiting on us) and turns presses into PlayerCommands:
@@ -213,6 +223,7 @@ struct PlaybackControl {
     OSTime lastSkipPress = 0;
     OSTime lastInteraction = 0;   // any press: shows the HUD for a while
     int trackStep = 0;            // set when L/R ended the track: -1 previous, +1 next
+    PlayQueue* queue = nullptr;   // the music queue being played (inQueue), for the Shuffle / Repeat buttons
 
     // Audio & subtitles panel (Y). Changing a track restarts the stream
     // at the current position, like a skip.
@@ -262,6 +273,18 @@ struct PlaybackControl {
         noticeAt = OSGetTime();
     }
 
+    // Shuffle button / X: turns shuffle on or off for the rest of the queue (the current track keeps playing).
+    void toggleShuffle() {
+        g_shuffleOn = queue ? !queue->shuffled() : !g_shuffleOn;
+        if (queue) queue->setShuffle(g_shuffleOn, (uint32_t)OSGetTime() ^ (uint32_t)((uint64_t)OSGetTime() >> 32));
+    }
+    // Repeat button / Y: off -> repeat all -> repeat one -> off.
+    void cycleRepeat() {
+        g_repeatMode = queue ? queue->cycleRepeat()
+                             : (g_repeatMode == PlayQueue::Repeat::Off ? PlayQueue::Repeat::All
+                                : g_repeatMode == PlayQueue::Repeat::All ? PlayQueue::Repeat::One : PlayQueue::Repeat::Off);
+    }
+
     PlayerCommand poll() {
         if (!procRunningTracked()) return PlayerCommand::stop();
         const input::State in = input::read();
@@ -302,6 +325,11 @@ struct PlaybackControl {
         } else if (t & VPAD_BUTTON_MINUS) {
             visualizerOn = !visualizerOn;
         }
+        // Music queue: X = shuffle, Y = repeat (a Wii Remote's 1 / 2 are X / Y).
+        if (inQueue && !isVideo) {
+            if (t & VPAD_BUTTON_X) toggleShuffle();
+            if (t & VPAD_BUTTON_Y) cycleRepeat();
+        }
 
         // GamePad touch: the transport buttons drawn under the progress
         // bar on any Now Playing screen -- music (with or without the
@@ -321,6 +349,7 @@ struct PlaybackControl {
             return PlayerCommand::setVolume(volume);
         }
         int touchHit = (nowPlayingShown && in.touched) ? ui::hitTestNowPlaying(in.touchX, in.touchY) : -1;
+        if (touchHit < 0 && inQueue && !isVideo && in.touched) touchHit = ui::hitTestNowPlayingToggles(in.touchX, in.touchY);
         if (touchHit >= 0 && touchHit != touchLastHit) {
             touchLastHit = touchHit;
             switch ((ui::NpButton)touchHit) {
@@ -335,6 +364,12 @@ struct PlaybackControl {
                     break;
                 case ui::NpButton::Stop:
                     return PlayerCommand::stop();
+                case ui::NpButton::Shuffle:
+                    toggleShuffle();
+                    break;
+                case ui::NpButton::Repeat:
+                    cycleRepeat();
+                    break;
                 default:
                     break;
             }
@@ -378,6 +413,12 @@ struct PlaybackControl {
         return PlayerCommand::none();
     }
 };
+
+// How long a stream request that burns in a subtitle track may take to start
+// answering (see PlayOptions::startupTimeoutSeconds). Jellyfin extracts the
+// track from the media file first -- a read of the whole file for an embedded
+// track -- so this is generous; B cancels the wait at any point.
+static const int SUBTITLE_STARTUP_TIMEOUT_SECONDS = 90;
 
 // Audio / subtitle language carried from one episode to the next.
 struct TrackPrefs {
@@ -437,11 +478,40 @@ private:
 // When playing from a music queue: shown on Now Playing, and L/R end
 // the track early (trackStep says which way).
 struct QueueInfo {
+    PlayQueue* q = nullptr;  // the queue itself: Shuffle / Repeat change it while a track plays
     std::string queueText;
     std::string nextText;
     int trackStep = 0;       // out: -1 previous, +1 next, 0 = ended/stopped normally
     double endPosition = 0;  // out: where playback was when it ended
 };
+
+// "Track 3 of 12  |  Shuffle  |  Repeat all", built fresh every frame: the buttons change it while playing.
+static std::string queueLine(const PlayQueue& q) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Track %u of %u", (unsigned)(q.position() + 1), (unsigned)q.size());
+    std::string s = buf;
+    if (q.shuffled()) s += "  |  Shuffle";
+    if (q.repeat() == PlayQueue::Repeat::All) s += "  |  Repeat all";
+    else if (q.repeat() == PlayQueue::Repeat::One) s += "  |  Repeat one";
+    return s;
+}
+
+// Fills a Now Playing model's queue part: the text lines and the Shuffle / Repeat button states.
+static void applyQueueModel(ui::NowPlayingModel& np, const QueueInfo* info) {
+    if (!info) return;
+    if (info->q) {
+        const PlayQueue& q = *info->q;
+        np.queueText = queueLine(q);
+        const JellyfinItem* next = q.repeat() == PlayQueue::Repeat::One ? &q.current() : q.peekNext();
+        np.nextText = next ? "Next: " + itemDisplayName(*next) : std::string();
+        np.queueControls = true;
+        np.shuffleOn = q.shuffled();
+        np.repeatMode = (int)q.repeat();
+    } else {
+        np.queueText = info->queueText;
+        np.nextText = info->nextText;
+    }
+}
 
 // Plays one item start to finish (or until B), handling Live TV tuning,
 // seeks (each one restarts the transcode), the on-screen HUD / Now
@@ -524,6 +594,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     playOptions.initialVolume = control.volume; // carries the user's last-set volume in
     control.canSeekAndPause = !isLive;
     control.inQueue = (queue != nullptr);
+    control.queue = queue ? queue->q : nullptr;
     control.isVideo = !isAudio;
     if (!isAudio && !isLive) {
         control.tracks = &info;
@@ -536,6 +607,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
                 : trackForLanguage(info.subtitleTracks, prefs->subtitleLanguage, info.defaultSubtitleIndex);
             videoOptions.audioStreamIndex = control.audioIndex;
             videoOptions.subtitleStreamIndex = control.subtitleIndex;
+            videoOptions.subtitleIsText = subtitleTrackIsText(info.subtitleTracks, control.subtitleIndex);
         }
     }
     control.durationSeconds = durationSeconds;
@@ -668,6 +740,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             }
             vm.hints = {{"A", vm.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
             if (queue) vm.hints.push_back({"L R", "Prev / Next"});
+            if (queue) { vm.hints.push_back({"X", "Shuffle"}); vm.hints.push_back({"Y", "Repeat"}); }
             vm.hints.push_back({"-", "Now Playing"});
             vm.hints.push_back({"B", "Stop"});
 
@@ -682,10 +755,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             np.durationSeconds = durationSeconds;
             np.paused = player.isPaused();
             np.volume = control.volume;
-            if (queue) {
-                np.queueText = queue->queueText;
-                np.nextText = queue->nextText;
-            }
+            applyQueueModel(np, queue);
             if (control.pendingDelta != 0.0) {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "Skipping %+d s ...", (int)control.pendingDelta);
@@ -693,6 +763,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             }
             np.hints = {{"A", np.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
             if (queue) np.hints.push_back({"L R", "Prev / Next"});
+            if (queue) { np.hints.push_back({"X", "Shuffle"}); np.hints.push_back({"Y", "Repeat"}); }
             np.hints.push_back({"-", "Visualizer"});
             np.hints.push_back({"B", "Stop"});
             np.art = artFor(picked, ui::layout::NP_IMAGE_MAX, ui::layout::NP_IMAGE_MAX, nullptr);
@@ -721,10 +792,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         np.durationSeconds = durationSeconds;
         np.paused = player.isPaused();
         np.volume = control.volume;
-        if (queue) {
-            np.queueText = queue->queueText;
-            np.nextText = queue->nextText;
-        }
+        applyQueueModel(np, queue);
         if (control.pendingDelta != 0.0) {
             char buf[64];
             snprintf(buf, sizeof(buf), "Skipping %+d s ...", (int)control.pendingDelta);
@@ -732,6 +800,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         }
         np.hints = {{"A", np.paused ? "Play" : "Pause"}, {"< >", "Seek"}};
         if (queue) np.hints.push_back({"L R", "Prev / Next"});
+        if (queue) { np.hints.push_back({"X", "Shuffle"}); np.hints.push_back({"Y", "Repeat"}); }
         np.hints.push_back({"-", "Visualizer"});
         np.hints.push_back({"B", "Stop"});
         np.art = artFor(picked, ui::layout::NP_IMAGE_MAX, ui::layout::NP_IMAGE_MAX, nullptr);
@@ -763,6 +832,19 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
                      h264::wireName(h264::parse(videoOptions.profile)), videoOptions.width,
                      videoOptions.height, videoOptions.videoBitrate);
         }
+        // A burned-in subtitle makes Jellyfin prepare the track (extract it, and
+        // its fonts, from the media file) before it answers the stream request at
+        // all, which can take far longer than the usual 15 s wait for the first
+        // bytes -- so that wait is longer here, and B cancels it (see
+        // PlayOptions::startupTimeoutSeconds). No subtitle: unchanged.
+        const bool burnedInSubtitle = !isAudio && videoOptions.subtitleStreamIndex >= 0;
+        playOptions.startupTimeoutSeconds = burnedInSubtitle ? SUBTITLE_STARTUP_TIMEOUT_SECONDS : 0;
+        if (burnedInSubtitle) {
+            OSReport("Ufin: subtitles: track %d (%s) burned in by the server%s\n", videoOptions.subtitleStreamIndex,
+                     videoOptions.subtitleIsText ? "text" : "bitmap or unknown",
+                     (videoOptions.subtitleIsText && videoOptions.startTimeTicks > 0) ? ", source timestamps kept (CopyTimestamps)" : "");
+            showBusy("Loading", {title, "", "Preparing the subtitles on the server (B to cancel)."});
+        }
         playOptions.startOffsetSeconds = startAt;
 
         result = player.play(target.host, target.port, target.path,
@@ -787,6 +869,7 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             control.tracksChanged = false;
             videoOptions.audioStreamIndex = control.audioIndex;
             videoOptions.subtitleStreamIndex = control.subtitleIndex;
+            videoOptions.subtitleIsText = subtitleTrackIsText(info.subtitleTracks, control.subtitleIndex);
         }
         reporter.update(startAt, false);
         if (!isAudio) showBusy("Skipping", {title, "", "Restarting the stream at " + ui::formatTime(startAt) + "."});
@@ -819,15 +902,14 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
 
 // Plays a music queue track by track. L/R skip (L restarts the track
 // if it's more than 3 s in, like most players), B stops the whole queue,
-// and the queue ends after the last track.
+// and the queue ends after the last track -- unless Repeat is on (all: start over; one: the
+// same track again). Shuffle and Repeat can be changed while it plays (PlaybackControl).
 static PlayResult playQueue(JellyfinClient& client, const UfinConfig& cfg, PlayQueue& queue,
                             std::string& errorMessage) {
     while (!queue.empty() && WHBProcIsRunning()) {
         QueueInfo info;
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Track %u of %u%s", (unsigned)(queue.position() + 1),
-                 (unsigned)queue.size(), queue.shuffled() ? "  |  Shuffle" : "");
-        info.queueText = buf;
+        info.q = &queue; // Now Playing reads the track number, "Next:" and the Shuffle / Repeat state from it live
+        info.queueText = queueLine(queue);
         if (const JellyfinItem* next = queue.peekNext()) info.nextText = "Next: " + itemDisplayName(*next);
 
         PlayResult result = playItem(client, cfg, queue.current(), errorMessage, &info);
@@ -837,8 +919,12 @@ static PlayResult playQueue(JellyfinClient& client, const UfinConfig& cfg, PlayQ
             if (info.endPosition <= 3.0) queue.previous(); // else: replay this track
             continue;
         }
-        if (info.trackStep > 0 || result == PlayResult::Completed) {
+        if (info.trackStep > 0) { // R / next button: always moves on, even with repeat one
             if (!queue.next()) return PlayResult::Completed;
+            continue;
+        }
+        if (result == PlayResult::Completed) { // the track ended by itself: repeat one plays it again
+            if (!queue.advanceAfterEnd()) return PlayResult::Completed;
             continue;
         }
         return result; // B
@@ -893,6 +979,158 @@ static uint32_t withRepeat(const input::State& vpad, RepeatState& rs) {
 
 // --- the app ---
 
+// --- startup update check ---------------------------------------------------
+//
+// Asks GitHub (over HTTPS, see https_client.h) whether a Ufin release newer than this build exists, on
+// a background thread so start-up is never held up, and says so once, as a card over whatever screen the app
+// is on (never during playback). Everything that can go wrong -- offline, GitHub or TLS refusing, an odd answer --
+// ends in a log line and nothing on screen. Rules and wording: update_check.h. config.json
+// "check_for_updates": false turns it off.
+
+// The check runs on its own OS thread (coreinit's OSCreateThread with a stack of ours, not std::thread:
+// a std::thread started from here froze Cemu), so the UI never waits for the network. The worker only
+// touches its own state and the https/dns code; the main loop polls it once a frame.
+struct UpdateWorker {
+    OSThread thread;
+    alignas(16) uint8_t stack[192 * 1024]; // Mbed TLS's handshake wants a roomy stack
+    std::atomic<int> state{0};             // 0 idle, 1 running, 2 finished (outcome is valid)
+    std::atomic<bool> cancel{false};
+    std::atomic<int> progress{0};          // 0..100, a rough guess from the connection's stages (for the notification bar)
+    updatecheck::Outcome outcome;
+};
+static UpdateWorker g_update;
+
+static int updateWorkerMain(int, const char**) {
+    https::Options options;
+    options.timeoutSeconds = 8;
+    options.cancelled = [] { return g_update.cancel.load(); };
+    updatecheck::Fetcher fetch = [&options](const std::string& host, const std::string& path,
+                                            const std::string& headers) {
+        const https::Response r = https::get(host, path, headers, options);
+        updatecheck::FetchResult f;
+        f.ok = r.ok;
+        f.status = r.status;
+        f.body = r.body;
+        f.error = r.error;
+        return f;
+    };
+    OSReport("Ufin: update check: this is Ufin %s, asking GitHub\n", ufin::kVersion);
+    updatecheck::Outcome outcome = updatecheck::checkForUpdate(fetch, ufin::kVersion, ufin::kGithubOwner,
+                                                               ufin::kGithubRepo, ufin::kStorePackageName,
+                                                               [] { return g_update.cancel.load(); });
+    if (g_update.cancel.load()) outcome.kind = updatecheck::Outcome::Kind::Unknown, outcome.detail = "cancelled";
+    OSReport("Ufin: update check: %s\n", outcome.detail.c_str());
+    g_update.outcome = outcome;
+    g_update.progress = 100;
+    g_update.state = 2;
+    return 0;
+}
+
+// The finished check, if there is one (and the thread is reaped).
+static bool takeUpdateResult(updatecheck::Outcome& out) {
+    if (g_update.state.load() != 2) return false;
+    int result = 0;
+    OSJoinThread(&g_update.thread, &result);
+    out = g_update.outcome;
+    g_update.state = 0;
+    return true;
+}
+
+// Starts a check. False when one is still running (a cancelled one needs a moment to notice).
+static bool startUpdateCheck() {
+    updatecheck::Outcome stale;
+    takeUpdateResult(stale); // a cancelled check's late answer is dropped
+    if (g_update.state.load() != 0) return false;
+    g_update.cancel = false;
+    g_update.state = 1;
+    g_update.progress = 0;
+    https::setTrace([](const char* message) {
+        OSReport("Ufin: https: %s\n", message);
+        static const struct { const char* text; int percent; } stages[] = {
+            {"DNS", 5}, {"TCP connect", 15}, {"TLS setup", 25}, {"TLS handshake", 35}, {"TLS ready", 60},
+            {"sending the request", 65}, {"request sent", 75}, {"the answer is arriving", 90}};
+        for (const auto& st : stages) {
+            if (strncmp(message, st.text, strlen(st.text)) == 0 && st.percent > g_update.progress.load())
+                g_update.progress = st.percent;
+        }
+    });
+    OSReport("Ufin: update check: starting the worker thread\n");
+    if (!OSCreateThread(&g_update.thread, updateWorkerMain, 0, nullptr, g_update.stack + sizeof(g_update.stack),
+                        (uint32_t)sizeof(g_update.stack), 20, OS_THREAD_ATTRIB_AFFINITY_ANY)) {
+        g_update.state = 0;
+        OSReport("Ufin: update check: could not create the thread\n");
+        return false;
+    }
+    OSResumeThread(&g_update.thread);
+    return true;
+}
+
+// Settings > Check for updates: shows the "Checking" card while the worker runs; B cancels.
+static updatecheck::Outcome runUpdateCheck(const std::string& title) {
+    updatecheck::Outcome outcome;
+    outcome.kind = updatecheck::Outcome::Kind::Unknown;
+    if (!startUpdateCheck()) {
+        outcome.detail = "a check is already running; try again in a moment";
+        return outcome;
+    }
+    ui::MessageModel busy;
+    busy.title = title;
+    busy.lines = {std::string("Your version: ") + ufin::kVersion, "", "Asking GitHub (B to cancel)."};
+    busy.hints = {{"B", "Cancel"}};
+    busy.busy = true;
+    RepeatState rs;
+    while (WHBProcIsRunning()) {
+        const input::State in = input::read();
+        if (withRepeat(in, rs) & VPAD_BUTTON_B) {
+            g_update.cancel = true;
+            outcome.detail = "cancelled";
+            return outcome;
+        }
+        if (takeUpdateResult(outcome)) return outcome;
+        drawFrame([&] { ui::drawMessage(busy); });
+    }
+    g_update.cancel = true;
+    outcome.detail = "cancelled";
+    return outcome;
+}
+
+// Up / down scrolls a card whose text is longer than it (the changelog); `pressed` is withRepeat()'s result.
+static void scrollCard(ui::MessageModel& m, uint32_t pressed) {
+    const int total = (int)m.lines.size();
+    if ((pressed & BTN_UP) && m.firstLine > 0) m.firstLine--;
+    if ((pressed & BTN_DOWN) && m.firstLine + m.linesShown < total) m.firstLine++;
+}
+
+// A card over the whole screen until A, B or a tap.
+static void showCardUntilDismissed(const std::string& title, const std::vector<std::string>& lines, bool isError) {
+    ui::MessageModel m;
+    m.title = title;
+    m.lines = lines;
+    m.isError = isError;
+    m.hints = {{"A", "Continue"}, {"Up Down", "Scroll"}};
+    RepeatState rs;
+    bool wasTouched = true; // a touch still held from before does not count
+    while (WHBProcIsRunning()) {
+        const input::State in = input::read();
+        const uint32_t p = withRepeat(in, rs);
+        const bool tapped = in.touched && !wasTouched;
+        wasTouched = in.touched;
+        if (tapped || (p & (VPAD_BUTTON_A | VPAD_BUTTON_B))) return;
+        scrollCard(m, p);
+        drawFrame([&] { ui::drawMessage(m); });
+    }
+}
+
+// Settings > Check for updates: the same check, run on demand, and always answered with a card -- what
+// this build is, what GitHub has, and whether to update, you are ahead of the release, or it failed.
+// B cancels while it waits.
+static void checkForUpdatesNow() {
+    const updatecheck::Outcome outcome = runUpdateCheck("Checking for updates");
+    if (outcome.detail == "cancelled") return; // B: back to Settings, nothing to say
+    const updatecheck::Card card = updatecheck::resultCard(outcome, ufin::kVersion);
+    showCardUntilDismissed(card.title, card.lines, card.isError);
+}
+
 enum class Section { Home, LiveTv, Search, Settings, Help };
 enum class Mode { SignIn, QuickConnect, Browse, Profiles }; // Profiles = "Who's watching?"
 
@@ -945,6 +1183,8 @@ struct App {
         toast = text;
         toastAt = OSGetTime();
     }
+
+    bool toastActive() const { return !toast.empty() && secondsSince(toastAt) < 2.5; }
 
     void saveConfig() {
         cfg.usageSeconds = g_usage.totalSeconds(monotonicSeconds()); // every save carries the latest total
@@ -1565,14 +1805,14 @@ struct App {
 
     enum SettingsRow { SetMusic, SetCrt, SetAccent, SetUnlockRainbow, SetLight, SetBackground, SetBackdrops, SetGlass, SetSnow, SetClock, SetLogging,
                        SetQuality, SetH264Profile, SetAutoplay, SetGamepadScreen, SetStrictVideoGeometry, SetTestPicture, SetAccount,
-                       SetAbout };
+                       SetAutoUpdates, SetCheckUpdates, SetAbout };
 
     std::vector<SettingsRow> settingsRows() const {
         std::vector<SettingsRow> rows = {SetMusic, SetAutoplay, SetGamepadScreen, SetStrictVideoGeometry, SetQuality,
                 SetH264Profile, SetAccent};
         if (cfg.rainbowEasterEgg) rows.push_back(SetUnlockRainbow);
         rows.insert(rows.end(), {SetLight, SetBackground, SetBackdrops, SetGlass, SetCrt, SetSnow, SetClock, SetLogging,
-                                 SetTestPicture, SetAccount, SetAbout});
+                                 SetTestPicture, SetAccount, SetAutoUpdates, SetCheckUpdates, SetAbout});
         return rows;
     }
 
@@ -1731,10 +1971,22 @@ struct App {
                 e.tag = "Switch profile";
                 e.detail = formatServerAddress(cfg.host, cfg.port);
                 break;
+            case SetAutoUpdates:
+                e.name = "Automatic update check";
+                e.icon = ui::Icon::Info;
+                e.tag = onOff(cfg.checkForUpdates);
+                e.detail = "Look for a newer Ufin on GitHub a moment after you sign in";
+                break;
+            case SetCheckUpdates:
+                e.name = "Check for updates";
+                e.icon = ui::Icon::Info;
+                e.tag = ufin::kVersion;
+                e.detail = "Compare this version with the latest release on GitHub";
+                break;
             case SetAbout:
                 e.name = "About Ufin";
                 e.icon = ui::Icon::Info;
-                e.tag = "1.1.0";
+                e.tag = ufin::kVersion;
                 // Build time: makes an old build on the SD card easy to spot.
                 e.detail = std::string("A Jellyfin client for the Wii U  -  built ") + __DATE__ + " " + __TIME__;
                 break;
@@ -1849,12 +2101,19 @@ struct App {
             case SetAccount:
                 showProfiles(true); // Who's watching? (your sign-in stays saved)
                 return;
+            case SetAutoUpdates:
+                cfg.checkForUpdates = !cfg.checkForUpdates;
+                say(cfg.checkForUpdates ? "Update check on start-up: on" : "Update check on start-up: off");
+                break;
+            case SetCheckUpdates:
+                checkForUpdatesNow();
+                return;
             case SetAbout:
                 // Tap it seven times... (like a phone's build number). Reveals
                 // the Rainbow accent toggle in Settings for good, rather than
                 // switching it on outright -- see SetUnlockRainbow above.
                 if (cfg.rainbowEasterEgg) {
-                    say("Ufin 1.1.0 -- UI inspired by CafeMP. Thanks for watching!");
+                    say(std::string("Ufin ") + ufin::kVersion + " -- UI inspired by CafeMP. Thanks for watching!");
                     return;
                 }
                 aboutTaps++;
@@ -1867,7 +2126,7 @@ struct App {
                     say(std::to_string(7 - aboutTaps) + (7 - aboutTaps == 1 ? " more..." : " more..."));
                     return;
                 } else {
-                    say("Ufin 1.1.0 -- UI inspired by CafeMP");
+                    say(std::string("Ufin ") + ufin::kVersion + " -- UI inspired by CafeMP");
                     return;
                 }
                 break;
@@ -2023,7 +2282,9 @@ struct App {
         } else if (picked.type == "Audio") {
             stopMusic();
             size_t start = 0;
-            PlayQueue queue(audioTracks(f.items, (size_t)f.selected, start), start, false, 0);
+            const uint32_t seed = (uint32_t)OSGetTime() ^ (uint32_t)((uint64_t)OSGetTime() >> 32);
+            PlayQueue queue(audioTracks(f.items, (size_t)f.selected, start), start, g_shuffleOn, seed);
+            queue.setRepeat(g_repeatMode);
             std::string error;
             if (playQueue(client, cfg, queue, error) == PlayResult::Error) errorMessage = error;
             refreshAfterPlayback();
@@ -2156,6 +2417,8 @@ struct App {
         stopMusic();
         uint32_t seed = (uint32_t)OSGetTime() ^ (uint32_t)((uint64_t)OSGetTime() >> 32);
         PlayQueue queue(tracks, (size_t)(seed % tracks.size()), true, seed);
+        g_shuffleOn = true; // "+" turns the Shuffle button on, so it shows as on in the player
+        queue.setRepeat(g_repeatMode);
         std::string error;
         if (playQueue(client, cfg, queue, error) == PlayResult::Error) errorMessage = error;
     }
@@ -2474,6 +2737,17 @@ int main(int argc, char** argv) {
     if (cfg.deviceId.empty()) cfg.deviceId = "ufin-" + makePlaySessionId((uint64_t)OSGetTime(), 7).substr(0, 16);
     ui::gfx().setCrt(cfg.crt);
 
+    // Start-up update check (on by default; Settings or Y on the prompt turn it off). It runs once, a
+    // couple of seconds after sign-in, on a worker thread; its answer is handled in the loop below.
+    bool updateCheckPending = true;      // starts once cfg.checkForUpdates is on (see the loop)
+    int updateCheckFrames = 0;
+    bool updateWorkerOurs = false;       // the worker thread is running for the start-up check
+    bool updatePromptOpen = false;
+    float updateShown = 0.0f;            // the notification bar's smoothed fill, 0..100
+    ui::MessageModel updatePrompt;
+    std::string updatePromptVersion;
+    if (!cfg.checkForUpdates) OSReport("Ufin: update check at start-up: off (turned off in Settings / config.json)\n");
+
     JellyfinClient client(cfg.host, cfg.port);
     client.setDeviceId(cfg.deviceId);
 
@@ -2523,8 +2797,55 @@ int main(int argc, char** argv) {
         float tapX = in.touchX, tapY = in.touchY;
         wasTouched = in.touched;
 
-        if (pressed || tapped) app->handleInput(pressed, tapped, tapX, tapY);
+        // The update prompt, when there is one: over whatever screen this is, and it takes the input.
+        if (updatePromptOpen) {
+            if (pressed & VPAD_BUTTON_X) {
+                app->cfg.skippedUpdateVersion = updatePromptVersion;
+                app->saveConfig();
+                updatePromptOpen = false;
+            } else if (pressed & VPAD_BUTTON_Y) {
+                app->cfg.checkForUpdates = false;
+                app->saveConfig();
+                updatePromptOpen = false;
+            } else if (tapped || (pressed & (VPAD_BUTTON_A | VPAD_BUTTON_B))) {
+                updatePromptOpen = false;
+            } else {
+                scrollCard(updatePrompt, pressed);
+            }
+        } else if (pressed || tapped) {
+            app->handleInput(pressed, tapped, tapX, tapY);
+        }
         app->pollQuickConnect();
+
+        // Start once, a couple of seconds after launch, wherever the user is (the sign-in screen included);
+        // turning the setting on later starts it too.
+        if (updateCheckPending && app->cfg.checkForUpdates && ++updateCheckFrames >= 120) {
+            updateCheckPending = false;
+            updateWorkerOurs = startUpdateCheck();
+        }
+        // Its answer: shown the moment we are back in this loop, so never while a movie plays.
+        if (updateWorkerOurs && !updatePromptOpen) {
+            updatecheck::Outcome outcome;
+            if (takeUpdateResult(outcome)) {
+                updateWorkerOurs = false;
+                if (outcome.kind == updatecheck::Outcome::Kind::Available && app->cfg.checkForUpdates) {
+                    const std::string& latest = outcome.info.latestVersion;
+                    if (latest == app->cfg.skippedUpdateVersion) {
+                        OSReport("Ufin: update check: %s is available but the user skipped it\n", latest.c_str());
+                    } else {
+                        updatePrompt = ui::MessageModel();
+                        updatePrompt.title = "Update available";
+                        updatePrompt.lines = updatecheck::promptLines(outcome.info, ufin::kVersion);
+                        updatePrompt.hints = {{"A", "Continue"}, {"X", "Don't remind me for this release"},
+                                              {"Y", "Turn off update checks"}, {"Up Down", "Scroll"}};
+                        updatePrompt.overlay = true;
+                        updatePromptVersion = latest;
+                        updatePromptOpen = true;
+                        wasTouched = true; // a touch still held does not dismiss it
+                    }
+                }
+            }
+        }
         app->updateMusic();
         app->updateBackdrop();
 
@@ -2535,9 +2856,25 @@ int main(int argc, char** argv) {
         }
 
         // Paced by vsync: frame() waits for the previous flip.
-        drawFrame([&] { app->draw(); });
+        // A smoothed progress value for the "Checking for updates" notification (top centre, like the other notices).
+        const bool checking = updateWorkerOurs && g_update.state.load() == 1;
+        if (checking) {
+            const float target = (float)g_update.progress.load();
+            updateShown += (target - updateShown) * 0.08f;
+        } else {
+            updateShown = 0.0f;
+        }
+        drawFrame([&] {
+            app->draw();
+            if (checking) ui::drawProgressToast("Checking for updates", updateShown / 100.0f, app->toastActive() ? 84.0f : 24.0f);
+            if (updatePromptOpen) ui::drawMessage(updatePrompt);
+        });
     }
 
+    if (g_update.state.load() == 1) { // do not leave a half-finished request behind
+        g_update.cancel = true;
+        for (int i = 0; i < 20 && g_update.state.load() == 1; i++) OSSleepTicks(OSMillisecondsToTicks(50));
+    }
     VPADSetLcdMode(VPAD_CHAN_0, VPAD_LCD_ON); // never leave the GamePad dark
     if (!app->cfg.host.empty()) app->saveConfig(); // the use-time total, so short sessions count too
     delete app;      // stops the menu music

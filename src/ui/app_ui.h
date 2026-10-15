@@ -77,6 +77,9 @@ struct MessageModel {
     std::vector<Hint> hints;
     bool isError = false;
     bool busy = false;              // animated dots after the title
+    bool overlay = false;           // drawn over the screen already there (no backdrop or logo of its own)
+    int firstLine = 0;              // scroll position: the first line drawn (the card keeps its size)
+    mutable int linesShown = 0;     // set by drawMessage: how many lines (from firstLine) fitted on the card
 };
 
 struct NowPlayingModel {
@@ -91,6 +94,11 @@ struct NowPlayingModel {
     Texture art = 0;               // album art, 0 = gradient placeholder
     float volume = 1.0f;           // 0..1, drawn as a slider below the transport buttons
     int pressedButton = -1;        // NpButton being touched right now, -1 = none (Liquid Glass pressed look only)
+    // Music queue controls: the Shuffle and Repeat buttons beside the transport row. Each says plainly whether
+    // it is on (lit in the accent colour, with its state written under it); Repeat has three states.
+    bool queueControls = false;    // draw them (a music queue; not the movie remote)
+    bool shuffleOn = false;
+    int repeatMode = 0;            // 0 = off, 1 = repeat all, 2 = repeat one (the button shows a 1)
 };
 
 // The music visualizer (- during audio playback). Bar levels come from
@@ -279,6 +287,8 @@ void drawQuickConnect(const QuickConnectModel& model);
 // A short notice at the top of the screen ("Menu music: ..."), fading
 // out over its last half second. `age` is seconds since it appeared.
 void drawToast(const std::string& text, double age, double lifetime = 2.5);
+// The same pill with a thin progress bar under the text (fraction 0..1), for something still running.
+void drawProgressToast(const std::string& text, float fraction, float y = 24.0f);
 
 // The CRT easter egg: scanlines, a soft glow, a rolling bright band and
 // a vignette with rounded dark corners, over everything drawn this

@@ -74,6 +74,7 @@ static const float NP_BUTTONS_Y = NP_TIME_Y + 40.0f;
 static const float NP_BUTTON_SIZE = 56.0f;
 static const float NP_BUTTON_SIZE_BIG = 78.0f; // play/pause, the primary action
 static const float NP_BUTTON_GAP = 26.0f;
+static const float NP_TOGGLE_SIZE = 52.0f; // Shuffle / Repeat toggles of a music queue
 
 // Volume slider, directly under the transport buttons: a plain
 // horizontal drag-track the same width as the progress bar. NP_VOLUME_H
@@ -243,7 +244,10 @@ inline int hitTestLogin(float x, float y, int rows) {
 // drawNowPlaying (draws them) and PlaybackControl::poll() (hit-tests
 // taps against them), for both the music Now Playing screen and the
 // movie remote (TV-only mode).
-enum class NpButton { SeekBack = 0, PlayPause = 1, SeekForward = 2, Stop = 3, Count = 4 };
+// Count = the four transport buttons (the movie remote shows only those). A music queue also shows two toggle
+// buttons either side of them -- Shuffle on the left, Repeat on the right -- numbered after the transport ones
+// so one index says which was touched (hitTestNowPlayingToggles below).
+enum class NpButton { SeekBack = 0, PlayPause = 1, SeekForward = 2, Stop = 3, Count = 4, Shuffle = 4, Repeat = 5 };
 
 inline float npButtonSize(int index) {
     return index == (int)NpButton::PlayPause ? layout::NP_BUTTON_SIZE_BIG : layout::NP_BUTTON_SIZE;
@@ -261,6 +265,25 @@ inline Rect npButtonRect(int index) {
     // button's centre sits on the same line regardless of its size.
     r.y = layout::NP_BUTTONS_Y + (layout::NP_BUTTON_SIZE_BIG - r.h) * 0.5f;
     return r;
+}
+
+// The Shuffle / Repeat toggles of a music queue: smaller round buttons level with the transport row, Shuffle
+// to the left of seek-back and Repeat to the right of stop.
+inline Rect npToggleRect(NpButton which) {
+    const float size = layout::NP_TOGGLE_SIZE;
+    const Rect first = npButtonRect(0), last = npButtonRect((int)NpButton::Count - 1);
+    Rect r;
+    r.w = r.h = size;
+    r.x = which == NpButton::Shuffle ? first.x - layout::NP_BUTTON_GAP - size : last.x + last.w + layout::NP_BUTTON_GAP;
+    r.y = layout::NP_BUTTONS_Y + (layout::NP_BUTTON_SIZE_BIG - size) * 0.5f;
+    return r;
+}
+
+// NpButton::Shuffle / NpButton::Repeat (as an int) if the touch lands on one, else -1.
+inline int hitTestNowPlayingToggles(float x, float y) {
+    if (npToggleRect(NpButton::Shuffle).contains(x, y)) return (int)NpButton::Shuffle;
+    if (npToggleRect(NpButton::Repeat).contains(x, y)) return (int)NpButton::Repeat;
+    return -1;
 }
 
 // -1 if the touch doesn't land on any transport button.

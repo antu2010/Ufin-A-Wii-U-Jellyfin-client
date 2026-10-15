@@ -50,3 +50,9 @@ struct HttpStreamHandle {
 
 bool http_open_stream(const std::string& host, int port, const std::string& path,
                        const std::string& extra_headers, HttpStreamHandle& out);
+
+// A connected TCP socket to host:port (a dotted address or a name), or -1 with
+// `error` set. Uses the same mutex-protected name lookup and bounded connect as
+// every request above; the caller owns the descriptor and must close() it.
+// For the HTTPS client (https_client.h), which layers TLS on top of it.
+int http_connect_tcp(const std::string& host, int port, int timeoutSeconds, std::string& error);

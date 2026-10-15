@@ -13,6 +13,7 @@
 
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "../http_stream_reader.h"
@@ -25,6 +26,14 @@ class HttpStreamIO {
 public:
     HttpStreamIO(std::string host, int port, std::string path);
     ~HttpStreamIO();
+
+    // Both forwarded to the HttpStreamReader (see its header); call before
+    // open(). Defaults keep the plain 15 s, non-cancellable wait.
+    void setStartupTimeoutSeconds(int seconds) { reader_.setStartupTimeoutSeconds(seconds); }
+    void setAbortCheck(std::function<bool()> abortCheck) { reader_.setAbortCheck(std::move(abortCheck)); }
+    // True when open() failed because the abort check ended the wait (the user
+    // backed out) rather than because anything went wrong.
+    bool cancelled() const { return reader_.cancelled(); }
 
     // Opens the underlying HttpStreamReader and sets up the AVIOContext.
     // Must succeed before avioContext() is usable.

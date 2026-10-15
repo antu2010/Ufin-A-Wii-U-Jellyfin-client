@@ -47,6 +47,12 @@ struct MediaTrack {
     std::string title;          // "Italian - AAC - 5.1 - Default"
     std::string language;       // "ita"
     bool isDefault = false;
+    // Subtitles only. A text format (SRT, ASS, WebVTT, ...) as opposed to a
+    // bitmap one (PGS, VobSub, DVB). Jellyfin burns the two kinds in through
+    // different ffmpeg filters, and only the text one disturbs the stream's
+    // timestamps when the transcode starts at an offset (see
+    // VideoStreamOptions::subtitleIsText and buildVideoStreamUrl).
+    bool isTextSubtitle = false;
 };
 
 // Everything needed to make HTTP requests against a media stream:
@@ -89,6 +95,14 @@ struct VideoStreamOptions {
     // separate subtitle stream). -2 = leave both to the server.
     int audioStreamIndex = -2;
     int subtitleStreamIndex = -2;
+    // True when subtitleStreamIndex names a *text* subtitle track (see
+    // MediaTrack::isTextSubtitle). With startTimeTicks > 0 that adds
+    // CopyTimestamps=true to the URL: without it Jellyfin's progressive
+    // transcode shifts the audio timestamps back by the start offset
+    // (asetpts=PTS-N/TB) while the video frames that land before zero are
+    // dropped, so the picture would sit on its first frame for N seconds
+    // while the sound plays on. Only ever set together with a burned-in track.
+    bool subtitleIsText = false;
 };
 
 // What we need to know about a video before playing it -- fetched from

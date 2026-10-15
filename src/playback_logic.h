@@ -58,6 +58,15 @@ inline int trackForLanguage(const std::vector<MediaTrack>& tracks, const std::st
     return fallback;
 }
 
+// Whether the chosen subtitle track (stream index; -1 = none) is a text format.
+// Feeds VideoStreamOptions::subtitleIsText; false when nothing is chosen or the
+// track is unknown, so only a known text track changes the stream request.
+inline bool subtitleTrackIsText(const std::vector<MediaTrack>& tracks, int index) {
+    if (index < 0) return false;
+    for (const MediaTrack& t : tracks) if (t.index == index) return t.isTextSubtitle;
+    return false;
+}
+
 inline std::string trackLanguage(const std::vector<MediaTrack>& tracks, int index) {
     for (const MediaTrack& t : tracks) if (t.index == index) return t.language;
     return "";

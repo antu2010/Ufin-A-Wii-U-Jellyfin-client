@@ -129,9 +129,16 @@ inline std::vector<Row> rowsFor(Controller c) {
     else add("L / R", "Previous / next track (L restarts a song after 3 s)", L | R);
     add("A", "Pause / resume", A);
     add("Left / Right", "Back 10 s / forward 30 s", DPAD);
+    if (remote) {
+        add("1", "Shuffle on / off", ONE);
+        add("2", "Repeat: off, then all, then one song (press again to change)", TWO);
+    } else {
+        add("X", "Shuffle on / off", X);
+        add("Y", "Repeat: off, then all, then one song (press again to change)", Y);
+    }
     add("-", "Visualizer on / off", MINUS);
     add("B", "Stop", B);
-    if (gamepad) add("Touch", "Transport buttons and the volume slider", TOUCH);
+    if (gamepad) add("Touch", "Transport buttons, Shuffle / Repeat and the volume slider", TOUCH);
 
     head("Live TV");
     add("B", "Stop", B);

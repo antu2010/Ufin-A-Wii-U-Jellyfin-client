@@ -62,6 +62,34 @@ run test_image_cache "$HERE/test_image_cache.cpp" "$SRC/image_cache.cpp"
 run test_input_map "$HERE/test_input_map.cpp"
 RUN_ARGS="$HERE/../../patches/ffmpeg-wiiu-fixes.patch" run test_h264_geometry "$HERE/test_h264_geometry.cpp"
 run test_playback_logic "$HERE/test_playback_logic.cpp"
+# HttpStreamReader: failure causes, longer / cancellable startup wait (no FFmpeg needed).
+run test_http_stream_reader "$HERE/test_http_stream_reader.cpp" "$SRC/http_stream_reader.cpp"
+run test_h264_diag "$HERE/test_h264_diag.cpp"
+# Startup update check: the decisions (no network), the HTTPS client's core against scripted servers, and
+# the glue to the console's system TLS (NSSL) against a fake NSSL (the real TLS cannot run on a PC).
+run test_update_check "$HERE/test_update_check.cpp" "$SRC/update_check.cpp" "$SRC/vendor/cJSON.c"
+run test_https_client "$HERE/test_https_client.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp"
+CXXFLAGS="$CXXFLAGS -DUFIN_TLS_NSSL" run test_https_nssl "$HERE/test_https_nssl.cpp" "$HERE/stubs/fake_nssl.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp"
+if [ -x "$OUT/test_https_nssl" ]; then "$OUT/test_https_nssl" noroots || status=1; "$OUT/test_https_nssl" emulator || status=1; fi
+# The DNS client (packets + a fake UDP server), and our own TLS client (vendored Mbed TLS, compiled once into a
+# static library here) against a real `openssl s_server` with a throw-away CA.
+run test_dns_client "$HERE/test_dns_client.cpp" "$SRC/dns_client.cpp"
+MBED="$SRC/vendor/mbedtls"
+if [ ! -f "$OUT/libmbedufin.a" ] || [ "$MBED/include/mbedtls/config.h" -nt "$OUT/libmbedufin.a" ]; then
+    echo "== building mbedtls (once)"
+    rm -rf "$OUT/mbed"; mkdir -p "$OUT/mbed"
+    for f in "$MBED"/library/*.c; do
+        gcc -std=gnu99 -O1 -c -I"$MBED/include" -I"$MBED/library" \
+            "$f" -o "$OUT/mbed/$(basename "$f" .c).o" || status=1
+    done
+    rm -f "$OUT/libmbedufin.a"; ar rcs "$OUT/libmbedufin.a" "$OUT"/mbed/*.o
+fi
+if command -v openssl >/dev/null 2>&1; then
+    CXXFLAGS="$CXXFLAGS -DUFIN_TLS_MBEDTLS -I$MBED/include" LIBS="$OUT/libmbedufin.a" \
+        run test_https_mbedtls "$HERE/test_https_mbedtls.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp" "$SRC/dns_client.cpp" "$SRC/tls_roots.cpp"
+else
+    echo "== test_https_mbedtls skipped (no openssl binary)"
+fi
 run test_login_utils "$HERE/test_login_utils.cpp"
 # Who's watching?: the rules, bounce and config round trip; then the screen itself (app_ui.cpp also links
 # model3d.cpp when the Help window's SD-card models are in the tree).
@@ -132,6 +160,15 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                     run test_player_seek "$HERE/test_player_seek.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
                     "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
                     "$HERE/stubs/fake_sdl.cpp"
+                RUN_ARGS=""
+                # Subtitles burned in at a start offset: the real URL builder and Player
+                # against a fake Jellyfin that applies its burn-in timestamp shift unless
+                # CopyTimestamps=true (reproduces the frozen-picture-with-audio report).
+                RUN_ARGS="$SRC60"
+                CXXFLAGS="$CXXFLAGS -I$H -I$SRC/media" \
+                    run test_player_burnin "$HERE/test_player_burnin.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
+                    "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
+                    "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c" "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
             fi
             # Graceful rebuffering: the real Player against a fake Jellyfin whose

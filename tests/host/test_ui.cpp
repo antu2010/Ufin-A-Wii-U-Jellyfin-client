@@ -469,7 +469,7 @@ static void testSettingsPreview() {
                {"Snow", "Off", "Gentle snowfall over the menus", ui::Icon::Snow, 0, 0},
                {"Clock", "On", "The time in the top-right corner", ui::Icon::Clock, 0, 0},
                {"Signed in as alex", "Sign out", "192.168.1.100", ui::Icon::User, 0, 0},
-               {"About Ufin", "1.1.0", "A Jellyfin client for the Wii U", ui::Icon::Info, 0, 0}};
+               {"About Ufin", "1.2.0", "A Jellyfin client for the Wii U", ui::Icon::Info, 0, 0}};
     m.hints = {{"A", "Change"}, {"B", "Back"}};
     SoftRender sr = renderScreen([&] { ui::drawBrowser(m); }, "settings");
     CHECK_EQ(sr.at((int)ui::layout::listRow(0).x + 200, (int)ui::layout::listRow(0).y + 3), SELECTED);
@@ -546,6 +546,70 @@ static void testNowPlaying() {
     m.paused = true;
     SoftRender sr = renderScreen([&] { ui::drawNowPlaying(m); }, "now_playing_paused");
     CHECK_EQ(sr.at(110 + 170 - 22, 150 + 170), bgr(0xFFFFFF)); // pause bar on the artwork
+}
+
+// Shuffle / Repeat buttons: hit-testing, and every state looks different from "off" (lit in the accent colour).
+static void testQueueToggles() {
+    using ui::NpButton;
+    const ui::Rect sh = ui::npToggleRect(NpButton::Shuffle), rp = ui::npToggleRect(NpButton::Repeat);
+    // Each toggle sits beside the transport row, on the screen, not on top of another button or the volume slider.
+    const ui::Rect first = ui::npButtonRect(0), last = ui::npButtonRect((int)NpButton::Count - 1);
+    CHECK(sh.right() < first.x && rp.x > last.right());
+    CHECK(sh.x > ui::layout::NP_TEXT_X && rp.right() < ui::layout::NP_TEXT_X + ui::layout::NP_TEXT_W);
+    CHECK(sh.bottom() < ui::layout::NP_VOLUME_Y && rp.bottom() < ui::layout::NP_VOLUME_Y);
+    CHECK_EQ(ui::hitTestNowPlayingToggles(sh.x + sh.w * 0.5f, sh.y + sh.h * 0.5f), (int)NpButton::Shuffle);
+    CHECK_EQ(ui::hitTestNowPlayingToggles(rp.x + rp.w * 0.5f, rp.y + rp.h * 0.5f), (int)NpButton::Repeat);
+    CHECK_EQ(ui::hitTestNowPlayingToggles(first.x + 5, first.y + 5), -1);
+    // The four transport buttons did not move or change meaning.
+    CHECK_EQ(ui::hitTestNowPlaying(sh.x + 5, sh.y + 5), -1);
+    CHECK_EQ(ui::hitTestNowPlaying(rp.x + 5, rp.y + 5), -1);
+
+    for (int glass = 0; glass < 2; glass++) {
+        ui::setGlass(glass == 1);
+        if (glass) ui::setGlassSnapshot((uint64_t)7781, &SoftRender::snapshotCallback, (void*)(intptr_t)7781);
+        auto shot = [&](bool shuffle, int repeat, const char* name) {
+            ui::NowPlayingModel m;
+            m.title = "Song"; m.durationSeconds = 200; m.positionSeconds = 20;
+            m.queueControls = true; m.shuffleOn = shuffle; m.repeatMode = repeat;
+            return renderScreen([&] { ui::drawNowPlaying(m); }, (std::string(name) + (glass ? "_glass" : "_flat")).c_str());
+        };
+        SoftRender off = shot(false, 0, "toggles_off"), shuf = shot(true, 0, "toggles_shuffle"),
+                   all = shot(false, 1, "toggles_all"), one = shot(false, 2, "toggles_one");
+        // The pixels around each button's centre (away from the icon) differ clearly between off and on.
+        auto diff = [&](const SoftRender& a, const SoftRender& b, const ui::Rect& r) {
+            long d = 0;
+            const int cx = (int)(r.x + r.w * 0.5f), cy = (int)(r.y + r.h * 0.5f);
+            for (int dy = -20; dy <= 20; dy += 4)
+                for (int dx = -20; dx <= 20; dx += 4) {
+                    const uint32_t p = a.at(cx + dx, cy + dy), q = b.at(cx + dx, cy + dy);
+                    d += std::abs((int)(p & 0xFF) - (int)(q & 0xFF)) + std::abs((int)((p >> 8) & 0xFF) - (int)((q >> 8) & 0xFF)) +
+                         std::abs((int)((p >> 16) & 0xFF) - (int)((q >> 16) & 0xFF));
+                }
+            return d;
+        };
+        CHECK(diff(off, shuf, sh) > 4000);        // shuffle lit
+        CHECK(diff(off, shuf, rp) < 200);         // ...and only shuffle: repeat did not change
+        CHECK(diff(off, all, rp) > 4000);         // repeat all lit
+        CHECK(diff(off, all, sh) < 200);
+        CHECK(diff(off, one, rp) > 4000);         // repeat one lit
+        {   // and repeat one is told apart from repeat all by the 1 in the loop (a thin glyph: every pixel counts)
+            long d = 0;
+            const int cx = (int)(rp.x + rp.w * 0.5f), cy = (int)(rp.y + rp.h * 0.5f);
+            for (int dy = -10; dy <= 10; dy++)
+                for (int dx = -8; dx <= 8; dx++) if (all.at(cx + dx, cy + dy) != one.at(cx + dx, cy + dy)) d++;
+            CHECK(d > 15);
+        }
+    }
+    ui::setGlassSnapshot(0, nullptr, nullptr);
+    ui::setGlass(false);
+
+    // The movie remote never shows them.
+    ui::NowPlayingModel movie;
+    movie.title = "Movie"; movie.durationSeconds = 200;
+    SoftRender a = renderScreen([&] { ui::drawNowPlaying(movie); }, "np_no_toggles");
+    movie.queueControls = true;
+    SoftRender b = renderScreen([&] { ui::drawNowPlaying(movie); }, "np_with_toggles");
+    CHECK(a.at((int)(sh.x + sh.w * 0.5f), (int)(sh.y + 2)) != b.at((int)(sh.x + sh.w * 0.5f), (int)(sh.y + 2)));
 }
 
 static void testMusicVisualizer() {
@@ -1506,6 +1570,7 @@ int main(int argc, char** argv) {
     testUsageCelebration();
     testHelpWindow();
 
+    testQueueToggles(); // last: it uses glass refraction snapshots, which other tests count from zero
     ImGui::DestroyContext();
     return check::finish("test_ui");
 }

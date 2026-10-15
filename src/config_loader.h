@@ -88,6 +88,13 @@ struct UfinConfig {
     // known-bad titles), so this is not a fully closed issue; a user who
     // hits it can turn the check back on from Settings.
     bool allowUnalignedVideoGeometry = true;
+    // On start-up, ask GitHub (over HTTPS) whether a newer Ufin release exists and say so once if it
+    // does (see update_check.h). On by default; "check_for_updates": false, Settings > Automatic update
+    // check or Y on the prompt turn it off. Settings > Check for updates works either way.
+    bool checkForUpdates = true;
+    // The release the user chose "Don't remind me" for on the start-up prompt ("1.3.1"); only that
+    // version is skipped -- a newer one prompts again. Settings > Check for updates still shows it.
+    std::string skippedUpdateVersion;
 
     // Optional video transcode settings (see JellyfinClient::
     // buildVideoStreamUrl for what they mean and why the defaults are

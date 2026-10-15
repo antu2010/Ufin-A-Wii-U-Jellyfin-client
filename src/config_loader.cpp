@@ -134,6 +134,8 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
     outConfig.autoplayNext = boolean("autoplay_next", true);
     outConfig.gamepadOffInVideo = boolean("gamepad_off_in_video", false);
     outConfig.allowUnalignedVideoGeometry = boolean("allow_unaligned_video_geometry", true);
+    outConfig.checkForUpdates = boolean("check_for_updates", true);
+    outConfig.skippedUpdateVersion = str("skipped_update_version");
 
     cJSON* videoHeight = cJSON_GetObjectItem(json, "video_height");
     if (cJSON_IsNumber(videoHeight) && videosize::supportedHeight(videoHeight->valueint)) {
@@ -254,6 +256,8 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setBool("autoplay_next", config.autoplayNext);
     setBool("gamepad_off_in_video", config.gamepadOffInVideo);
     setBool("allow_unaligned_video_geometry", config.allowUnalignedVideoGeometry);
+    setBool("check_for_updates", config.checkForUpdates);
+    setStr("skipped_update_version", config.skippedUpdateVersion);
 
     char* text = cJSON_Print(json);
     cJSON_Delete(json);

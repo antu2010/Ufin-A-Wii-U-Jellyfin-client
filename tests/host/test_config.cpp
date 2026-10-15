@@ -279,6 +279,8 @@ int main() {
     }
     CHECK(!tok.rainbowUnlocked);
     CHECK(tok.autoplayNext);        // on unless turned off
+    CHECK(tok.skippedUpdateVersion.empty()); // nothing skipped by default
+    CHECK(tok.checkForUpdates);     // the startup update check is on by default
     CHECK(!tok.gamepadOffInVideo);
     UfinConfig noHost = tok;
     noHost.host.clear();
@@ -310,6 +312,8 @@ int main() {
         c.rainbowUnlocked = true;
         c.autoplayNext = false;
         c.gamepadOffInVideo = true;
+        c.checkForUpdates = false;
+        c.skippedUpdateVersion = "1.3.1";
         CHECK(saveConfigToFile(path.c_str(), c, err));
         UfinConfig back;
         CHECK(loadConfigFromFile(path.c_str(), back, err));
@@ -330,6 +334,8 @@ int main() {
         CHECK(back.rainbowUnlocked);
         CHECK(!back.autoplayNext);
         CHECK(back.gamepadOffInVideo);
+        CHECK(back.skippedUpdateVersion == "1.3.1"); // "Don't remind me for this release" survives
+        CHECK(!back.checkForUpdates);  // turning the update check off survives a save and a load
         CHECK_STR(back.password, "");
         FILE* f = fopen(path.c_str(), "rb");
         char text[4096] = {0};

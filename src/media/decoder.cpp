@@ -1,5 +1,6 @@
 #include "decoder.h"
 #include "../h264_profile.h"
+#include "../h264_diag.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -67,11 +68,24 @@ bool Decoder::openCodecForStream(int streamIndex, AVCodecContext** outCtx) {
     // this must never turn into a blanket "reject anything but 1280x720"
     // rule (see repository investigation notes): only the alignment the
     // hardware actually needs is enforced here.
+    int hwHeight = 0; // see h264diag::hardwareHeightOverride; 0 for every stream that works today
     if (strcmp(codec->name, "h264_wiiu") == 0) {
+        hwHeight = h264diag::hardwareHeightOverride(
+            h264diag::spsGeometry(params->extradata, params->extradata_size > 0 ? (size_t)params->extradata_size : 0),
+            params->width, params->height);
+        if (hwHeight > 0) {
+            // The container says %dx%d, but the SPS codes the picture taller and crops it
+            // (a burned-in-subtitle transcode did this: 832 rows, 28 cropped). The hardware
+            // writes the coded picture and h264_wiiu places chroma after align16(height)
+            // rows, so it has to be told the coded height -- the extra rows are cropped
+            // off again when each frame comes out (decodeFrom).
+            OSReport("Ufin: stream is coded %dx%d for a visible %dx%d -- giving h264_wiiu the coded height\n",
+                     params->width, hwHeight, params->width, params->height);
+        }
         const int kPitchAlign = 256;
         const int kHeightAlign = 16;
         bool unsafe = (params->width <= 0 || params->height <= 0 ||
-                       (params->width % kPitchAlign) != 0 || (params->height % kHeightAlign) != 0);
+                       (params->width % kPitchAlign) != 0 || ((hwHeight > 0 ? hwHeight : params->height) % kHeightAlign) != 0);
         if (unsafe && !allow_unaligned_geometry_) {
             snprintf(last_error_, sizeof(last_error_),
                      "unsafe geometry for h264_wiiu: %dx%d (needs width a multiple of %d, "
@@ -103,6 +117,13 @@ bool Decoder::openCodecForStream(int streamIndex, AVCodecContext** outCtx) {
         snprintf(last_error_, sizeof(last_error_), "avcodec_parameters_to_context failed");
         avcodec_free_context(&ctx);
         return false;
+    }
+
+    if (hwHeight > 0) {
+        ctx->height = hwHeight;
+        ctx->coded_height = hwHeight;
+        video_hw_height_ = hwHeight;
+        video_visible_height_ = params->height;
     }
 
     // Lets the decoder stamp output frames with timestamps in the
@@ -193,6 +214,13 @@ bool Decoder::open(AVIOContext* avioCtx) {
                  h264::nameForProfileIdc(video_profile_idc_),
                  video_profile_idc_, (vp->extradata_size >= 4 && vp->extradata[0] == 1) ? vp->extradata[3] : 0,
                  videoNeedsReorder() ? "display-order reorder ON" : "baseline, no reorder");
+        // Diagnostics: the parameter sets as the server sent them, logged before the
+        // decoder sees anything (see h264_diag.h).
+        if (vp->extradata_size >= 7 && vp->extradata[0] == 1) {
+            video_nal_length_size_ = (vp->extradata[4] & 3) + 1;
+            OSReport("Ufin: video %s\n", h264diag::describeAvcC(vp->extradata, (size_t)vp->extradata_size).c_str());
+            OSReport("Ufin: video avcC hex: %s\n", h264diag::hex(vp->extradata, (size_t)vp->extradata_size, 96).c_str());
+        }
         if (!openCodecForStream(video_stream_index_, &video_ctx_)) {
             return false; // last_error_ already set by openCodecForStream
         }
@@ -311,6 +339,11 @@ bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool
         int ret = avcodec_receive_frame(ctx, frame_);
         if (ret == 0) {
             if (isVideo) consecutive_video_decode_errors_ = 0;
+            if (isVideo && video_hw_height_ > 0 && frame_->height == video_hw_height_) {
+                // Bottom rows of the coded picture only: the planes keep their own pointers and
+                // strides, so shortening the frame is all the crop there is.
+                frame_->height = video_visible_height_;
+            }
             *outFrame = frame_;
             return true;
         }
@@ -340,6 +373,14 @@ bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool
 
         if (!queue.empty()) {
             AVPacket* pkt = queue.front();
+            if (isVideo && video_diag_packets_ < 6) {
+                // Logged *before* the send: if the process dies in the decoder, this is the last line.
+                video_diag_packets_++;
+                OSReport("Ufin: video packet #%d about to be decoded: %d B key=%d pts=%lld dts=%lld nals=[%s]\n",
+                         video_diag_packets_, pkt->size, (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0, (long long)pkt->pts,
+                         (long long)pkt->dts,
+                         h264diag::describePacketNals(pkt->data, (size_t)pkt->size, video_nal_length_size_).c_str());
+            }
             int sendRet = avcodec_send_packet(ctx, pkt);
             if (sendRet == AVERROR(EAGAIN)) {
                 // Wants output drained first, but just said it has none:
@@ -497,6 +538,9 @@ void Decoder::close() {
     reachedEof_.store(false, std::memory_order_release);
     video_timed_packets_.store(0, std::memory_order_relaxed);
     video_untimed_packets_.store(0, std::memory_order_relaxed);
+    video_diag_packets_ = 0;
+    video_hw_height_ = 0;
+    video_visible_height_ = 0;
     video_decode_errors_ = 0;
     consecutive_video_decode_errors_ = 0;
     fatal_decode_error_.store(false, std::memory_order_release);

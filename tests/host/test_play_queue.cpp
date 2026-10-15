@@ -79,6 +79,94 @@ int main() {
         CHECK_STR(two.current().id, "t0");
     }
 
+    // Repeat: off ends the queue; all wraps (both ways); one replays only when a track ends by itself.
+    {
+        PlayQueue q(tracks(3), 1, false, 1);
+        CHECK(q.repeat() == PlayQueue::Repeat::Off);
+        CHECK(q.next());
+        CHECK(!q.next());                       // end, repeat off
+        CHECK(!q.advanceAfterEnd());
+        CHECK(q.cycleRepeat() == PlayQueue::Repeat::All);
+        CHECK(q.hasNext());
+        CHECK_STR(q.peekNext()->id, "t0");
+        CHECK(q.next());                        // wraps
+        CHECK_STR(q.current().id, "t0");
+        CHECK(q.hasPrevious());
+        CHECK(q.previous());                    // and back the other way
+        CHECK_STR(q.current().id, "t2");
+        CHECK(q.cycleRepeat() == PlayQueue::Repeat::One);
+        CHECK(q.advanceAfterEnd());             // a track that ended: same one again
+        CHECK_STR(q.current().id, "t2");
+    }
+    {
+        PlayQueue q(tracks(3), 2, false, 1);
+        q.setRepeat(PlayQueue::Repeat::One);
+        CHECK(!q.next());                       // skip at the end with repeat one: nothing after the last track
+        CHECK(q.advanceAfterEnd());             // but an ended track plays again
+        CHECK_STR(q.current().id, "t2");
+        CHECK(q.cycleRepeat() == PlayQueue::Repeat::Off);
+        CHECK(!q.advanceAfterEnd());
+    }
+
+    // Repeat all + shuffle: the next round is a fresh order of every track, not starting with the last played.
+    {
+        PlayQueue q(tracks(6), 0, true, 77);
+        q.setRepeat(PlayQueue::Repeat::All);
+        for (int i = 0; i < 5; i++) CHECK(q.next());
+        const std::string last = q.current().id;
+        const JellyfinItem* peek = q.peekNext();
+        CHECK(peek != nullptr);
+        const std::string promised = peek->id;
+        CHECK(promised != last);
+        CHECK(q.next());
+        CHECK_STR(q.current().id, promised);    // "Next:" told the truth
+        CHECK_EQ((int)q.position(), 0);
+        std::set<std::string> seen;
+        do seen.insert(q.current().id); while (q.next() && q.position() != 0);
+        CHECK_EQ((int)seen.size(), 6);          // every track exactly once in the new round
+    }
+    {
+        PlayQueue one(tracks(1), 0, false, 1);
+        one.setRepeat(PlayQueue::Repeat::All);
+        CHECK(one.next());                      // a single track repeats
+        CHECK_STR(one.current().id, "t0");
+    }
+
+    // Shuffle on and off while playing.
+    {
+        PlayQueue q(tracks(10), 3, false, 1);
+        CHECK(q.next());                        // now on t4
+        q.setShuffle(true, 4242);
+        CHECK(q.shuffled());
+        CHECK_STR(q.current().id, "t4");        // the current track keeps playing
+        CHECK_EQ((int)q.position(), 4);         // history stays behind it
+        CHECK(q.hasPrevious());
+        CHECK(q.previous()); CHECK_STR(q.current().id, "t3");
+        CHECK(q.next());
+        std::set<std::string> seen = {"t0", "t1", "t2", "t3", "t4"};
+        bool inOrder = true;
+        std::string prev = q.current().id;
+        while (q.next()) {
+            seen.insert(q.current().id);
+            if (q.current().id != "t" + std::to_string(std::stoi(prev.substr(1)) + 1)) inOrder = false;
+            prev = q.current().id;
+        }
+        CHECK_EQ((int)seen.size(), 10);         // nothing lost, nothing doubled
+        CHECK(!inOrder);                        // and the rest really is mixed up
+    }
+    {
+        PlayQueue q(tracks(10), 0, true, 99);
+        CHECK(q.next()); CHECK(q.next());
+        const std::string here = q.current().id;
+        q.setShuffle(false, 1);
+        CHECK(!q.shuffled());
+        CHECK_STR(q.current().id, here);        // still on the same track
+        const int n = std::stoi(here.substr(1));
+        if (n < 9) { CHECK(q.next()); CHECK_STR(q.current().id, "t" + std::to_string(n + 1)); } // list order from here
+        q.setShuffle(false, 1);                 // already off: nothing happens
+        CHECK(!q.shuffled());
+    }
+
     // audioTracks: only Audio items, start index follows the selection.
     {
         std::vector<JellyfinItem> list = tracks(3);

@@ -99,6 +99,15 @@ struct PlayOptions {
     // playable seconds that were measured at that moment (NAN if none).
     std::function<void(PlaybackState from, PlaybackState to, double playableSeconds)> onPlaybackState;
 
+    // How long to wait for the server to start answering the stream request,
+    // in seconds. 0 = the usual 15 s, and the wait cannot be interrupted
+    // (exactly as before). Above 0 the wait is that long *and* the poll
+    // callback is consulted while it lasts, so a Stop (B) backs out cleanly
+    // with PlayResult::Stopped. For requests that make Jellyfin work before it
+    // sends the first byte -- a burned-in subtitle track is extracted from the
+    // media file and its fonts unpacked first -- where 15 s is not always enough.
+    int startupTimeoutSeconds = 0;
+
     // Mirrors UfinConfig::allowUnalignedVideoGeometry (see config_loader.h
     // for what it's for) -- forwarded to Decoder before it opens the
     // codec. Default false: keep the h264_wiiu geometry safety check

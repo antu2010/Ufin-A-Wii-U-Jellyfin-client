@@ -1,4 +1,5 @@
 #include "jellyfin_client.h"
+#include "version.h"
 #include "http_client.h"
 #include "video_size.h"
 #include "vendor/cJSON.h"
@@ -23,7 +24,7 @@ std::string JellyfinClient::authHeader() const {
     // because no client/device info arrived. The Authorization form has
     // been accepted since Jellyfin 10.8.
     std::string h = "Authorization: MediaBrowser Client=\"Ufin\", Device=\"Wii U\", DeviceId=\"" +
-                    (device_id_.empty() ? std::string("wiiu-ufin-001") : device_id_) + "\", Version=\"1.1.0\"";
+                    (device_id_.empty() ? std::string("wiiu-ufin-001") : device_id_) + "\", Version=\"" + std::string(ufin::kVersion) + "\"";
     if (!token_.empty()) {
         h += ", Token=\"" + token_ + "\"";
     }
@@ -435,6 +436,23 @@ static void parseVideoStream(cJSON* mediaStreams, VideoInfo& out) {
     }
 }
 
+// Same rule as Jellyfin's MediaStream.IsTextFormat: everything is text except
+// the bitmap formats (PGS / "sup", DVD and DVB subtitles, VobSub's "sub"). It
+// also treats FFmpeg's raw spellings of those ("dvd_subtitle", "dvb_subtitle",
+// "vobsub"), which Jellyfin normally rewrites before it reports them, as
+// bitmap. An unknown (empty) codec counts as "not text" -- the conservative
+// answer, which leaves the stream request untouched.
+static bool subtitleCodecIsText(const std::string& codecIn) {
+    if (codecIn.empty()) return false;
+    std::string codec = codecIn;
+    for (char& c : codec) c = (char)tolower((unsigned char)c);
+    if (codec.find("microdvd") != std::string::npos) return true;
+    return codec.find("pgs") == std::string::npos && codec.find("dvdsub") == std::string::npos &&
+           codec.find("dvbsub") == std::string::npos && codec.find("dvd_sub") == std::string::npos &&
+           codec.find("dvb_sub") == std::string::npos && codec.find("vobsub") == std::string::npos &&
+           codec != "sup" && codec != "sub";
+}
+
 // Audio and subtitle tracks from a MediaStreams array.
 static void parseTracks(cJSON* mediaStreams, VideoInfo& out) {
     out.audioTracks.clear();
@@ -451,6 +469,11 @@ static void parseTracks(cJSON* mediaStreams, VideoInfo& out) {
         if (t.title.empty()) t.title = jsonString(s, "Title");
         if (t.title.empty()) t.title = t.language.empty() ? type + " " + std::to_string(t.index) : t.language;
         t.isDefault = cJSON_IsTrue(cJSON_GetObjectItem(s, "IsDefault"));
+        if (type == "Subtitle") {
+            // The server's own answer when it gives one, else its rule applied to the codec name.
+            cJSON* isText = cJSON_GetObjectItem(s, "IsTextSubtitleStream");
+            t.isTextSubtitle = cJSON_IsBool(isText) ? cJSON_IsTrue(isText) : subtitleCodecIsText(jsonString(s, "Codec"));
+        }
         if (t.index < 0) continue;
         (type == "Audio" ? out.audioTracks : out.subtitleTracks).push_back(t);
     }
@@ -683,6 +706,21 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     if (options.subtitleStreamIndex >= 0) {
         // Burned into the picture: the Wii U decoder has no subtitle track.
         target.path += "&SubtitleStreamIndex=" + std::to_string(options.subtitleStreamIndex) + "&SubtitleMethod=Encode";
+        // Text subtitles + a start offset: ask Jellyfin to keep the source
+        // timestamps. In its progressive transcode (EncodingHelper.cs,
+        // GetTextSubtitlesFilter / GetAudioFilterParam) a text burn-in that is
+        // NOT copying timestamps appends "setpts=PTS-N/TB" to the video chain
+        // and "asetpts=PTS-N/TB" to the audio chain, N = the rounded start
+        // offset in seconds, on top of an input that ffmpeg has already moved
+        // to 0. The audio then starts at -N s and the video frames before 0
+        // are dropped, so the first picture is held for N seconds while the
+        // audio runs (reproduced with ffmpeg 6.1, see tests/host). With
+        // CopyTimestamps=true Jellyfin skips both filters and passes
+        // -copyts instead: audio and video both start at ~N s, which
+        // itemPositionFromStreamTime() already understands. Bitmap subtitles
+        // never get the shift, and without an offset there is nothing to
+        // shift, so those requests stay exactly as they were.
+        if (options.subtitleIsText && options.startTimeTicks > 0) target.path += "&CopyTimestamps=true";
     } else if (options.subtitleStreamIndex == -1) {
         target.path += "&SubtitleStreamIndex=-1"; // explicitly none
     }

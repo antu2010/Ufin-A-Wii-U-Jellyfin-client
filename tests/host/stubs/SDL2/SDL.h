@@ -30,6 +30,7 @@ typedef struct SDL_AudioSpec {
 extern "C" {
 int SDL_InitSubSystem(Uint32 flags);
 void SDL_QuitSubSystem(Uint32 flags);
+const char* SDL_GetCurrentAudioDriver(void);
 SDL_AudioDeviceID SDL_OpenAudioDevice(const char* device, int iscapture, const SDL_AudioSpec* desired,
                                       SDL_AudioSpec* obtained, int allowed_changes);
 void SDL_CloseAudioDevice(SDL_AudioDeviceID dev);

@@ -5,6 +5,7 @@
 #include <cstring>
 #include "fake_http_server.h"
 #include "jellyfin_client.h"
+#include "playback_logic.h"
 
 #include <chrono>
 #include <thread>
@@ -579,6 +580,73 @@ int main() {
         p = client.buildVideoStreamUrl("m5", o).path;
         CHECK(contains(p, "&SubtitleStreamIndex=-1"));
         CHECK(!contains(p, "SubtitleMethod"));
+
+        // Text vs bitmap subtitle tracks: the server's own flag wins, the codec
+        // name decides when an older server leaves the flag out, and an unknown
+        // codec is "not text" (the conservative answer).
+        FakeRoute subs;
+        subs.body = "{\"Id\":\"m6\",\"MediaSources\":[{\"Id\":\"src6\",\"MediaStreams\":["
+            "{\"Type\":\"Video\",\"Index\":0,\"Width\":1920,\"Height\":1080},"
+            "{\"Type\":\"Audio\",\"Index\":1,\"Language\":\"eng\"},"
+            "{\"Type\":\"Subtitle\",\"Index\":2,\"Codec\":\"subrip\",\"IsTextSubtitleStream\":true},"
+            "{\"Type\":\"Subtitle\",\"Index\":3,\"Codec\":\"hdmv_pgs_subtitle\",\"IsTextSubtitleStream\":false},"
+            "{\"Type\":\"Subtitle\",\"Index\":4,\"Codec\":\"ass\"},"
+            "{\"Type\":\"Subtitle\",\"Index\":5,\"Codec\":\"PGSSUB\"},"
+            "{\"Type\":\"Subtitle\",\"Index\":6,\"Codec\":\"dvd_subtitle\"},"
+            "{\"Type\":\"Subtitle\",\"Index\":7},"
+            "{\"Type\":\"Subtitle\",\"Index\":8,\"Codec\":\"dvbsub\"},"
+            "{\"Type\":\"Subtitle\",\"Index\":9,\"Codec\":\"webvtt\",\"IsTextSubtitleStream\":false}]}]}";
+        server.addRoute("/Users/user1/Items/m6", subs);
+        VideoInfo vs;
+        CHECK(client.getVideoInfo("m6", vs));
+        CHECK_EQ((int)vs.subtitleTracks.size(), 8);
+        auto isText = [&](int index) {
+            for (const MediaTrack& t : vs.subtitleTracks) if (t.index == index) return t.isTextSubtitle;
+            return false;
+        };
+        CHECK(isText(2));    // flag true
+        CHECK(!isText(3));   // flag false
+        CHECK(isText(4));    // no flag, "ass" -> text
+        CHECK(!isText(5));   // no flag, "PGSSUB" -> bitmap (case-insensitive)
+        CHECK(!isText(6));   // no flag, FFmpeg's raw "dvd_subtitle" -> bitmap
+        CHECK(!isText(7));   // no flag, no codec -> unknown -> not text
+        CHECK(!isText(8));   // no flag, dvbsub -> bitmap
+        CHECK(!isText(9));   // an explicit flag beats the codec name
+        CHECK(vs.audioTracks.size() == 1 && !vs.audioTracks[0].isTextSubtitle); // audio never marked
+        CHECK(subtitleTrackIsText(vs.subtitleTracks, 2));
+        CHECK(!subtitleTrackIsText(vs.subtitleTracks, 3));
+        CHECK(!subtitleTrackIsText(vs.subtitleTracks, -1));   // none chosen
+        CHECK(!subtitleTrackIsText(vs.subtitleTracks, 99));   // not a track of this video
+
+        // CopyTimestamps: only for a text subtitle burned in at a start offset.
+        // Jellyfin's progressive burn-in otherwise shifts audio PTS to -N s while
+        // dropping the video that lands before 0 (see buildVideoStreamUrl), which
+        // freezes the picture for N seconds while the audio plays.
+        VideoStreamOptions t;
+        t.subtitleStreamIndex = 2;
+        t.subtitleIsText = true;
+        t.startTimeTicks = 600000000LL; // 60 s
+        p = client.buildVideoStreamUrl("m6", t).path;
+        CHECK(contains(p, "&SubtitleStreamIndex=2&SubtitleMethod=Encode"));
+        CHECK(contains(p, "&StartTimeTicks=600000000"));
+        CHECK(contains(p, "&CopyTimestamps=true"));
+        t.startTimeTicks = 0;                       // no offset: nothing to shift
+        CHECK(!contains(client.buildVideoStreamUrl("m6", t).path, "CopyTimestamps"));
+        t.startTimeTicks = 600000000LL;
+        t.subtitleIsText = false;                   // bitmap or unknown track: unchanged request
+        CHECK(!contains(client.buildVideoStreamUrl("m6", t).path, "CopyTimestamps"));
+        t.subtitleIsText = true;
+        t.subtitleStreamIndex = -1;                 // subtitles off
+        CHECK(!contains(client.buildVideoStreamUrl("m6", t).path, "CopyTimestamps"));
+        t.subtitleStreamIndex = -2;                 // left to the server
+        CHECK(!contains(client.buildVideoStreamUrl("m6", t).path, "CopyTimestamps"));
+        // The no-subtitle request is byte-for-byte what it was without the new fields.
+        VideoStreamOptions plain;
+        plain.startTimeTicks = 600000000LL;
+        VideoStreamOptions plainFlagged = plain;
+        plainFlagged.subtitleIsText = true; // stale flag without a track must not matter
+        CHECK_STR(client.buildVideoStreamUrl("m6", plain).path, client.buildVideoStreamUrl("m6", plainFlagged).path);
+        CHECK(!contains(client.buildVideoStreamUrl("m6", plain).path, "CopyTimestamps"));
     }
 
     // --- signing in without config.json ---

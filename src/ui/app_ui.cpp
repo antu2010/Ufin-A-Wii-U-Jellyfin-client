@@ -1618,8 +1618,12 @@ void drawBrowser(const BrowserModel& m) {
 // --- message card ---
 
 void drawMessage(const MessageModel& m) {
-    drawScreenBackdrop();
-    drawLogo(30.0f, 40.0f);
+    if (m.overlay) {
+        dl()->AddRectFilled(ImVec2(0, 0), ImVec2(layout::SCREEN_W, layout::SCREEN_H), IM_COL32(0, 0, 0, 150));
+    } else {
+        drawScreenBackdrop();
+        drawLogo(30.0f, 40.0f);
+    }
 
     const float cardW = 820.0f;
     const float x = (layout::SCREEN_W - cardW) * 0.5f;
@@ -1653,15 +1657,19 @@ void drawMessage(const MessageModel& m) {
 
     float ty = y + pad + TEXT_L + 26.0f;
     const float maxY = y + cardH - pad;
-    for (const std::string& line : m.lines) {
+    m.linesShown = 0;
+    for (size_t i = (size_t)std::max(0, m.firstLine); i < m.lines.size(); i++) {
+        const std::string& line = m.lines[i];
         if (line.empty()) {
             ty += TEXT_M * 0.6f;
+            m.linesShown++;
             continue;
         }
         float h = font()->CalcTextSizeA(TEXT_M, 1e9f, wrap, line.c_str()).y;
         if (ty + h > maxY) break;
         dl()->AddText(font(), TEXT_M, ImVec2(x + pad, ty), col::MUTED, line.c_str(), nullptr, wrap);
         ty += h + 8.0f;
+        m.linesShown++;
     }
 
     drawHints(m.hints, x, y + cardH + 24.0f);
@@ -1745,6 +1753,59 @@ void drawNowPlaying(const NowPlayingModel& m) {
                 break;
             }
             default: break;
+        }
+    }
+
+    // Shuffle / Repeat (music queues only). OFF: a plain dim button, icon grey, caption "off". ON: the button is
+    // filled with the accent colour, the icon white, the caption written in the accent colour -- so it is clear at
+    // a glance which are active. Repeat has a third state: "repeat one" is lit too, with a 1 on the icon.
+    if (m.queueControls) {
+        for (int w = (int)ui::NpButton::Shuffle; w <= (int)ui::NpButton::Repeat; w++) {
+            const bool isShuffle = (w == (int)ui::NpButton::Shuffle);
+            const bool on = isShuffle ? m.shuffleOn : m.repeatMode != 0;
+            const ui::Rect r = ui::npToggleRect((ui::NpButton)w);
+            const float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f, rad = r.w * 0.5f;
+            if (g_glass) {
+                glassCircle(dl(), cx, cy, rad, m.pressedButton == w ? GK::ButtonPressed : (on ? GK::ButtonHot : GK::Button), true);
+                if (on) dl()->AddCircleFilled(ImVec2(cx, cy), rad * 0.94f, (accentMain() & 0x00FFFFFF) | (0x9Cu << 24), 32);
+            } else if (on) {
+                dl()->AddCircleFilled(ImVec2(cx, cy), rad, accentMain(), 32);
+                dl()->AddCircle(ImVec2(cx, cy), rad, IM_COL32(0xFF, 0xFF, 0xFF, 0x70), 32, 1.5f);
+            } else {
+                dl()->AddCircleFilled(ImVec2(cx, cy), rad, IM_COL32(0x2C, 0x31, 0x3A, 0x90), 32);
+                dl()->AddCircle(ImVec2(cx, cy), rad, IM_COL32(0x3A, 0x3F, 0x48, 0x90), 32, 1.5f);
+            }
+            const ImU32 ic = on ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0xA0, 0xA5, 0xAE, 0xB0);
+            const float s = rad * 0.52f, th = 2.6f;
+            ImDrawList* d = dl();
+            auto arrowRight = [&](float x, float y) { d->AddTriangleFilled(ImVec2(x + s * 0.42f, y), ImVec2(x - s * 0.1f, y - s * 0.32f), ImVec2(x - s * 0.1f, y + s * 0.32f), ic); };
+            auto arrowLeft = [&](float x, float y) { d->AddTriangleFilled(ImVec2(x - s * 0.42f, y), ImVec2(x + s * 0.1f, y + s * 0.32f), ImVec2(x + s * 0.1f, y - s * 0.32f), ic); };
+            if (isShuffle) {
+                // Two arrows crossing: the order is mixed.
+                d->AddLine(ImVec2(cx - s, cy - s * 0.55f), ImVec2(cx + s * 0.55f, cy + s * 0.55f), ic, th);
+                d->AddLine(ImVec2(cx - s, cy + s * 0.55f), ImVec2(cx + s * 0.55f, cy - s * 0.55f), ic, th);
+                arrowRight(cx + s * 0.78f, cy + s * 0.55f);
+                arrowRight(cx + s * 0.78f, cy - s * 0.55f);
+            } else {
+                // Two arrows chasing each other round a loop.
+                const ImVec2 top[3] = {ImVec2(cx - s, cy + s * 0.15f), ImVec2(cx - s, cy - s * 0.55f), ImVec2(cx + s * 0.55f, cy - s * 0.55f)};
+                const ImVec2 bot[3] = {ImVec2(cx + s, cy - s * 0.15f), ImVec2(cx + s, cy + s * 0.55f), ImVec2(cx - s * 0.55f, cy + s * 0.55f)};
+                d->AddPolyline(top, 3, ic, 0, th);
+                d->AddPolyline(bot, 3, ic, 0, th);
+                arrowRight(cx + s * 0.78f, cy - s * 0.55f);
+                arrowLeft(cx - s * 0.78f, cy + s * 0.55f);
+                if (m.repeatMode == 2) { // repeat one: a 1 in the middle of the loop
+                    const float fs = rad * 0.72f;
+                    const ImVec2 sz = font()->CalcTextSizeA(fs, 1e9f, 0.0f, "1");
+                    d->AddText(font(), fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, "1");
+                }
+            }
+            // The state, written under the button.
+            const char* name = isShuffle ? (on ? "Shuffle on" : "Shuffle off")
+                                         : (m.repeatMode == 0 ? "Repeat off" : (m.repeatMode == 1 ? "Repeat all" : "Repeat one"));
+            const float fs = 16.0f;
+            const ImVec2 ns = font()->CalcTextSizeA(fs, 1e9f, 0.0f, name);
+            d->AddText(font(), fs, ImVec2(cx - ns.x * 0.5f, r.y + r.h + 6.0f), on ? accentMain() : col::MUTED, name);
         }
     }
 
@@ -2041,6 +2102,25 @@ void drawToast(const std::string& t, double age, double lifetime) {
                 t.c_str());
 }
 
+void drawProgressToast(const std::string& t, float fraction, float y) {
+    fraction = std::min(1.0f, std::max(0.0f, fraction));
+    ImVec2 ts = textSize(TEXT_M, t);
+    const float barW = std::max(220.0f, ts.x), barH = 6.0f;
+    const float w = barW + 48, h = 68, x = (layout::SCREEN_W - w) * 0.5f;
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+    if (g_glass) {
+        glassSurface(fg, x, y, x + w, y + h, 24.0f, GK::Button, true, 1.0f);
+    } else {
+        fg->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x2C, 0x31, 0x3A, 245), 24.0f);
+        fg->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x00, 0xA4, 0xDC, 255), 24.0f, 0, 2.0f);
+    }
+    fg->AddText(font(), TEXT_M, ImVec2(x + (w - ts.x) * 0.5f, y + 10), IM_COL32(0xEC, 0xEE, 0xF1, 255), t.c_str());
+    const float bx = x + 24, by = y + h - 18;
+    fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + barW, by + barH), col::TRACK, barH * 0.5f);
+    if (fraction > 0.0f)
+        fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + barW * fraction, by + barH), accentMain(), barH * 0.5f);
+}
+
 void drawCrtOverlay(double time) {
     ImDrawList* fg = ImGui::GetForegroundDrawList();
     const float W = layout::SCREEN_W, H = layout::SCREEN_H;
@@ -2222,8 +2302,14 @@ void drawLoadedModel(ImDrawList* d, const ModelSlot& s, float cx, float cy, floa
         order.emplace_back((sz[i0] + sz[i1] + sz[i2]) * (1.0f / 3.0f), (uint32_t)t);
     }
     std::sort(order.begin(), order.end());
-    const size_t kMaxDrawn = 13000; // 3 vertices each: stays well inside one draw list's 16-bit indices
+    // Every triangle the loader accepts (kModelMaxTriangles) must be drawn: this list is sorted far to near,
+    // so dropping any would cut away the farthest part of the model along a straight line that sweeps
+    // across it as it turns (what a 13000 cap did to the 15-16k triangle Meshy controllers, whose
+    // double-sided materials keep every triangle). A single draw command is kept under the 16-bit vertex
+    // index range below instead; the draw list switches to a new vertex offset by itself beyond that.
+    const size_t kMaxDrawn = kModelMaxTriangles;
     if (order.size() > kMaxDrawn) order.erase(order.begin(), order.end() - (std::ptrdiff_t)kMaxDrawn);
+    const size_t kRunMax = 20000; // triangles per PrimReserve: 60000 vertices < 65536
 
     auto texOf = [&](uint32_t t) -> uint64_t {
         const int ti = m.materials[m.triMat[t]].tex;
@@ -2234,7 +2320,7 @@ void drawLoadedModel(ImDrawList* d, const ModelSlot& s, float cx, float cy, floa
     for (size_t i = 0; i < order.size();) {
         const uint64_t h = texOf(order[i].second);
         size_t j = i;
-        while (j < order.size() && texOf(order[j].second) == h) j++;
+        while (j < order.size() && j - i < kRunMax && texOf(order[j].second) == h) j++;
         if (pushed) { d->PopTexture(); pushed = false; }
         if (h) { d->PushTexture(ImTextureRef((ImTextureID)h)); pushed = true; }
         d->PrimReserve((int)(j - i) * 3, (int)(j - i) * 3);

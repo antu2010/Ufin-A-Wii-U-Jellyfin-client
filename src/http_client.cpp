@@ -347,3 +347,25 @@ bool http_open_stream(const std::string& host, int port, const std::string& path
         raw.append(buf, (size_t)n);
     }
 }
+
+int http_connect_tcp(const std::string& host, int port, int timeoutSeconds, std::string& error) {
+    struct sockaddr_in server;
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_port = htons((uint16_t)port);
+    if (!resolve_host(host, &server.sin_addr)) {
+        error = "could not resolve " + host;
+        return -1;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        error = "socket() failed";
+        return -1;
+    }
+    if (!connect_with_timeout(sock, server, timeoutSeconds)) {
+        close(sock);
+        error = "connect() failed or timed out connecting to " + host;
+        return -1;
+    }
+    return sock;
+}
