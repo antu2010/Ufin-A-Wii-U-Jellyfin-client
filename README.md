@@ -6,15 +6,15 @@ WIP jellyfin client for the Nintendo Wii U
 
 A native Jellyfin client for the Nintendo Wii U, because why not XD.
 
-**Beta v1.2.1.** Expect bugs, crashes, and probably the occasional Wii U death beep. (will be released in the following days)
+**Latest release: v1.3.** Ufin is now out of beta!
 
-> ⚠️ **Beta notice:** Music and video playback have been confirmed working on real Wii U hardware, Live TV has also been tested and confirmed working.
+>Music, video playback and Live TV have been confirmed working on real Wii U hardware.
 >
-> Ufin offers additional H.264 profiles, low-bandwidth 480p presets, and experimental 1080p30 streaming. The recommended playback path remains 720p30 H.264 Baseline or main + AAC, transcoded by the Jellyfin server.
+>Ufin supports multiple H.264 profiles, low-bandwidth 480p presets, and experimental 1080p30 streaming. The recommended playback path remains 720p30 H.264 Baseline or Main + AAC, transcoded by the Jellyfin server.
 >
-> Playback may stutter on poor or congested Wi-Fi. Ethernet is recommended for 1080p30 playback, which may buffer heavily over Wi-Fi.
+>Ethernet is recommended for experimental 1080p30 playback, which may buffer heavily over Wi-Fi. Playback performance can vary depending on network conditions.
 >
-> Bug reports and testing feedback are welcome, particularly from users with different network setups. Ufin will leave beta once testing provides sufficient confidence that no experience-breaking bugs remain.
+>Bug reports and testing feedback are still welcome, particularly from users with different network setups. Although Ufin is out of beta, there may still be bugs, and feedback helps improve compatibility and stability.
 ## Current status
 
 ### Tested and working on real hardware
@@ -59,6 +59,25 @@ A native Jellyfin client for the Nintendo Wii U, because why not XD.
 * ✅ New default BGM, made by me (its not great)
 * ✅ total usage time + easter egg
 * ✅ Automatic Update checker: checks github and lets you know if there is a new release to download manually
+* ✅ Material 3 Expressive theme with animated icons and buttons
+* ✅ Physical controller button animations, including nearby-button bounce effects
+* ✅ Custom accent colours and Material 3 Expressive shape customization
+* ✅ Automatic accent colour extraction from song and movie cover art in material 3 expressive
+* ✅ HTTPS connections, including self-signed certificate support
+* ✅ Plain and synchronised lyrics displayed on the GamePad and TV
+* ✅ Paginated music library with All Songs, Artists, Albums and Playlists tabs
+* ✅ Music library sorting
+* ✅ Playlist management: create playlists, add songs and remove songs
+* ✅ Up Next queue accessible from Now Playing for music, movies and TV
+* ✅ Queue management: play now, remove entries, reorder and clear
+* ✅ Add to Queue popup for browsing the music library during playback
+* ✅ Touch-based seeking using the movie progress bar, with a time bubble while holding
+* ✅ Change video quality and resolution during playback
+* ✅ Change audio and subtitle tracks from the movie remote
+* ✅ Access the Up Next queue on the GamePad during movie playback
+* ✅ Additional music visualizer styles: Classic, 3D Terrain, Radial and Wave
+* ❌ Sync Play
+* ❌ Wii U system inspired UI theme
 
 ### Implemented, but not yet fully tested on real hardware
 
