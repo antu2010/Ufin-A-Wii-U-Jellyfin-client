@@ -1,5 +1,6 @@
 #include "jellyfin_client.h"
 #include "version.h"
+#include "library_logic.h"
 #include "http_client.h"
 #include "video_size.h"
 #include "vendor/cJSON.h"
@@ -216,6 +217,20 @@ static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
         ji.seriesName = jsonString(item, "SeriesName");
         ji.seriesId = jsonString(item, "SeriesId");
         ji.childCount = jsonInt(item, "ChildCount", -1);
+        ji.dateCreated = jsonString(item, "DateCreated");
+        ji.premiereDate = jsonString(item, "PremiereDate");
+        ji.album = jsonString(item, "Album");
+        ji.playlistItemId = jsonString(item, "PlaylistItemId");
+        {
+            cJSON* cr = cJSON_GetObjectItem(item, "CommunityRating");
+            if (cJSON_IsNumber(cr)) ji.communityRating = (float)cr->valuedouble;
+            cJSON* kr = cJSON_GetObjectItem(item, "CriticRating");
+            if (cJSON_IsNumber(kr)) ji.criticRating = (float)kr->valuedouble;
+            ji.artist = jsonString(item, "AlbumArtist");
+            cJSON* artists = cJSON_GetObjectItem(item, "Artists");
+            if (ji.artist.empty() && cJSON_IsArray(artists) && cJSON_IsString(cJSON_GetArrayItem(artists, 0)))
+                ji.artist = cJSON_GetArrayItem(artists, 0)->valuestring;
+        }
         cJSON* userData = cJSON_GetObjectItem(item, "UserData");
         if (cJSON_IsObject(userData)) {
             cJSON* pos = cJSON_GetObjectItem(userData, "PlaybackPositionTicks");
@@ -225,6 +240,8 @@ static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
             cJSON* pct = cJSON_GetObjectItem(userData, "PlayedPercentage");
             if (cJSON_IsNumber(pct)) ji.playedPercentage = pct->valuedouble;
             ji.unplayedCount = jsonInt(userData, "UnplayedItemCount", -1);
+            ji.playCount = jsonInt(userData, "PlayCount", -1);
+            ji.lastPlayedDate = jsonString(userData, "LastPlayedDate");
         }
 
         // Artwork: own Primary image first, then the album's (songs),
@@ -477,6 +494,13 @@ static void parseTracks(cJSON* mediaStreams, VideoInfo& out) {
         if (t.index < 0) continue;
         (type == "Audio" ? out.audioTracks : out.subtitleTracks).push_back(t);
     }
+}
+
+bool JellyfinClient::getLyrics(const std::string& itemId, lyrics::Lyrics& out) {
+    out = lyrics::Lyrics{};
+    HttpResponse resp = http_get(host_, port_, "/Audio/" + itemId + "/Lyrics", authHeader());
+    if (!resp.success) return false;
+    return lyrics::parse(resp.body, out);
 }
 
 bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
@@ -790,4 +814,102 @@ bool JellyfinClient::reportPlaybackStopped(const std::string& itemId, int64_t po
                                            const PlaybackIds& ids) {
     return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Stopped", itemId,
                              positionTicks, true, ids, false);
+}
+
+
+// --- library queries, playlists (library_logic.h) ---
+
+static const char* QUERY_FIELDS = "&EnableImageTypes=Primary,Backdrop&ImageTypeLimit=1&EnableUserData=true"
+                                  "&Fields=DateCreated,PremiereDate";
+
+bool JellyfinClient::queryItems(const library::Query& q, std::vector<JellyfinItem>& out, int& total, bool append) {
+    library::Query use = q;
+    if (use.reversedPlaylist()) { use.startIndex = 0; use.limit = library::kMaxLoaded; }
+    std::string path = library::queryPath(use, user_id_, QUERY_FIELDS);
+    HttpResponse resp = http_get(host_, port_, path, authHeader());
+    if (!resp.success) {
+        last_error_ = "Loading the list failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        last_error_ = "could not parse the list";
+        return false;
+    }
+    std::vector<JellyfinItem> page;
+    parseItemsArray(cJSON_IsArray(json) ? json : cJSON_GetObjectItem(json, "Items"), page);
+    cJSON* tr = cJSON_GetObjectItem(json, "TotalRecordCount");
+    int count = cJSON_IsNumber(tr) ? tr->valueint : -1;
+    cJSON_Delete(json);
+    if (use.reversedPlaylist()) {
+        std::vector<JellyfinItem> rev(page.rbegin(), page.rend());
+        page.swap(rev);
+        count = (int)page.size();
+    }
+    if (!append) out.clear();
+    out.insert(out.end(), page.begin(), page.end());
+    // A server that sends no count: assume it is complete when the page came back short.
+    if (count < 0) count = (int)out.size() + ((use.limit > 0 && (int)page.size() >= use.limit) ? 1 : 0);
+    total = count;
+    return true;
+}
+
+library::Version JellyfinClient::serverVersion() {
+    if (version_checked_) return version_;
+    HttpResponse resp = http_get(host_, port_, "/System/Info/Public", "");
+    if (resp.success) {
+        cJSON* json = cJSON_Parse(resp.body.c_str());
+        if (json) {
+            version_ = library::parseVersion(jsonString(json, "Version"));
+            cJSON_Delete(json);
+        }
+        version_checked_ = true; // (a failed request is tried again next time)
+    }
+    return version_;
+}
+
+bool JellyfinClient::createPlaylist(const std::string& name, bool isPublic, const std::string& firstItemId,
+                                    std::string& newId) {
+    const library::Version v = serverVersion();
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "Name", name.c_str());
+    cJSON_AddStringToObject(body, "UserId", user_id_.c_str());
+    cJSON_AddStringToObject(body, "MediaType", "Audio");
+    cJSON* ids = cJSON_AddArrayToObject(body, "Ids");
+    if (!firstItemId.empty()) cJSON_AddItemToArray(ids, cJSON_CreateString(firstItemId.c_str()));
+    // Visibility only where the server has it (10.10+); never sent to one that does not.
+    if (library::supportsPlaylistVisibility(v)) cJSON_AddBoolToObject(body, "IsPublic", isPublic);
+    char* text = cJSON_PrintUnformatted(body);
+    const std::string payload = text ? text : "{}";
+    if (text) cJSON_free(text);
+    cJSON_Delete(body);
+    HttpResponse resp = http_post(host_, port_, "/Playlists", payload, "application/json", authHeader());
+    if (!resp.success) {
+        last_error_ = "The server refused the playlist (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    newId = json ? jsonString(json, "Id") : std::string();
+    if (json) cJSON_Delete(json);
+    return true;
+}
+
+bool JellyfinClient::addToPlaylist(const std::string& playlistId, const std::string& itemId) {
+    HttpResponse resp = http_post(host_, port_,
+                                  "/Playlists/" + playlistId + "/Items?ids=" + itemId + "&userId=" + user_id_, "",
+                                  "application/json", authHeader());
+    if (!resp.success) {
+        last_error_ = "Adding to the playlist failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    return true;
+}
+
+bool JellyfinClient::removeFromPlaylist(const std::string& playlistId, const std::string& entryId) {
+    HttpResponse resp = http_delete(host_, port_, "/Playlists/" + playlistId + "/Items?entryIds=" + entryId, authHeader());
+    if (!resp.success) {
+        last_error_ = "Removing from the playlist failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    return true;
 }

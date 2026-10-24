@@ -37,5 +37,63 @@ int main() {
     }
     CHECK(unique);
     CHECK_EQ(fromClassic(classic::STICK_R_UP), STICK_R_UP);
+
+    // Add to playlist: right stick up on GamePad / Pro / Classic, 1 + 2 on the Wii Remote (all one bit).
+    CHECK_EQ(ADD_TO_PLAYLIST, STICK_R_UP);
+    CHECK_EQ(fromKpad(EXT_PRO, 0, pro::STICK_R_UP), ADD_TO_PLAYLIST);
+    CHECK_EQ(fromKpad(EXT_CLASSIC, 0, classic::STICK_R_UP), ADD_TO_PLAYLIST);
+    CHECK_EQ(fromWiimote(wiimote::CHORD_ONE_TWO), ADD_TO_PLAYLIST);
+    // ... and no other button of any controller produces it
+    const uint32_t wm[] = {wiimote::LEFT, wiimote::RIGHT, wiimote::DOWN, wiimote::UP, wiimote::PLUS, wiimote::TWO,
+                           wiimote::ONE, wiimote::B, wiimote::A, wiimote::MINUS, wiimote::HOME};
+    for (uint32_t b : wm) CHECK((fromWiimote(b) & ADD_TO_PLAYLIST) == 0);
+    for (uint32_t b : proBits) CHECK((fromPro(b) & ADD_TO_PLAYLIST) == 0);
+
+    {   // The 1 + 2 chord.
+        ChordFilter f;
+        uint32_t t, h;
+        // both in one read -> one chord press, no 1 / 2
+        t = wiimote::ONE | wiimote::TWO; h = t;
+        f.step(t, h, 1000);
+        CHECK_EQ(t, wiimote::CHORD_ONE_TWO);
+        t = 0; h = wiimote::ONE | wiimote::TWO; // still down: nothing new
+        f.step(t, h, 1010);
+        CHECK_EQ(t, 0u);
+        t = 0; h = 0; f.step(t, h, 1020); // released
+        // 1 first, then 2 a frame later -> the chord, and 1 never fired
+        t = wiimote::ONE; h = wiimote::ONE;
+        f.step(t, h, 2000);
+        CHECK_EQ(t, 0u);
+        t = wiimote::TWO; h = wiimote::ONE | wiimote::TWO;
+        f.step(t, h, 2016);
+        CHECK_EQ(t, wiimote::CHORD_ONE_TWO);
+        t = 0; h = 0; f.step(t, h, 2100);
+        // 1 alone: held back, then let through after the window
+        t = wiimote::ONE; h = wiimote::ONE;
+        f.step(t, h, 3000);
+        CHECK_EQ(t, 0u);
+        t = 0; h = wiimote::ONE; f.step(t, h, 3020);
+        CHECK_EQ(t, 0u);
+        t = 0; h = wiimote::ONE; f.step(t, h, 3045);
+        CHECK_EQ(t, wiimote::ONE);
+        t = 0; h = wiimote::ONE; f.step(t, h, 3060); // not repeated
+        CHECK_EQ(t, 0u);
+        t = 0; h = 0; f.step(t, h, 3100);
+        // a quick tap (released inside the window) still counts as a press
+        t = wiimote::TWO; h = wiimote::TWO; f.step(t, h, 4000);
+        CHECK_EQ(t, 0u);
+        t = 0; h = 0; f.step(t, h, 4010);
+        CHECK_EQ(t, wiimote::TWO);
+        // 2 held long, then 1 much later: 2 already went through, so 1 is its own press
+        t = wiimote::TWO; h = wiimote::TWO; f.step(t, h, 5000);
+        t = 0; h = wiimote::TWO; f.step(t, h, 5050);
+        CHECK_EQ(t, wiimote::TWO);
+        t = wiimote::ONE; h = wiimote::ONE | wiimote::TWO; f.step(t, h, 5500);
+        CHECK_EQ(t & wiimote::CHORD_ONE_TWO, 0u);
+        t = 0; h = 0; f.step(t, h, 5600);
+        // other buttons are never delayed
+        t = wiimote::A | wiimote::PLUS; h = t; f.step(t, h, 6000);
+        CHECK_EQ(t, wiimote::A | wiimote::PLUS);
+    }
     return check::finish("test_input_map");
 }

@@ -142,6 +142,16 @@ void AudioVisualizer::update(const int16_t* samples, int count, int sampleRate, 
         }
 
         double rms = bins > 0 ? std::sqrt(energy / (double)bins) : 0.0;
+        if (bins == 0) {
+            // A low band narrower than one FFT bin (the second bar: ~56-90 Hz is less than the 47 Hz bin spacing
+            // allows) contains no whole bin and used to stay at zero forever. Read the spectrum at the band's
+            // centre instead, interpolating between its two neighbouring bins.
+            const double fc = std::sqrt(f0 * f1) / binHz;
+            const int k0 = std::max(1, std::min(FFT_SIZE / 2 - 2, (int)std::floor(fc)));
+            const double frac = std::max(0.0, std::min(1.0, fc - (double)k0));
+            const double a0 = binAmplitude(re[k0], im[k0], FFT_SIZE), a1 = binAmplitude(re[k0 + 1], im[k0 + 1], FFT_SIZE);
+            rms = a0 * (1.0 - frac) + a1 * frac;
+        }
 
         // Express each band's energy in dB relative to digital full scale.
         // This gives useful movement over normal music's very large dynamic

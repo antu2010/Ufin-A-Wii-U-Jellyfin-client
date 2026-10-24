@@ -40,6 +40,15 @@ uint64_t createSnapshotTexture(const GX2ColorBuffer* src, bool asRenderTarget = 
 //        and scissor (the caller still follows with ImDrawCallback_ResetRenderState)
 bool copyColorBufferToSnapshot(uint64_t handle, GX2ColorBuffer* src, int stage = 5);
 
+// Liquid Glass frost: a colour buffer + texture of `like`'s size shifted right by `shift` (1 = half, 2 = quarter...),
+// released with releaseTexture(). 0 if it cannot be created.
+uint64_t createBlurTarget(const GX2ColorBuffer* like, int shift);
+// Blurs the snapshot: shrinks it through `chain` (`downsteps` targets, each half the size of the one before), then runs
+// `passes` (even, 0..4) smoothing passes at that size, ping-ponging with `scratch` (a target of the last one's size). The
+// blurred picture ends up in chain[downsteps - 1]. Then binds `display` as the render target again. Called from the
+// snapshot callback, right after copyColorBufferToSnapshot().
+void blurSnapshot(uint64_t snapshot, const uint64_t* chain, int downsteps, uint64_t scratch, int passes, GX2ColorBuffer* display);
+
 // Only between frames: ui::Gfx::frame() ends with GX2DrawDone, so the
 // GPU is finished with every texture once it returns.
 void releaseTexture(uint64_t handle);

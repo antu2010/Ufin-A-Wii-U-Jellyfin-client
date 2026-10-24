@@ -8,10 +8,9 @@ struct HttpResponse {
     bool success = false; // true if we got a 2xx status back (206 Partial Content included)
 };
 
-// Minimal HTTP/1.1 client built directly on BSD sockets. No TLS support --
-// this is meant for talking to a Jellyfin server over plain http:// on
-// your LAN, same as your N100 box. If you ever need https://, this client
-// won't work as-is (would need mbedtls-wup wired in).
+// Minimal HTTP/1.1 client built directly on BSD sockets. A Jellyfin server
+// that was set up for https (net::setServerTls, net_conn.h) is spoken to
+// over TLS by the same calls; every other one in plain http://, as ever.
 //
 // extra_headers, if provided, must be pre-formatted with a trailing
 // "\r\n" per header line, e.g. "X-Custom: value\r\n". Range requests

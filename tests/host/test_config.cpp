@@ -236,11 +236,44 @@ int main() {
     CHECK_STR(tok.menuMusicItemId, "song");
     CHECK_STR(tok.menuMusicName, "Tune");
     CHECK(tok.crt);
+    {
+        // Settings > Restore default menu music: only the song choice goes (what the action does to the config),
+        // the rest survives a save + load, and the default stays selected after a restart.
+        UfinConfig r = tok, back;
+        r.accent = 3; r.menuMusicEnabled = true;
+        r.menuMusicItemId.clear();
+        r.menuMusicName.clear();
+        std::string pR = writeTemp("bgmrestore", "{}");
+        CHECK(saveConfigToFile(pR.c_str(), r, err));
+        CHECK(loadConfigFromFile(pR.c_str(), back, err));
+        CHECK(back.menuMusicItemId.empty() && back.menuMusicName.empty());
+        CHECK(back.menuMusicEnabled);
+        CHECK(back.crt && back.accent == 3);
+        CHECK_STR(back.accessToken, "t0k");
+    }
     CHECK_EQ(tok.accent, 0); // look & feel defaults when absent
     CHECK_EQ(tok.backgroundEffect, 0);
     CHECK(!tok.lightMode);
     CHECK(!tok.snow);
     CHECK(!tok.liquidGlass); // Liquid Glass UI is opt-in: off unless the setting says otherwise
+    CHECK(!tok.m3Expressive); // so is Material 3 Expressive: Plain is the default style
+    {
+        UfinConfig m3;
+        std::string pM = writeTemp("m3on", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"m3_expressive\":true}");
+        CHECK(loadConfigFromFile(pM.c_str(), m3, err));
+        CHECK(m3.m3Expressive && !m3.liquidGlass);
+        // Both set by hand: exactly one style survives -- Liquid Glass, the older one.
+        UfinConfig both;
+        std::string pB = writeTemp("m3both", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"liquid_glass\":true,\"m3_expressive\":true}");
+        CHECK(loadConfigFromFile(pB.c_str(), both, err));
+        CHECK(both.liquidGlass && !both.m3Expressive);
+        // M3E alone round-trips through save + load.
+        UfinConfig save = m3, back;
+        std::string pS = writeTemp("m3save", "{}");
+        CHECK(saveConfigToFile(pS.c_str(), save, err));
+        CHECK(loadConfigFromFile(pS.c_str(), back, err));
+        CHECK(back.m3Expressive && !back.liquidGlass);
+    }
     CHECK(!tok.glassDebug);
     CHECK(tok.glassRefraction);   // real refraction is on by default (it only matters once Liquid Glass is on)...
     CHECK_EQ(tok.glassRefractionStage, 6); // ...at stage 6, the lowest that works on real hardware (3-5 blank the UI)
@@ -265,6 +298,28 @@ int main() {
         CHECK(loadConfigFromFile(pHi.c_str(), hi, err));
         CHECK_EQ(hi.glassRefractionStage, 7);   // 7 is the highest rung of the bring-up ladder
         CHECK(hi.glassRefraction);  // (a stage alone does not turn it off)
+        {
+            UfinConfig vg; CHECK_EQ(vg.visualizerGlass, 0);
+            for (int v : {0, 1, 2}) {
+                UfinConfig c2;
+                std::string pv = writeTemp("visglass", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"visualizer_glass\":" + std::to_string(v) + "}");
+                CHECK(loadConfigFromFile(pv.c_str(), c2, err));
+                CHECK_EQ(c2.visualizerGlass, v);
+            }
+            {
+                UfinConfig g0; CHECK_EQ(g0.glassBlur, 1);
+                for (int v : {-3, 0, 4, 99}) {
+                    UfinConfig c3;
+                    std::string pg = writeTemp("glassblur", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_blur\":" + std::to_string(v) + "}");
+                    CHECK(loadConfigFromFile(pg.c_str(), c3, err));
+                    CHECK_EQ(c3.glassBlur, v < 0 ? 0 : (v > 3 ? 3 : v));
+                }
+            }
+            UfinConfig bad;
+            std::string pb = writeTemp("visglassbad", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"visualizer_glass\":9}");
+            CHECK(loadConfigFromFile(pb.c_str(), bad, err));
+            CHECK_EQ(bad.visualizerGlass, 0); // unknown value: the default
+        }
         UfinConfig offc;
         std::string pOffc = writeTemp("refroff", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"glass_refraction\":false}");
         CHECK(loadConfigFromFile(pOffc.c_str(), offc, err));
@@ -282,6 +337,96 @@ int main() {
     CHECK(tok.skippedUpdateVersion.empty()); // nothing skipped by default
     CHECK(tok.checkForUpdates);     // the startup update check is on by default
     CHECK(!tok.gamepadOffInVideo);
+    // An older config.json (none of the customisation keys) loads with safe defaults.
+    CHECK(!tok.customPalette);
+    CHECK_EQ(tok.customColor[0], 0x00A4DCu); CHECK_EQ(tok.customColor[1], 0x0B7FB0u); CHECK_EQ(tok.customColor[2], 0xAA5CC3u);
+    CHECK_EQ(tok.customArrange, 0);
+    CHECK(!tok.artworkAccent);
+    CHECK(!tok.customShapes);
+    for (int i = 0; i < 4; i++) CHECK_EQ(tok.buttonShape[i], 0);
+    for (int i = 0; i < 8; i++) CHECK_EQ(tok.buttonSize[i], 100);
+    CHECK(tok.tlsServers.empty());
+    {   // https servers: loaded with their pin, a damaged pin / entry is dropped to "no pin" / skipped
+        UfinConfig ts;
+        const std::string fp(64, 'A');
+        std::string ps = writeTemp("tls", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"tls_servers\":["
+            "{\"host\":\"192.168.1.5\",\"port\":8920,\"pin\":\"" + fp + "\"},"
+            "{\"host\":\"jelly.example.com\",\"port\":443},"
+            "{\"host\":\"bad.pin\",\"port\":443,\"pin\":\"not a fingerprint\"},"
+            "{\"host\":\"\",\"port\":443},{\"host\":\"x\",\"port\":0},{\"port\":443},7]}");
+        CHECK(loadConfigFromFile(ps.c_str(), ts, err));
+        CHECK_EQ(ts.tlsServers.size(), (size_t)3);
+        CHECK_STR(ts.tlsServers[0].host, "192.168.1.5"); CHECK_EQ(ts.tlsServers[0].port, 8920); CHECK_STR(ts.tlsServers[0].pin, std::string(64, 'a'));
+        CHECK_STR(ts.tlsServers[1].host, "jelly.example.com"); CHECK(ts.tlsServers[1].pin.empty());
+        CHECK(ts.tlsServers[2].pin.empty());
+        CHECK(findTlsServer(ts.tlsServers, "JELLY.example.com", 443) != nullptr);
+        CHECK(findTlsServer(ts.tlsServers, "jelly.example.com", 8920) == nullptr);
+        // round trip
+        std::string rt = writeTemp("tls_rt", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\"}");
+        UfinConfig a;
+        CHECK(loadConfigFromFile(rt.c_str(), a, err));
+        setTlsServer(a.tlsServers, "srv", 8920, true, std::string(64, 'b'));
+        setTlsServer(a.tlsServers, "SRV", 8920, true, std::string(64, 'c')); // same server: updated, not added
+        setTlsServer(a.tlsServers, "plain", 8096, false, "");                  // not https: nothing to remove / add
+        CHECK_EQ(a.tlsServers.size(), (size_t)1);
+        CHECK(saveConfigToFile(rt.c_str(), a, err));
+        UfinConfig b;
+        CHECK(loadConfigFromFile(rt.c_str(), b, err));
+        CHECK_EQ(b.tlsServers.size(), (size_t)1); CHECK_STR(b.tlsServers[0].pin, std::string(64, 'c'));
+        setTlsServer(b.tlsServers, "srv", 8920, false, "");                    // back to http: the entry goes
+        CHECK(b.tlsServers.empty());
+        CHECK(saveConfigToFile(rt.c_str(), b, err));
+        UfinConfig c2;
+        CHECK(loadConfigFromFile(rt.c_str(), c2, err));
+        CHECK(c2.tlsServers.empty());
+    }
+    {   // sizes: 60..130 load, anything else (out of range, wrong type, short array) is the normal size
+        UfinConfig sz;
+        std::string ps = writeTemp("sizes", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"button_sizes\":[60,130,75,59,131,\"x\",90]}");
+        CHECK(loadConfigFromFile(ps.c_str(), sz, err));
+        CHECK_EQ(sz.buttonSize[0], 60); CHECK_EQ(sz.buttonSize[1], 130); CHECK_EQ(sz.buttonSize[2], 75);
+        CHECK_EQ(sz.buttonSize[3], 100); CHECK_EQ(sz.buttonSize[4], 100); CHECK_EQ(sz.buttonSize[5], 100);
+        CHECK_EQ(sz.buttonSize[6], 90); CHECK_EQ(sz.buttonSize[7], 100);
+        std::string pt = writeTemp("sizes2", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"button_sizes\":5}");
+        CHECK(loadConfigFromFile(pt.c_str(), sz, err));
+        for (int i = 0; i < 8; i++) CHECK_EQ(sz.buttonSize[i], 100);
+    }
+    {   // shapes: valid values load, nonsense (out of range, wrong type, scalloped on dialog buttons) falls back to 0
+        UfinConfig sh;
+        std::string ps = writeTemp("shapes", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"custom_shapes\":true,\"button_shapes\":[6,2,99,5]}");
+        CHECK(loadConfigFromFile(ps.c_str(), sh, err));
+        CHECK(sh.customShapes);
+        CHECK_EQ(sh.buttonShape[0], 6); CHECK_EQ(sh.buttonShape[1], 2); CHECK_EQ(sh.buttonShape[2], 0); CHECK_EQ(sh.buttonShape[3], 0);
+        std::string pt = writeTemp("shapes2", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"button_shapes\":\"x\"}");
+        CHECK(loadConfigFromFile(pt.c_str(), sh, err));
+        for (int i = 0; i < 4; i++) CHECK_EQ(sh.buttonShape[i], 0);
+    }
+    {   // Hand-edited / damaged values never break the load: bad colours keep their default, a bad arrangement is 0.
+        UfinConfig bad;
+        std::string pb = writeTemp("custombad", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\","
+                                   "\"custom_palette\":true,\"custom_colors\":[\"#FF0000\",\"nope\",42],\"custom_arrange\":99,\"artwork_accent\":true}");
+        CHECK(loadConfigFromFile(pb.c_str(), bad, err));
+        CHECK(bad.customPalette);
+        CHECK_EQ(bad.customColor[0], 0xFF0000u);
+        CHECK_EQ(bad.customColor[1], 0x0B7FB0u);
+        CHECK_EQ(bad.customColor[2], 0xAA5CC3u);
+        CHECK_EQ(bad.customArrange, 0);
+        CHECK(bad.artworkAccent);
+        UfinConfig notArray;
+        std::string pn = writeTemp("customnotarray", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"custom_colors\":\"#FF0000\",\"custom_arrange\":-1}");
+        CHECK(loadConfigFromFile(pn.c_str(), notArray, err));
+        CHECK_EQ(notArray.customColor[0], 0x00A4DCu);
+        CHECK_EQ(notArray.customArrange, 0);
+        // The newer background effects (Aurora..Waves) are no longer reset to Off on load.
+        UfinConfig bg;
+        std::string pg = writeTemp("bgeffect", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"background_effect\":11}");
+        CHECK(loadConfigFromFile(pg.c_str(), bg, err));
+        CHECK_EQ(bg.backgroundEffect, 11);
+        std::string pg2 = writeTemp("bgeffect2", "{\"host\":\"h\",\"port\":1,\"username\":\"u\",\"password\":\"p\",\"background_effect\":12}");
+        CHECK(loadConfigFromFile(pg2.c_str(), bg, err));
+        CHECK_EQ(bg.backgroundEffect, 0);
+    }
+    CHECK(!tok.alwaysDefaultTracks); // the first-play audio & subtitle prompt is on by default
     UfinConfig noHost = tok;
     noHost.host.clear();
     CHECK(!hasLogin(noHost));
@@ -305,6 +450,7 @@ int main() {
         c.lightMode = true;
         c.snow = true;
         c.liquidGlass = true;
+        c.m3Expressive = true; // (both set by hand: saving keeps Liquid Glass only -- one style at a time)
         c.glassDebug = true;
         c.glassRefraction = true;
         c.glassRefractionStage = 2;
@@ -312,8 +458,16 @@ int main() {
         c.rainbowUnlocked = true;
         c.autoplayNext = false;
         c.gamepadOffInVideo = true;
+        c.alwaysDefaultTracks = true;
         c.checkForUpdates = false;
         c.skippedUpdateVersion = "1.3.1";
+        c.customPalette = true;
+        c.customColor[0] = 0x123456; c.customColor[1] = 0xABCDEF; c.customColor[2] = 0x000001;
+        c.customArrange = 4;
+        c.artworkAccent = true;
+        c.customShapes = true;
+        c.buttonShape[0] = 4; c.buttonShape[1] = 6; c.buttonShape[2] = 1; c.buttonShape[3] = 3;
+        for (int i = 0; i < 8; i++) c.buttonSize[i] = i == 7 ? 112 : 60 + i * 10;
         CHECK(saveConfigToFile(path.c_str(), c, err));
         UfinConfig back;
         CHECK(loadConfigFromFile(path.c_str(), back, err));
@@ -327,6 +481,7 @@ int main() {
         CHECK(back.lightMode);
         CHECK(back.snow);
         CHECK(back.liquidGlass);
+        CHECK(!back.m3Expressive);
         CHECK(back.glassDebug);
         CHECK(back.glassRefraction);
         CHECK_EQ(back.glassRefractionStage, 2);
@@ -334,6 +489,16 @@ int main() {
         CHECK(back.rainbowUnlocked);
         CHECK(!back.autoplayNext);
         CHECK(back.gamepadOffInVideo);
+        CHECK(back.alwaysDefaultTracks);
+        CHECK(back.customPalette);
+        CHECK_EQ(back.customColor[0], 0x123456u); CHECK_EQ(back.customColor[1], 0xABCDEFu); CHECK_EQ(back.customColor[2], 0x000001u);
+        CHECK_EQ(back.customArrange, 4);
+        CHECK(back.artworkAccent);
+        CHECK(back.customShapes);
+        CHECK_EQ(back.buttonShape[0], 4); CHECK_EQ(back.buttonShape[1], 6); CHECK_EQ(back.buttonShape[2], 1); CHECK_EQ(back.buttonShape[3], 3);
+        for (int i = 0; i < 8; i++) CHECK_EQ(back.buttonSize[i], i == 7 ? 112 : 60 + i * 10);
+        CHECK(back.paletteEdited);  // (non-default colours were chosen by the user)
+        CHECK(!tok.paletteEdited);
         CHECK(back.skippedUpdateVersion == "1.3.1"); // "Don't remind me for this release" survives
         CHECK(!back.checkForUpdates);  // turning the update check off survives a save and a load
         CHECK_STR(back.password, "");

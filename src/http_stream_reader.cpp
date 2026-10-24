@@ -16,109 +16,16 @@
 #include <chrono>
 #include <coreinit/debug.h>
 
-static bool resolveHost(const std::string& host, struct in_addr* out) {
-    if (inet_pton(AF_INET, host.c_str(), out) == 1) return true;
-    struct hostent* he = gethostbyname(host.c_str());
-    if (!he || !he->h_addr_list || !he->h_addr_list[0]) return false;
-    memcpy(out, he->h_addr_list[0], sizeof(struct in_addr));
-    return true;
-}
-
 static std::string toLower(const std::string& s) {
     std::string out = s;
     for (auto& c : out) c = (char)tolower((unsigned char)c);
     return out;
 }
 
-// wut doesn't expose SO_RCVTIMEO (confirmed earlier -- it fails to
-// compile), so timeouts are done manually via select() instead: wait for
-// the socket to become readable before ever calling the blocking recv().
-// Without this, a slow-to-respond server (plausible here -- Jellyfin has
-// to spin up FFmpeg and start actually encoding before the first
-// response bytes exist) leaves us blocked in recv() indefinitely, which
-// is what appears to be crashing Cemu and freezing real hardware. This
-// turns that into a clean, visible timeout error instead.
-static bool waitReadable(int sock, int timeoutSeconds) {
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(sock, &readSet);
-
-    struct timeval tv;
-    tv.tv_sec = timeoutSeconds;
-    tv.tv_usec = 0;
-
-    int result = select(sock + 1, &readSet, nullptr, nullptr, &tv);
-    return result > 0;
-}
-
-enum class WaitResult { Readable, TimedOut, Aborted };
-
-// waitReadable() with an optional way out: with an abort check, the wait runs
-// in 50 ms slices and the check is polled between them, so a long wait (see
-// HttpStreamReader::setStartupTimeoutSeconds) never leaves the user stuck on a
-// loading screen. Without one it is exactly the single select() it always was.
-static WaitResult waitReadableOrAbort(int sock, int timeoutSeconds, const std::function<bool()>& abortCheck) {
-    if (!abortCheck) return waitReadable(sock, timeoutSeconds) ? WaitResult::Readable : WaitResult::TimedOut;
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
-    while (true) {
-        if (abortCheck()) return WaitResult::Aborted;
-
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        FD_SET(sock, &readSet);
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 50 * 1000;
-        int result = select(sock + 1, &readSet, nullptr, nullptr, &tv);
-        if (result > 0) return WaitResult::Readable;
-        if (result < 0 && errno != EINTR) return WaitResult::TimedOut; // select itself failed: same as before, "not readable"
-        if (std::chrono::steady_clock::now() >= deadline) return WaitResult::TimedOut;
-    }
-}
-
-// The comment above explains why recv() needed a manual timeout;
-// connect() has exactly the same problem and never got the same fix --
-// a plain blocking connect() left blocked by a stalled handshake (no
-// SYN-ACK, no RST, nothing) hangs indefinitely with no error and nothing
-// to OSReport, same as recv() used to. Bounded the same way: non-blocking
-// connect() + select() on the write side, then restore blocking mode.
-static bool connectWithTimeout(int sock, const struct sockaddr_in& server, int timeoutSeconds) {
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    int rc = connect(sock, (const struct sockaddr*)&server, sizeof(server));
-    if (rc == 0) {
-        fcntl(sock, F_SETFL, flags);
-        return true;
-    }
-    if (errno != EINPROGRESS) {
-        fcntl(sock, F_SETFL, flags);
-        return false;
-    }
-
-    fd_set writeSet;
-    FD_ZERO(&writeSet);
-    FD_SET(sock, &writeSet);
-    struct timeval tv;
-    tv.tv_sec = timeoutSeconds;
-    tv.tv_usec = 0;
-    int sel = select(sock + 1, nullptr, &writeSet, nullptr, &tv);
-    fcntl(sock, F_SETFL, flags);
-    if (sel <= 0) return false;
-
-    int soErr = 0;
-    socklen_t errLen = sizeof(soErr);
-    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &errLen) < 0 || soErr != 0) return false;
-    return true;
-}
-
 HttpStreamReader::HttpStreamReader(std::string host, int port, std::string path)
     : host_(std::move(host)), port_(port), path_(std::move(path)) {}
 
-HttpStreamReader::~HttpStreamReader() {
-    if (sock_ >= 0) close(sock_);
-}
+HttpStreamReader::~HttpStreamReader() { conn_.close(); }
 
 bool HttpStreamReader::fillSockBuf() {
     if (sock_buf_pos_ < sock_buf_len_) return true; // still have unconsumed bytes
@@ -127,27 +34,27 @@ bool HttpStreamReader::fillSockBuf() {
     // transcode start-up, but still finite -- if this is ever too short/long
     // in practice, this constant is the first thing to tune. The very first
     // wait after the request can be given longer (setStartupTimeoutSeconds)
-    // and be cancelled (setAbortCheck); see open().
-    const WaitResult waited = waitReadableOrAbort(sock_, wait_seconds_, wait_abortable_ ? abort_check_ : std::function<bool()>());
-    if (waited == WaitResult::Aborted) {
+    // and be cancelled (setAbortCheck); see open(). (wut has no SO_RCVTIMEO,
+    // so the wait is a select() inside net::Conn -- over TLS too.)
+    sock_buf_.resize(4096);
+    const std::function<bool()>* abort = (wait_abortable_ && abort_check_) ? &abort_check_ : nullptr;
+    const int n = conn_.recv(sock_buf_.data(), (int)sock_buf_.size(), wait_seconds_, abort);
+    if (n == net::Conn::Aborted) {
         cancelled_ = true;
         fill_error_ = "cancelled";
         last_error_ = "cancelled while waiting for the server";
         return false;
     }
-    if (waited == WaitResult::TimedOut) {
+    if (n == net::Conn::TimedOut) {
         fill_error_ = "timed out after " + std::to_string(wait_seconds_) + "s";
         last_error_ = "timed out waiting for data from server (" + std::to_string(wait_seconds_) + "s)";
         return false;
     }
-
-    sock_buf_.resize(4096);
-    ssize_t n = recv(sock_, sock_buf_.data(), sock_buf_.size(), 0);
     if (n <= 0) {
         // 0 = peer closed, <0 = error -- both mean "no more data" to the
         // caller, but they are different stories in the log.
         fill_error_ = n == 0 ? "connection closed by the server"
-                             : "recv() failed (errno " + std::to_string(errno) + ")";
+                             : (conn_.secure() ? std::string("TLS read failed") : "recv() failed (errno " + std::to_string(errno) + ")");
         return false;
     }
     sock_buf_len_ = (size_t)n;
@@ -195,37 +102,22 @@ bool HttpStreamReader::open() {
         OSReport("Ufin: GET %s\n", shown.c_str());
     }
 
-    struct in_addr addr;
-    if (!resolveHost(host_, &addr)) {
-        last_error_ = "could not resolve host: " + host_;
-        OSReport("Ufin: resolveHost failed for %s\n", host_.c_str());
-        return false;
+    {
+        std::string openError;
+        if (!conn_.open(host_, port_, 15, openError)) {
+            last_error_ = openError.rfind("could not resolve", 0) == 0 ? "could not resolve host: " + host_
+                          : openError.rfind("connect() failed", 0) == 0 ? "connect() failed or timed out connecting to " + host_
+                                                                         : openError;
+            OSReport("Ufin: connect failed: %s\n", last_error_.c_str());
+            return false;
+        }
+        OSReport("Ufin: connect() ok%s\n", conn_.secure() ? " (TLS)" : "");
     }
-    OSReport("Ufin: resolveHost ok\n");
-
-    sock_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_ < 0) {
-        last_error_ = "socket() failed";
-        OSReport("Ufin: socket() failed\n");
-        return false;
-    }
-    OSReport("Ufin: socket() ok, fd=%d\n", sock_);
-
-    struct sockaddr_in server{};
-    server.sin_family = AF_INET;
-    server.sin_port = htons((uint16_t)port_);
-    server.sin_addr = addr;
-
-    if (!connectWithTimeout(sock_, server, 15)) {
-        last_error_ = "connect() failed or timed out connecting to " + host_;
-        OSReport("Ufin: connect() failed or timed out\n");
-        return false;
-    }
-    OSReport("Ufin: connect() ok\n");
 
     // Deliberately NOT sending "Connection: close" here -- the whole
     // point of this class is to keep the connection open and keep
     // reading as Jellyfin generates more of the transcode.
+    const std::string hostHeader = (conn_.secure() && port_ != 443) ? host_ + ":" + std::to_string(port_) : host_;
     char request[4096];
     snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
@@ -233,19 +125,14 @@ bool HttpStreamReader::open() {
         "Accept: */*\r\n"
         "Connection: keep-alive\r\n"
         "\r\n",
-        path_.c_str(), host_.c_str());
+        path_.c_str(), hostHeader.c_str());
 
     std::string req(request);
     OSReport("Ufin: sending request, %zu bytes\n", req.size());
-    size_t sent = 0;
-    while (sent < req.size()) {
-        ssize_t n = send(sock_, req.c_str() + sent, req.size() - sent, 0);
-        if (n <= 0) {
-            last_error_ = "send() failed";
-            OSReport("Ufin: send() failed at offset %zu\n", sent);
-            return false;
-        }
-        sent += (size_t)n;
+    if (!conn_.sendAll(req.data(), req.size())) {
+        last_error_ = "send() failed";
+        OSReport("Ufin: send() failed\n");
+        return false;
     }
     OSReport("Ufin: request sent ok\n");
 
@@ -290,7 +177,7 @@ bool HttpStreamReader::open() {
         std::string line;
         while (readLine(line) && !line.empty()) {}
         std::string body;
-        if (sock_buf_pos_ < sock_buf_len_ || waitReadable(sock_, 2)) {
+        if (sock_buf_pos_ < sock_buf_len_ || conn_.waitReadable(2)) {
             if (fillSockBuf()) {
                 size_t avail = sock_buf_len_ - sock_buf_pos_;
                 body.assign((const char*)sock_buf_.data() + sock_buf_pos_,

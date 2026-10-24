@@ -5,6 +5,8 @@
 #include <padscore/wpad.h>
 #include <vpad/input.h>
 
+#include <coreinit/time.h>
+
 #include <cstring>
 
 // The tables in input_map.h are copies of wut's values: check them.
@@ -40,6 +42,7 @@ namespace input {
 static KPADStatus g_kpad[4];
 static bool g_connected[4] = {false, false, false, false};
 static uint32_t g_kpadHold[4] = {0, 0, 0, 0};
+static pad::ChordFilter g_chord[4]; // 1 + 2 together, per Wii Remote
 static int g_last = 4;
 static bool g_inited = false;
 
@@ -98,6 +101,7 @@ State read() {
                 g_connected[c] = true;
                 uint32_t coreHold = s.extensionType == WPAD_EXT_PRO_CONTROLLER ? 0 : s.hold;
                 uint32_t coreTrig = s.extensionType == WPAD_EXT_PRO_CONTROLLER ? 0 : s.trigger;
+                g_chord[c].step(coreTrig, coreHold, (uint32_t)OSTicksToMilliseconds(OSGetTime()));
                 g_kpadHold[c] = pad::fromKpad(s.extensionType, coreHold, extButtons(s, false));
                 uint32_t trig = pad::fromKpad(s.extensionType, coreTrig, extButtons(s, true));
                 st.trigger |= trig;
@@ -114,6 +118,12 @@ State read() {
 }
 
 int lastController() { return g_last; }
+
+bool lastIsWiiRemote() {
+    if (g_last < 0 || g_last > 3 || !g_connected[g_last]) return false;
+    const uint8_t t = g_kpad[g_last].extensionType;
+    return t != WPAD_EXT_PRO_CONTROLLER && t != WPAD_EXT_CLASSIC && t != WPAD_EXT_MPLUS_CLASSIC;
+}
 
 const KPADStatus* kpad(int channel) {
     if (channel < 0 || channel > 3 || !g_connected[channel]) return nullptr;

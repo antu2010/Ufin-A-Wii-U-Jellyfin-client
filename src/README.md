@@ -72,9 +72,11 @@ the Wii U menu.
 
 ## Known limitations / things we'll hit next
 
-- **No TLS.** The HTTP client is raw sockets, plain `http://` only. Fine
-  for your local Jellyfin server, would need mbedtls-wup wired in for
-  `https://`.
+- **No TLS for Jellyfin.** The HTTP client is raw sockets, plain `http://`
+  only. Fine for your local Jellyfin server; an `https://` server address is
+  rejected. (The startup update check, `https_client.cpp`, is the one place
+  that speaks HTTPS: GitHub requires it, and it uses its own TLS 1.2 client,
+  vendored Mbed TLS, with built-in root certificates and its own DNS lookup.)
 - **No chunked transfer-encoding support** in the HTTP client. Jellyfin's
   JSON endpoints normally send `Content-Length`, so this should be fine for
   browsing, but flag it if a response looks truncated.

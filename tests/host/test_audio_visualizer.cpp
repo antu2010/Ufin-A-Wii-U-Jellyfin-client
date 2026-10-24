@@ -156,6 +156,20 @@ int main() {
         CHECK(allZero);
     }
 
+    // Every bar can move: a tone at the centre of each band lights that band. (The second bar, ~56-90 Hz, is
+    // narrower than one FFT bin and used to stay at zero whatever played.)
+    for (int rate : {48000, 44100}) {
+        const double lo = 35.0, hi = 10000.0;
+        for (int band = 0; band < AudioVisualizer::BANDS; band++) {
+            const double f0 = lo * std::pow(hi / lo, (double)band / AudioVisualizer::BANDS);
+            const double f1 = lo * std::pow(hi / lo, (double)(band + 1) / AudioVisualizer::BANDS);
+            AudioVisualizer viz;
+            auto tone = makeTone(std::sqrt(f0 * f1), rate, 1024);
+            for (int i = 0; i < 60; i++) viz.update(tone.data(), (int)tone.size(), rate, 1.0 / 60.0);
+            CHECK(viz.levels()[band] > 0.05f);
+        }
+    }
+
     // A wildly out-of-range dt (e.g. a stall) is clamped internally
     // rather than producing NaN/inf levels.
     {

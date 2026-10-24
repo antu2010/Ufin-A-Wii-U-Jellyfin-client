@@ -87,31 +87,38 @@ inline std::vector<Row> rowsFor(Controller c) {
     head("Browsing");
     if (remote) {
         add("D-pad / Nunchuk stick", "Move; hold to scroll fast", DPAD | NUN_STICK);
-        add("Left / Right", "Switch between the sidebar and the list", DPAD);
-        add("Nunchuk C / Z", "Page up / page down", NUN_C | NUN_Z);
+        add("Left / Right", "Sidebar / list; Right in a list reaches Sort and New playlist", DPAD);
+        add("Nunchuk C / Z", "Page up / down; in a music library: switch view", NUN_C | NUN_Z);
         add("A", "Open / play", A);
         add("B", "Back; from the top level, to the sidebar", B);
         add("1", "Search", ONE);
         add("2", "Favourite / unfavourite", TWO);
+        add("1 + 2 together", "Add a song to a playlist (or remove it there); songs, movies, albums, shows: add to Up Next", ONE | TWO);
         add("+", "Shuffle the selected album or playlist", PLUS);
         add("-", "Use the selected song as menu music", MINUS);
     } else {
         add("D-pad / left stick", "Move; hold to scroll fast", DPAD | STICK_L);
-        add("Left / Right", "Switch between the sidebar and the list", DPAD);
-        add("L / R", "Page up / page down", L | R);
+        add("Left / Right", "Sidebar / list; Right in a list reaches Sort and New playlist", DPAD);
+        add("L / R", "Page up / down; in a music library: switch view", L | R);
         add("A", "Open / play", A);
         add("B", "Back; from the top level, to the sidebar", B);
         add("X", "Search", X);
         add("Y", "Favourite / unfavourite", Y);
         add("ZL", "Mark watched / unwatched", ZL);
         add("ZR", "Refresh the list", ZR);
+        add("Right stick up", "Add a song to a playlist (or remove it there); songs, movies, albums, shows: add to Up Next", STICK_R);
         add("+", "Shuffle the selected album or playlist", PLUS);
         add("-", "Use the selected song as menu music", MINUS);
     }
-    if (gamepad) add("Touch", "Tap a sidebar entry or a row", TOUCH);
+    if (gamepad) add("Touch", "Tap a sidebar entry, row, tab, + or round button", TOUCH);
+
+    head("Sort menu (opened from the Sort button)");
+    add("Up / Down", "Pick a sort; last row flips the direction", DPAD);
+    add("A", "Apply", A);
+    add("B", "Close", B);
 
     head("Settings");
-    add("A", "Change the selected setting", A);
+    add("A", "Change the selected setting (\"Restore default menu music\" goes back to the built-in music)", A);
     add("B", "Back", B);
 
     head("Video playback");
@@ -121,6 +128,8 @@ inline std::vector<Row> rowsFor(Controller c) {
     if (remote) add("2", "Audio and subtitles", TWO);
     else add("Y", "Audio and subtitles", Y);
     add("+", "TV mode: the GamePad becomes a remote", PLUS);
+    if (gamepad) add("Touch", "In TV mode: touch the progress bar to seek (release to go), the gear for quality / audio / subtitles, Queue to browse", TOUCH);
+    add("Up / Y", remote ? "In TV mode: open the Queue / the playback settings (2)" : "In TV mode: open the Queue / the playback settings", DPAD);
     add("-", "GamePad screen on / off", MINUS);
     add("B", "Stop", B);
 
@@ -136,9 +145,32 @@ inline std::vector<Row> rowsFor(Controller c) {
         add("X", "Shuffle on / off", X);
         add("Y", "Repeat: off, then all, then one song (press again to change)", Y);
     }
-    add("-", "Visualizer on / off", MINUS);
+    add("-", "Visualizer: on, next style (5), then off", MINUS);
+    add("Up", "Open the Up Next queue (the Queue button under the cover)", DPAD);
     add("B", "Stop", B);
-    if (gamepad) add("Touch", "Transport buttons, Shuffle / Repeat and the volume slider", TOUCH);
+    if (gamepad) add("Touch", "Transport buttons, Shuffle / Repeat, Queue, the volume slider, and the progress bar (touch to seek)", TOUCH);
+
+    head("Up Next queue (open over the player; the music keeps playing)");
+    add("Up / Down", "Choose Add to Queue, Clear, or a queued item", DPAD);
+    add("A", "Play the item now / open Add to Queue / clear (press twice)", A);
+    if (remote) { add("1", "Remove the item", ONE); add("2", "Clear the queue (press twice)", TWO); }
+    else { add("X", "Remove the item", X); add("Y", "Clear the queue (press twice)", Y); }
+    add("Left / Right", "Move the item up / down (on the buttons: switch between them)", DPAD);
+    if (remote) add("Nunchuk C / Z", "Move the item up / down", NUN_C | NUN_Z);
+    else add("L / R", "Move the item up / down", L | R);
+    add("+", "Add to Queue", PLUS);
+    add("B", "Close the queue (does not stop the music)", B);
+    if (gamepad) add("Touch", "Tap an item to play it; the arrows move it, the cross removes it", TOUCH);
+
+    head("Add to Queue (the pop-up browser)");
+    add("Up / Down", "Move in the list", DPAD);
+    add("A", "Open an album / show / folder; on a song, movie or episode: add it", A);
+    if (remote) { add("1", "Add the selected item (an album or show adds all its songs / episodes)", ONE); add("2", "Add everything listed", TWO); }
+    else { add("X", "Add the selected item (an album or show adds all its songs / episodes)", X); add("Y", "Add everything listed", Y); }
+    add(remote ? "Left / Right or Nunchuk C / Z" : "Left / Right or L / R", "Switch view in a music library",
+        remote ? (DPAD | NUN_C | NUN_Z) : (DPAD | L | R));
+    add("B", "Back; from the first page, return to the queue", B);
+    if (gamepad) add("Touch", "Tap a row to select, tap it again to open; the buttons add", TOUCH);
 
     head("Live TV");
     add("B", "Stop", B);

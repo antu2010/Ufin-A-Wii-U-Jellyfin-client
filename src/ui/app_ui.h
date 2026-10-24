@@ -9,6 +9,7 @@
 // Ufin's own shapes and icons (no assets needed).
 #pragma once
 #include "layout.h"
+#include "../lyrics.h"
 
 #include <cstdint>
 #include <functional>
@@ -36,6 +37,21 @@ struct Hint {
     std::string label;
 };
 
+// An optional control drawn inside a list row (Settings > Customization).
+struct RowWidget {
+    enum class Kind { None, Swatches, Slider, Preview, Shapes, ButtonPreview };
+    Kind kind = Kind::None;
+    std::vector<uint32_t> colours; // Swatches: chips as 0xRRGGBB (bit 24 set = the rainbow chip)
+    int selected = -1;             // Swatches: the chosen chip
+    bool numbered = false;         // Swatches: draw 1, 2, 3 on the chips (the palette's colours)
+    float value = 0.0f;            // Slider: 0..1
+    uint32_t trackLo = 0, trackHi = 0; // Slider: the track runs from one colour to the other (0xRRGGBB)
+    bool hueTrack = false;         // Slider: the track is the rainbow instead
+    std::vector<int> sizes;        // ButtonPreview: width, height (percent) per button kind; `shapes` holds the 4 shapes
+    std::vector<int> shapes;       // Shapes: the button shapes on offer (ids as buttonShapeName)
+    int count() const { return kind == Kind::Shapes ? (int)shapes.size() : (int)colours.size(); }
+};
+
 struct ListEntry {
     std::string name;
     std::string tag;     // right-aligned, e.g. "2008  1:52:00"
@@ -48,11 +64,30 @@ struct ListEntry {
     bool favorite = false;  // heart next to the tag
     float progress = 0.0f;  // partly watched: bar under the artwork (0..1)
     int unplayed = -1;      // shows / seasons: unwatched count badge
+    RowWidget widget;       // swatches / slider / preview inside the row
+    bool grouped = false;   // part of one long panel with the neighbouring grouped rows (the palette editor)
+    bool dimmed = false;    // greyed out: shown, but not usable right now
+    bool addable = false;   // a song: shows the little "+" (touch: add to a playlist)
 };
 
 struct SidebarEntry {
     std::string label;
     Icon icon = Icon::None;
+};
+
+// Floating round buttons at the bottom right of a list (circle in Plain and Liquid Glass, the cookie in M3E).
+enum class FabKind { Sort, NewPlaylist };
+
+// The sort flyout, anchored above the Sort button: the criteria, then the direction.
+struct SortMenuModel {
+    bool open = false;
+    int anchor = 0;                    // index into BrowserModel::fabs of the Sort button
+    std::string title = "Sort by";
+    std::vector<std::string> options;  // criteria offered
+    int current = 0;                   // the active one (index into options)
+    int cursor = 0;                    // 0..options.size(); options.size() = the direction row
+    bool descending = false;
+    std::string directionText;         // "Newest first"
 };
 
 struct BrowserModel {
@@ -67,7 +102,37 @@ struct BrowserModel {
     std::string path;              // breadcrumb above it
     std::vector<ListEntry> items;
     int selected = 0;
+    std::vector<std::string> tabs; // page tabs under the title (Settings); empty = none
+    int tabSelected = 0;
     std::string emptyMessage = "Nothing here yet.";
+    std::vector<Hint> hints;
+    std::vector<FabKind> fabs;     // floating buttons, left to right (the last is in the corner)
+    int fabFocus = -1;             // the one the controller cursor is on, -1 = none
+    SortMenuModel sortMenu;        // the flyout, drawn over everything while open
+    int total = 0;                 // items in the whole list when only part is loaded (0 = items.size())
+};
+
+// The New playlist dialog.
+struct PlaylistFormModel {
+    std::string title = "New playlist";
+    std::string name;
+    bool showVisibility = false;   // only on servers that have playlist visibility
+    bool isPublic = false;
+    int focus = 0;                 // 0 name, 1 visibility, 2 Create, 3 Cancel
+    std::string message;           // an error (kept with what was typed) or "Creating ..."
+    bool messageIsError = false;
+    bool busy = false;             // a request is running: Create is greyed
+    std::vector<Hint> hints;
+};
+
+// "Add to playlist": a compact scrolling list of the user's playlists, "New playlist" first.
+struct PlaylistPickerModel {
+    std::string title = "Add to playlist";
+    std::string subtitle;          // the song
+    std::vector<std::string> rows; // row 0 is "New playlist"
+    int selected = 0;
+    std::string message;           // e.g. "No playlists yet" or an error
+    bool busy = false;
     std::vector<Hint> hints;
 };
 
@@ -80,6 +145,62 @@ struct MessageModel {
     bool overlay = false;           // drawn over the screen already there (no backdrop or logo of its own)
     int firstLine = 0;              // scroll position: the first line drawn (the card keeps its size)
     mutable int linesShown = 0;     // set by drawMessage: how many lines (from firstLine) fitted on the card
+};
+
+// One line of the queue flyout / the Add to Queue browser.
+struct QueueRow {
+    std::string title;
+    std::string sub;       // artist / show and episode / year ...
+    Texture art = 0;
+    bool container = false; // browser: opens (album, show ...) rather than being a single item
+};
+
+// The Up Next flyout of Now Playing (anchored to the Queue button).
+struct QueueFlyoutModel {
+    bool open = false;       // asked for; the drawing eases in / out by itself
+    bool visible = false;    // rows are filled in (open, or still fading out)
+    std::string title = "Up Next";
+    QueueRow current;        // what plays now
+    // upcoming, in play order. Only the rows near the cursor are filled in: rows[0] is entry `first` of `count`.
+    std::vector<QueueRow> rows;
+    int first = 0, count = 0;
+    int cursor = 0;          // -2 Add to Queue, -1 Clear, 0.. a row
+    bool confirmClear = false;
+    std::string toast;       // short feedback line ("Added 12 songs")
+    std::string empty = "Nothing queued. Add songs, movies or episodes.";
+};
+
+// The popup media browser opened by "Add to Queue".
+struct QueueBrowserModel {
+    bool open = false;
+    bool visible = false;
+    std::string title = "Add to Queue";
+    std::string context;     // "Music  >  Albums  >  Abbey Road"
+    std::vector<std::string> tabs; int tab = 0;
+    std::vector<QueueRow> rows; // the visible window: rows[0] is entry `first` of `count`
+    int first = 0, count = 0;
+    int selected = 0;
+    int total = 0;           // size of the whole list on the server (rows may be fewer: pages load as you scroll)
+    bool busy = false;
+    Texture cover = 0; float coverAspect = 1.0f;
+    std::string coverTitle, coverSub;
+    std::string addLabel = "Add";
+    bool canAddAll = false;
+    std::string toast;
+    std::string empty = "Nothing here.";
+    std::vector<Hint> hints;
+};
+
+// The movie remote's settings flyout (the gear at the top right): what plays now, changeable for this viewing only.
+struct VideoSettingsModel {
+    bool gear = false;              // show the gear button (movie remote only)
+    bool open = false;
+    std::vector<std::string> qualities; // the presets, in order
+    int quality = -1;               // the one in use (-1 = custom)
+    int cursor = 0;                 // controller cursor: 0.. quality rows, then audio, then subtitles
+    std::string audioLabel, subtitleLabel;
+    bool hasAudio = false, hasSubtitles = false;
+    std::string toast;
 };
 
 struct NowPlayingModel {
@@ -99,6 +220,23 @@ struct NowPlayingModel {
     bool queueControls = false;    // draw them (a music queue; not the movie remote)
     bool shuffleOn = false;
     int repeatMode = 0;            // 0 = off, 1 = repeat all, 2 = repeat one (the button shows a 1)
+    // Lyrics (music only). `lyrics` is null / empty when the song has none: the Lyrics button is then greyed.
+    // lyricsOpen slides the player to the left and shows them; lyricsSync follows the song line by line
+    // (when the lyrics carry timing) instead of just drifting through the text.
+    const lyrics::Lyrics* lyrics = nullptr;
+    bool lyricsOpen = false;
+    bool lyricsSync = true;
+    bool lyricsTouching = false;   // a finger is dragging the lyrics
+    float lyricsDragDy = 0.0f;     // how far it moved down (px) since the last frame
+    bool lyricsCapable = false;    // a music player (has the Lyrics button); the movie remote is not
+    // Queue button (music) and its flyout. queueCount < 0 = no button (the movie remote).
+    int queueCount = -1;           // upcoming entries in the Up Next list
+    bool queueFocus = false;
+    QueueFlyoutModel flyout;
+    VideoSettingsModel settings;
+    bool scrubbing = false;        // a finger is on the progress bar: it shows scrubSeconds, and lifting seeks there
+    double scrubSeconds = 0.0;
+    QueueBrowserModel browser;
 };
 
 // The music visualizer (- during audio playback). Bar levels come from
@@ -110,6 +248,9 @@ struct VisualizerModel {
     static const int MAX_BANDS = 16;
     float bands[MAX_BANDS] = {};   // roughly 0..1, low frequency first
     int bandCount = 0;
+    // Look: 0 Bars, 1 Terrain (3D), 2 Segments, 3 Radial, 4 Wave (the "-" button steps through them, then switches off).
+    static const int STYLE_COUNT = 5;
+    int style = 0;
     std::vector<Hint> hints;
 };
 
@@ -122,6 +263,17 @@ struct ChoiceModel {
     std::vector<Hint> hints;
     Texture art = 0;       // optional artwork next to the text
     float artAspect = 0;
+};
+
+// The prompt shown when a video starts: which audio track and subtitles to use. The two selector rows
+// work like the Y panel during playback; OK plays, "Always use default" plays and stops asking.
+struct TrackPromptModel {
+    std::string title;
+    std::string subtitle;
+    std::string audioLabel;
+    std::string subtitleLabel;
+    int selected = 2;              // 0 audio, 1 subtitles, 2 OK, 3 always use default
+    std::vector<Hint> hints;
 };
 
 // "Up next" between episodes, with a countdown.
@@ -193,16 +345,55 @@ struct QuickConnectModel {
 enum class Accent { Blue, Purple, Green, Orange, Pink, Teal, Crimson, Amber, Indigo, Rainbow, COUNT };
 const char* accentName(Accent a);
 void setAccent(Accent a);
+// Button shapes (Material 3 Expressive; other styles ignore them). Kind: 0 play / pause, 1 seek & skip, 2 toggles
+// (shuffle, repeat, lyrics), 3 dialog and login buttons. Shape 0 = the default look; out-of-range values fall back to it.
+void setButtonShapes(const int shapes[4]);
+// Width / height of each kind of button in percent of the normal size (100 = normal), {w0, h0, w1, h1, ...}. Clamped to
+// buttonSizeMin()..buttonSizeMax().
+void setButtonSizes(const int sizes[8]);
+int buttonSizeMin();
+int buttonSizeMax(int index); // index = kind * 2 + (0 width, 1 height)
+int buttonShapeCount(int kind);
+const char* buttonShapeName(int shape);
+const char* buttonKindName(int kind);
+uint32_t accentSwatchColour(Accent a); // 0xRRGGBB for the Customization chips (bit 24 = the rainbow chip)
+
+// --- global theme customisation (shared by every renderer: Plain, Liquid Glass, Material 3 Expressive, the video
+// HUD, the GamePad remote -- they all read the same three theme colours) ---
+// Custom palette: three colours (0xRRGGBB) plus an arrangement 0..5 (which colour is main / deep / second).
+// on = false returns to the premade accent chosen with setAccent, which is remembered meanwhile.
+void setCustomPalette(bool on, const uint32_t rgbColours[3], int arrange);
+bool customPaletteActive();
+// Artwork-reactive accent (Material 3 Expressive only; other styles ignore it). `enabled` is the Settings switch,
+// `playing` is true while a music / video player is on screen, and the colour is the playing item's dominant colour
+// (valid = false when there is no usable artwork). The theme eases to it and back; menus keep the palette.
+void setArtworkAccent(bool enabled);
+void setArtworkContext(bool playing);
+void setArtworkColour(bool valid, uint32_t rgbColour);
+bool artworkAccentActive();
+float artworkMix(); // 0 = selected palette .. 1 = artwork colour (for tests)
 
 // Swaps the base neutral palette (background/panel/text/...) for a light
 // set instead of the default dark one; every accent colour works with
 // either. Independent of setAccent -- the two combine freely.
 void setLightMode(bool on);
 
+// UI style: exactly one of three looks is active. Plain is the original flat UI; Liquid Glass and
+// Material 3 Expressive (M3E) are appearance layers on top of the same screens and layout. All three use
+// the one user-selected accent colour (setAccent) and light/dark flag (setLightMode).
+// M3E: tonal surfaces and a palette derived from the accent, pill / cookie / squiggle shapes, spring
+// morphs on focus, faux-bold headings, and soft frosted dialogs over the calm shared blur (no refraction).
+enum class Style { Plain, LiquidGlass, Expressive };
+void setStyle(Style s);
+Style style();
+const char* styleName(Style s);
+void setExpressive(bool on); // (turns Liquid Glass off when on)
+bool expressiveEnabled();
+
 // Liquid Glass UI (Settings -> Appearance; default off). A pure appearance
 // layer: translucent, rounder, softly lit panels over a shared low-resolution
 // blurred backdrop (glass_core.h). Off, every screen draws exactly as before.
-void setGlass(bool on);
+void setGlass(bool on); // (turns M3E off when on)
 bool glassEnabled();
 // True while the shared blur is running (false: Off, or flat glass after a fallback).
 bool glassBlurAvailable();
@@ -219,6 +410,12 @@ void glassFrame(double timeSeconds, bool videoActive);
 // texture is baked into that frame's draw lists. texture 0 / null callback (or
 // glass off) = no refraction: glass uses the soft blurred backdrop instead.
 using GlassSnapshotCallback = void (*)(const ImDrawList* list, const ImDrawCmd* cmd); // same type as ImDrawCallback
+// Liquid Glass only: the frost on the refracted picture. `level` 0 = sharp, 1/2/3 = light / medium / strong (default 1): the
+// picture it bends is a shrunk, smoothed copy. The blurred texture is made by the renderer (gfx.cpp) from the snapshot
+// and handed over with setGlassBlurTexture(); without one, the sharp snapshot is used.
+void setGlassBlur(int level);
+void setGlassBlurTexture(uint64_t texture);
+int glassBlurLevel();
 void setGlassSnapshot(uint64_t texture, GlassSnapshotCallback callback, void* userData);
 bool glassRefractionActive();
 // Snapshots requested so far in the current UI frame (for tests/diagnostics).
@@ -269,6 +466,23 @@ void drawSnow(double time);
 void applyTheme();
 
 void drawBrowser(const BrowserModel& model);
+void drawPlaylistForm(const PlaylistFormModel& model);     // over whatever is drawn already
+void drawPlaylistPicker(const PlaylistPickerModel& model); // over whatever is drawn already
+
+// Touch tests for the library chrome. All return -1 for "nothing".
+int hitTestFab(const BrowserModel& m, float x, float y);                  // index into m.fabs
+// Sort flyout: 0..options-1 a criterion, options = the direction row, -2 = on the card but on no row.
+int hitTestSortMenu(const BrowserModel& m, float x, float y);
+bool hitTestRowAdd(const BrowserModel& m, int itemIndex, int slot, float x, float y); // the "+" on row `slot`
+// Form: 0 name, 1 visibility (Private half = 10, Public half = 11), 2 Create, 3 Cancel.
+int hitTestPlaylistForm(const PlaylistFormModel& m, float x, float y);
+// Picker: row index (into m.rows, accounting for the scroll window), or -1.
+int hitTestPlaylistPicker(const PlaylistPickerModel& m, float x, float y);
+// The user activated something (A button, a tap). M3E bounces the rows next to the activated one and replays its
+// icon's animation; the other styles ignore it. Cheap: sets two numbers.
+void pulse();
+// Call once after the first (TV) pass of a two-pass TV + GamePad tick, so animations count ticks, not passes.
+void noteExtraPass();
 void drawMessage(const MessageModel& model);
 void drawNowPlaying(const NowPlayingModel& model);
 void drawMusicVisualizer(const VisualizerModel& model);
@@ -282,6 +496,7 @@ void drawBufferingIndicator(double bufferedSeconds, double targetSeconds);
 void drawLogin(const LoginModel& model);
 void drawChoice(const ChoiceModel& model);   // over whatever is drawn already
 void drawUpNext(const UpNextModel& model);
+void drawTrackPrompt(const TrackPromptModel& model);   // a whole screen (backdrop + card), like drawMessage
 void drawQuickConnect(const QuickConnectModel& model);
 
 // A short notice at the top of the screen ("Menu music: ..."), fading

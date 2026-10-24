@@ -1,5 +1,7 @@
 #include "app_ui.h"
 #include "glass_core.h"
+#include "m3e_core.h"
+#include "theme_core.h"
 #include "../help_content.h"
 #include "model3d.h"
 
@@ -45,13 +47,61 @@ struct AccentColours {
 static AccentColours g_accent = {IM_COL32(0x00, 0xA4, 0xDC, 0xFF), IM_COL32(0x0B, 0x7F, 0xB0, 0xFF),
                                  IM_COL32(0xAA, 0x5C, 0xC3, 0xFF)};
 static bool g_rainbow = false;
+// The selected palette is separate from what is drawn: the premade accent or the custom palette is the BASE;
+// g_accent (above) is the base after the artwork blend and the readability pass -- the one place every renderer
+// reads the three theme colours from (accentMain/Deep/Second, g_m3c, the glass pack).
+static m3e::Rgb8 unpack(ImU32 c) { return {(uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF)}; }
+static ImU32 pack(m3e::Rgb8 c) { return IM_COL32(c.r, c.g, c.b, 0xFF); }
+static bool g_custom = false;                // "Custom Palette" is the selected palette
+static theme::Custom g_customPal;
+static bool g_artPref = false;               // Settings: artwork-reactive accent (M3E only)
+static bool g_artContext = false;            // a music / video player is on screen
+static bool g_artHave = false;               // the playing item gave a usable colour
+static float g_artGoal[3] = {0, 0, 0}, g_artNow[3] = {0, 0, 0}; // 0..255
+static float g_artMix = 0.0f;                // 0 = the selected palette, 1 = the artwork colour
+static double g_themeTime = 0.0, g_lastTick = -1.0;
 static Background g_background = Background::Off;
 static bool g_snow = false;
 static bool g_light = false; // false = dark palette (default), true = light
 
-static ImU32 accentMain() { return g_accent.main; }
-static ImU32 accentDeep() { return g_accent.deep; }
-static ImU32 accentSecond() { return g_accent.second; }
+// --- Material 3 Expressive state (see m3e_core.h, m3e_draw.inc) ---
+// In M3E mode the accent roles below are served from a palette derived from the SAME user-selected accent
+// (g_accent), so every screen that draws with accentMain()/accentDeep()/accentSecond() follows the theme:
+//   main   = primary             (text in the accent colour, progress, switches that are on)
+//   deep   = primaryContainer    (focused rows and buttons: a tonal fill, not a saturated one)
+//   second = tertiary            (the second colour of gradients)
+// and onMain()/onFocus() give the matching foreground. With M3E off they are the old values and white.
+static bool g_m3e = false;
+// Button shapes (Settings > Customization > Customize shapes; M3E only -- see m3e_draw.inc). Default is each
+// button's own look; the rest are Pill, Rounded, Square and the scalloped Clover, Cookie and Flower (round buttons).
+enum { SH_DEFAULT, SH_PILL, SH_ROUNDED, SH_SQUARE, SH_CLOVER, SH_COOKIE, SH_FLOWER, SH_COUNT };
+static float g_btnSize[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}}; // width, height scale per button kind
+static int g_btnShape[4] = {0, 0, 0, 0}; // per button kind: play/pause, seek & skip, toggles, dialog & login
+struct M3Colours {
+    ImU32 primary, onPrimary, primaryContainer, onPrimaryContainer, secondaryContainer, onSecondaryContainer,
+          tertiary, tertiaryContainer, onTertiaryContainer, errorContainer, onErrorContainer;
+};
+static M3Colours g_m3c = {};
+
+static ImU32 accentMain() { return g_m3e ? g_m3c.primary : g_accent.main; }
+static ImU32 accentDeep() { return g_m3e ? g_m3c.primaryContainer : g_accent.deep; }
+static ImU32 accentSecond() { return g_m3e ? g_m3c.tertiary : g_accent.second; }
+// Text on an accent fill: white on every premade accent (as ever); a custom palette may be pale, so there it is
+// whichever of white / near-black reads better.
+static ImU32 onMain() {
+    if (g_m3e) return g_m3c.onPrimary;
+    return g_custom ? pack(theme::onColour(unpack(g_accent.main))) : IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
+}
+// Text and glyphs on the translucent overlay surfaces of the video HUD: white as ever, except M3E whose
+// overlays follow its light/dark surface.
+static uint64_t g_extraPasses = 0;
+void noteExtraPass() { g_extraPasses++; }
+
+static ImU32 onOverlay() { return g_m3e ? col::TEXT : IM_COL32(0xFF, 0xFF, 0xFF, 0xFF); }
+static ImU32 onFocus() {
+    if (g_m3e) return g_m3c.onPrimaryContainer;
+    return g_custom ? pack(theme::onColour(unpack(g_accent.deep))) : IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
+}
 
 static ImU32 rgb(uint32_t v, int a = 0xFF) { return IM_COL32((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, a); }
 
@@ -73,6 +123,50 @@ static ImU32 hsv(float h, float sat, float val) {
     return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 1.0f));
 }
 
+
+void applyTheme(); // (defined at the end of the file)
+
+// Sets the neutral half of the palette (col::BG/SIDEBAR/PANEL/PANEL_HI/TEXT/MUTED/DIM/TRACK) and, in M3E
+// mode, the accent roles. Plain and Liquid Glass: the dark defaults or the light set, exactly as before.
+// M3E: tonal surfaces derived from the accent, so every existing col::* user is coordinated with it for
+// free. Called whenever the accent (Rainbow: every frame), the light flag or the style changes.
+static void refreshPalette() {
+    if (g_m3e) {
+        const m3e::Rgb8 seed = unpack(g_accent.second);
+        const m3e::Palette p = m3e::derive(unpack(g_accent.main), g_light, (g_custom || g_artMix > 0.0f) ? &seed : nullptr);
+        col::BG       = pack(p.surface);
+        col::SIDEBAR  = pack(p.surfaceLow);
+        col::PANEL    = pack(p.surfaceContainer);
+        col::PANEL_HI = pack(p.surfaceHigh);
+        col::TEXT     = pack(p.onSurface);
+        col::MUTED    = pack(p.onSurfaceVariant);
+        col::DIM      = pack(p.outline);
+        col::TRACK    = pack(p.surfaceHighest);
+        g_m3c = {pack(p.primary), pack(p.onPrimary), pack(p.primaryContainer), pack(p.onPrimaryContainer),
+                 pack(p.secondaryContainer), pack(p.onSecondaryContainer), pack(p.tertiary),
+                 pack(p.tertiaryContainer), pack(p.onTertiaryContainer), pack(p.errorContainer),
+                 pack(p.onErrorContainer)};
+    } else if (g_light) {
+        col::BG       = IM_COL32(0xF6, 0xF7, 0xF9, 0xFF);
+        col::SIDEBAR  = IM_COL32(0xED, 0xEE, 0xF1, 0xFF);
+        col::PANEL    = IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
+        col::PANEL_HI = IM_COL32(0xE7, 0xE9, 0xED, 0xFF);
+        col::TEXT     = IM_COL32(0x1A, 0x1D, 0x21, 0xFF);
+        col::MUTED    = IM_COL32(0x6B, 0x72, 0x80, 0xFF);
+        col::DIM      = IM_COL32(0xC3, 0xC7, 0xCC, 0xFF);
+        col::TRACK    = IM_COL32(0xD8, 0xDB, 0xE0, 0xFF);
+    } else {
+        col::BG       = IM_COL32(0x14, 0x16, 0x1A, 0xFF);
+        col::SIDEBAR  = IM_COL32(0x1B, 0x1E, 0x24, 0xFF);
+        col::PANEL    = IM_COL32(0x23, 0x27, 0x2E, 0xFF);
+        col::PANEL_HI = IM_COL32(0x2C, 0x31, 0x3A, 0xFF);
+        col::TEXT     = IM_COL32(0xEC, 0xEE, 0xF1, 0xFF);
+        col::MUTED    = IM_COL32(0x9A, 0xA0, 0xA8, 0xFF);
+        col::DIM      = IM_COL32(0x5F, 0x65, 0x6E, 0xFF);
+        col::TRACK    = IM_COL32(0x3A, 0x3F, 0x48, 0xFF);
+    }
+}
+
 static Accent g_accentStyle = Accent::Blue;
 
 const char* accentName(Accent a) {
@@ -91,29 +185,157 @@ const char* accentName(Accent a) {
     }
 }
 
-void setAccent(Accent a) {
-    g_accentStyle = a;
-    g_rainbow = (a == Accent::Rainbow);
+static AccentColours premadeColours(Accent a, double time) {
     switch (a) {
-        case Accent::Purple:  g_accent = {rgb(0xAA5CC3), rgb(0x7E3F99), rgb(0x00A4DC)}; break;
-        case Accent::Green:   g_accent = {rgb(0x2ECC71), rgb(0x1E8C4E), rgb(0x00A4DC)}; break;
-        case Accent::Orange:  g_accent = {rgb(0xFF9F43), rgb(0xC7702A), rgb(0xE84393)}; break;
-        case Accent::Pink:    g_accent = {rgb(0xFF6BB5), rgb(0xC2447F), rgb(0x7E57C2)}; break;
-        // Four new colourways, same {main, deep, secondary} shape as the
-        // originals above (secondary is only used for gradients/ambient).
-        case Accent::Teal:    g_accent = {rgb(0x1ABC9C), rgb(0x128F76), rgb(0x3498DB)}; break;
-        case Accent::Crimson: g_accent = {rgb(0xE74C3C), rgb(0xB03A2E), rgb(0xF39C12)}; break;
-        case Accent::Amber:   g_accent = {rgb(0xF1C40F), rgb(0xB7950B), rgb(0xE67E22)}; break;
-        case Accent::Indigo:  g_accent = {rgb(0x5C6BC0), rgb(0x3F4A8C), rgb(0x26C6DA)}; break;
-        case Accent::Rainbow: tickTheme(0.0); break;
-        default:              g_accent = {rgb(0x00A4DC), rgb(0x0B7FB0), rgb(0xAA5CC3)}; break;
+        case Accent::Purple:  return {rgb(0xAA5CC3), rgb(0x7E3F99), rgb(0x00A4DC)};
+        case Accent::Green:   return {rgb(0x2ECC71), rgb(0x1E8C4E), rgb(0x00A4DC)};
+        case Accent::Orange:  return {rgb(0xFF9F43), rgb(0xC7702A), rgb(0xE84393)};
+        case Accent::Pink:    return {rgb(0xFF6BB5), rgb(0xC2447F), rgb(0x7E57C2)};
+        // Four more colourways, same {main, deep, secondary} shape as the originals above (secondary is only
+        // used for gradients/ambient).
+        case Accent::Teal:    return {rgb(0x1ABC9C), rgb(0x128F76), rgb(0x3498DB)};
+        case Accent::Crimson: return {rgb(0xE74C3C), rgb(0xB03A2E), rgb(0xF39C12)};
+        case Accent::Amber:   return {rgb(0xF1C40F), rgb(0xB7950B), rgb(0xE67E22)};
+        case Accent::Indigo:  return {rgb(0x5C6BC0), rgb(0x3F4A8C), rgb(0x26C6DA)};
+        case Accent::Rainbow: {
+            const float h = (float)std::fmod(time * 0.06, 1.0);
+            return {hsv(h, 0.72f, 0.95f), hsv(h, 0.78f, 0.66f), hsv(h + 0.33f, 0.6f, 0.9f)};
+        }
+        default:              return {rgb(0x00A4DC), rgb(0x0B7FB0), rgb(0xAA5CC3)};
     }
 }
 
+// The one place g_accent is computed: base palette (premade or custom) -> artwork blend (M3E, while playing)
+// -> readability (a custom colour that would vanish into the background is lifted) -> neutral palette.
+static void rebuildAccent() {
+    AccentColours b = g_custom ? AccentColours{pack(theme::rolesOf(g_customPal).main), pack(theme::rolesOf(g_customPal).deep),
+                                               pack(theme::rolesOf(g_customPal).second)}
+                               : premadeColours(g_accentStyle, g_themeTime);
+    if (g_m3e && g_artMix > 0.0f) {
+        const m3e::Rgb8 art{(uint8_t)(g_artNow[0] + 0.5f), (uint8_t)(g_artNow[1] + 0.5f), (uint8_t)(g_artNow[2] + 0.5f)};
+        b.main = lerpColor(b.main, pack(art), g_artMix);
+        b.deep = lerpColor(b.deep, pack(theme::autoDeep(art)), g_artMix);
+        b.second = lerpColor(b.second, pack(theme::autoSecond(art)), g_artMix);
+    }
+    if (g_m3e) {
+        g_accent = b; // (M3E derives tonal roles; they are readable by construction)
+        refreshPalette();
+    } else {
+        g_accent = b;
+        refreshPalette(); // the neutral half first: custom colours are checked against its background
+        if (g_custom) {
+            g_accent.main = pack(theme::ensureContrast(unpack(b.main), unpack(col::BG), 3.0f));
+            g_accent.second = pack(theme::ensureContrast(unpack(b.second), unpack(col::BG), 2.0f));
+        }
+    }
+}
+
+// Button shapes (M3E). Kind 0 = play / pause, 1 = seek & skip, 2 = toggles (shuffle, repeat, lyrics), 3 = dialog and
+// login buttons (wide: no scalloped shapes).
+static void syncPlayerRow();
+void setButtonShapes(const int shapes[4]) {
+    for (int i = 0; i < 4; i++) {
+        const int v = shapes[i];
+        g_btnShape[i] = (v >= 0 && v < buttonShapeCount(i)) ? v : 0;
+    }
+    syncPlayerRow();
+}
+int buttonSizeMin() { return 60; }
+// (A dialog button's height stops where its neighbours' 12 px gap does: taller would overlap the row above / below.)
+int buttonSizeMax(int index) { return index == 7 ? 112 : 130; }
+// The player's button row re-spaces itself around the sizes and shapes in use (layout.h npCustom): only in M3E,
+// and only while something is customised, so everything else keeps the original layout exactly.
+static void syncPlayerRow() {
+    NpCustom& c = npCustom();
+    bool custom = false;
+    for (int k = 0; k < 4; k++) custom = custom || g_btnShape[k] != 0 || g_btnSize[k][0] != 1.0f || g_btnSize[k][1] != 1.0f;
+    c.active = g_m3e && custom;
+    for (int k = 0; k < 3; k++) {
+        c.sw[k] = c.active ? g_btnSize[k][0] : 1.0f;
+        c.sh[k] = c.active ? g_btnSize[k][1] : 1.0f;
+    }
+}
+void setButtonSizes(const int sizes[8]) {
+    for (int i = 0; i < 8; i++) {
+        const int v = std::max(buttonSizeMin(), std::min(buttonSizeMax(i), sizes[i]));
+        g_btnSize[i / 2][i % 2] = (float)v / 100.0f;
+    }
+    syncPlayerRow();
+}
+int buttonShapeCount(int kind) { return kind == 3 ? 4 : (int)SH_COUNT; }
+const char* buttonShapeName(int shape) {
+    static const char* names[] = {"Default", "Pill", "Rounded", "Square", "Clover", "Cookie", "Flower"};
+    return (shape >= 0 && shape < (int)SH_COUNT) ? names[shape] : "";
+}
+const char* buttonKindName(int kind) {
+    static const char* names[] = {"Play / pause", "Seek & skip", "Toggles", "Dialog buttons"};
+    return (kind >= 0 && kind < 4) ? names[kind] : "";
+}
+
+// The colour a premade accent shows as in the Customization list (0xRRGGBB; bit 24 marks the rainbow chip).
+uint32_t accentSwatchColour(Accent a) {
+    if (a == Accent::Rainbow) return 0x01000000u;
+    const ImU32 c = premadeColours(a, 0.0).main;
+    return ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+}
+
+void setAccent(Accent a) {
+    g_accentStyle = a;
+    g_rainbow = (a == Accent::Rainbow);
+    rebuildAccent();
+    if (g_m3e) applyTheme(); // M3E derives its whole palette from the accent
+}
+
+// Custom palette: three colours (0xRRGGBB) and which of them is main / deep / second. `on` false goes back to the
+// premade accent chosen with setAccent (which is kept all along).
+void setCustomPalette(bool on, const uint32_t rgbColours[3], int arrange) {
+    g_custom = on;
+    for (int i = 0; i < 3; i++) {
+        const uint32_t v = rgbColours[i];
+        g_customPal.c[i] = {(uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+    }
+    g_customPal.arrange = (arrange >= 0 && arrange < theme::kArrangeCount) ? arrange : 0;
+    rebuildAccent();
+    if (g_m3e) applyTheme();
+}
+bool customPaletteActive() { return g_custom; }
+
+// Artwork-reactive accent. The preference is the Settings switch (only M3E honours it); the context says whether a
+// player is on screen; the colour is the playing item's dominant colour (valid = false: none, e.g. no artwork).
+void setArtworkAccent(bool enabled) { g_artPref = enabled; }
+void setArtworkContext(bool playing) { g_artContext = playing; }
+void setArtworkColour(bool valid, uint32_t rgbColour) {
+    g_artHave = valid;
+    if (!valid) return; // (the blend fades back to the selected palette; the old colour stays for that fade)
+    g_artGoal[0] = (float)((rgbColour >> 16) & 0xFF);
+    g_artGoal[1] = (float)((rgbColour >> 8) & 0xFF);
+    g_artGoal[2] = (float)(rgbColour & 0xFF);
+    if (g_artMix <= 0.001f) for (int i = 0; i < 3; i++) g_artNow[i] = g_artGoal[i]; // appearing: no slide from a stale colour
+}
+bool artworkAccentActive() { return g_m3e && g_artPref && g_artContext && g_artHave; }
+float artworkMix() { return g_artMix; }
+
 void tickTheme(double time) {
-    if (!g_rainbow) return;
-    float h = (float)std::fmod(time * 0.06, 1.0);
-    g_accent = {hsv(h, 0.72f, 0.95f), hsv(h, 0.78f, 0.66f), hsv(h + 0.33f, 0.6f, 0.9f)};
+    const double dt = g_lastTick < 0.0 ? 0.0 : std::min(0.1, std::max(0.0, time - g_lastTick));
+    g_lastTick = time;
+    bool dirty = false;
+    if (g_rainbow && !g_custom) { g_themeTime = time; dirty = true; }
+    // Artwork blend: eases in and out, and follows the colour of the next item smoothly. Costs nothing once settled.
+    const float goal = artworkAccentActive() ? 1.0f : 0.0f;
+    const float k = 1.0f - std::exp(-(float)dt * 4.5f);
+    if (g_artMix != goal) {
+        g_artMix += (goal - g_artMix) * k;
+        if (std::fabs(goal - g_artMix) < 0.004f) g_artMix = goal;
+        dirty = true;
+    }
+    if (g_artMix > 0.0f) {
+        for (int i = 0; i < 3; i++) {
+            const float d = g_artGoal[i] - g_artNow[i];
+            if (std::fabs(d) > 0.4f) { g_artNow[i] += d * k; dirty = true; }
+            else if (d != 0.0f) { g_artNow[i] = g_artGoal[i]; dirty = true; }
+        }
+    }
+    if (dirty) rebuildAccent(); // (a few dozen flops; ImGui's own style colours are not touched per frame)
 }
 
 const char* backgroundEffectName(Background b) {
@@ -142,25 +364,7 @@ void setBackgroundEffect(Background b) { g_background = b; }
 // nothing that draws with col::* needs to know or care which is active.
 void setLightMode(bool on) {
     g_light = on;
-    if (on) {
-        col::BG       = IM_COL32(0xF6, 0xF7, 0xF9, 0xFF);
-        col::SIDEBAR  = IM_COL32(0xED, 0xEE, 0xF1, 0xFF);
-        col::PANEL    = IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
-        col::PANEL_HI = IM_COL32(0xE7, 0xE9, 0xED, 0xFF);
-        col::TEXT     = IM_COL32(0x1A, 0x1D, 0x21, 0xFF);
-        col::MUTED    = IM_COL32(0x6B, 0x72, 0x80, 0xFF);
-        col::DIM      = IM_COL32(0xC3, 0xC7, 0xCC, 0xFF);
-        col::TRACK    = IM_COL32(0xD8, 0xDB, 0xE0, 0xFF);
-    } else {
-        col::BG       = IM_COL32(0x14, 0x16, 0x1A, 0xFF);
-        col::SIDEBAR  = IM_COL32(0x1B, 0x1E, 0x24, 0xFF);
-        col::PANEL    = IM_COL32(0x23, 0x27, 0x2E, 0xFF);
-        col::PANEL_HI = IM_COL32(0x2C, 0x31, 0x3A, 0xFF);
-        col::TEXT     = IM_COL32(0xEC, 0xEE, 0xF1, 0xFF);
-        col::MUTED    = IM_COL32(0x9A, 0xA0, 0xA8, 0xFF);
-        col::DIM      = IM_COL32(0x5F, 0x65, 0x6E, 0xFF);
-        col::TRACK    = IM_COL32(0x3A, 0x3F, 0x48, 0xFF);
-    }
+    rebuildAccent();
     applyTheme(); // refresh ImGui's own style colours (little uses them)
 }
 
@@ -492,8 +696,14 @@ std::string fitText(ImFont* f, float size, const std::string& text, float maxWid
     return f->CalcTextSizeA(size, 1e9f, 0.0f, dots.c_str()).x <= maxWidth ? dots : "";
 }
 
+// M3E has weight contrast (headlines and the focused label are heavier) but the console has one font file, so
+// heavier text is the same glyphs drawn twice, 0.7 px apart. `g_bold` marks an emphasised run (the focused
+// row's name); headline sizes are heavier automatically.
+static bool g_bold = false;
+static bool boldText(float size) { return g_m3e && (g_bold || size >= TEXT_L - 0.5f); }
 static void text(float size, float x, float y, ImU32 color, const std::string& s, float maxWidth = 0.0f) {
     std::string t = maxWidth > 0.0f ? fitText(font(), size, s, maxWidth) : s;
+    if (boldText(size)) dl()->AddText(font(), size, ImVec2(x + std::max(0.7f, size * 0.022f), y), color, t.c_str());
     dl()->AddText(font(), size, ImVec2(x, y), color, t.c_str());
 }
 
@@ -569,12 +779,40 @@ void setGlassSnapshot(uint64_t texture, GlassSnapshotCallback callback, void* us
     g_snapCb = g_snapTex ? callback : nullptr;
     g_snapData = g_snapTex ? userData : nullptr;
 }
+static uint64_t g_snapBlurTex = 0; // the snapshot downsampled (see Gfx): what the refraction samples when the frost is on
+static int g_glassBlurLevel = 1;   // 0 sharp, 1 half, 2 quarter, 3 eighth resolution
+void setGlassBlur(int level) { g_glassBlurLevel = level < 0 ? 0 : (level > 3 ? 3 : level); }
+void setGlassBlurTexture(uint64_t texture) { g_snapBlurTex = texture; }
+int glassBlurLevel() { return g_glassBlurLevel; }
 static bool refractionOn() { return g_glass && g_snapTex && g_snapCb; }
 bool glassRefractionActive() { return refractionOn(); }
 int glassSnapshotsThisFrame() { return g_snapPlanner.snapshotsThisFrame(); }
 
-void setGlass(bool on) { g_glass = on; }
+// The three looks are mutually exclusive: turning one on turns the other off (Plain = neither flag).
+void setGlass(bool on) {
+    g_glass = on;
+    if (on && g_m3e) { g_m3e = false; rebuildAccent(); applyTheme(); }
+}
 bool glassEnabled() { return g_glass; }
+void setExpressive(bool on) {
+    if (on) g_glass = false;
+    if (g_m3e != on) { g_m3e = on; rebuildAccent(); applyTheme(); }
+    syncPlayerRow();
+}
+bool expressiveEnabled() { return g_m3e; }
+void setStyle(Style st) {
+    setGlass(st == Style::LiquidGlass);
+    setExpressive(st == Style::Expressive);
+    syncPlayerRow();
+}
+Style style() { return g_m3e ? Style::Expressive : (g_glass ? Style::LiquidGlass : Style::Plain); }
+const char* styleName(Style st) {
+    switch (st) {
+        case Style::LiquidGlass: return "Liquid Glass";
+        case Style::Expressive:  return "Material 3 Expressive";
+        default:                 return "Plain";
+    }
+}
 bool glassBlurAvailable() { return glass::backdrop().active(); }
 
 static glass::Rgb toRgb(ImU32 c) {
@@ -586,7 +824,7 @@ static glass::Rgb toRgb(ImU32 c) {
 }
 
 void glassNoteArtwork(uint64_t texture, const uint8_t* rgba, int width, int height) {
-    if (!g_glass || !texture || !rgba || width <= 0 || height <= 0) return;
+    if (!g_glass || !texture || !rgba || width <= 0 || height <= 0) return; // (M3E does not tint by artwork)
     // 8x8 grid sample, weighted towards colourful pixels so a mostly-black
     // poster still yields its dominant hue rather than grey.
     float sr = 0, sg = 0, sb = 0, sw = 0;
@@ -615,7 +853,7 @@ static void glassArtFocus(uint64_t texture) {
 }
 
 void glassFrame(double time, bool videoActive) {
-    if (!g_glass) return;
+    if (!g_glass && !g_m3e) return; // Plain: nothing runs. M3E shares the (calm, static) blur for its frosted dialogs.
     glass::BackdropManager& bd = glass::backdrop();
     double dt = time - g_glassLastTime;
     g_glassLastTime = time;
@@ -646,15 +884,27 @@ void glassFrame(double time, bool videoActive) {
     p.art = g_artCur;
     p.artStrength = g_artAmt * 0.7f; // faint: the artwork must never be drowned out
     p.light = g_light;
-    p.animated = true;
+    p.animated = g_glass; // M3E's frost is still: regenerated only when the accent or light/dark changes
+    if (g_m3e) {
+        // M3E: the field is the theme's own surface colour with the primary tone; the accent is quantised
+        // (5 bits a channel) so Rainbow does not restart the blur every frame.
+        auto q = [](float v) { return std::floor(v * 31.0f + 0.5f) / 31.0f; };
+        p.base = toRgb(col::BG);
+        p.accent = toRgb(g_m3c.primaryContainer);
+        p.accent2 = toRgb(g_m3c.tertiaryContainer);
+        p.accent.r = q(p.accent.r); p.accent.g = q(p.accent.g); p.accent.b = q(p.accent.b);
+        p.accent2.r = q(p.accent2.r); p.accent2.g = q(p.accent2.g); p.accent2.b = q(p.accent2.b);
+        p.artStrength = 0.0f;
+    }
     bd.update(time, p, videoActive);
     g_glassBlend = bd.blend(time);
 }
 
-enum class GK { Panel, Row, RowFocus, RowFocusDim, Overlay, Button, ButtonHot, ButtonPressed, ButtonDisabled };
+// Dialog is M3E's frosted card over dimmed content (Liquid Glass draws such cards as Panel).
+enum class GK { Panel, Row, RowFocus, RowFocusDim, Overlay, Button, ButtonHot, ButtonPressed, ButtonDisabled, Dialog };
 
 // Corner radius in glass mode: rounder, like Wii U tiles.
-static float gr(float r) { return g_glass ? r * 1.45f : r; }
+static float gr(float r) { return g_glass ? r * 1.45f : (g_m3e ? r * 1.7f : r); } // (M3E: larger shape tokens)
 
 // --- Shape-aware geometry ---------------------------------------------------
 //
@@ -924,6 +1174,7 @@ static void glassSurface(ImDrawList* d, float x0, float y0, float x1, float y1, 
         case GK::ButtonHot: tintA = 0x70; sheenA = 0x40; break;
         case GK::ButtonPressed: tintA = 0x60; sheenA = 0; break;
         case GK::ButtonDisabled: tintA = 0x38; sheenA = 0x10; break;
+        case GK::Dialog: tintA = 0x34; sheenA = 0x22; break;
     }
     // Nothing soft to sit on (over video, or blur unavailable): give the
     // surface a little more body of its own so text stays readable.
@@ -954,7 +1205,7 @@ static void glassSurface(ImDrawList* d, float x0, float y0, float x1, float y1, 
     // backdrop at this panel's own screen position, only partly opaque, bent a
     // little at the edges...
     if (refract) {
-        glassBackdropLayer(d, g_snapTex, x0, y0, x1, y1, rad, A(255), true);
+        glassBackdropLayer(d, (g_glassBlurLevel > 0 && g_snapBlurTex) ? g_snapBlurTex : g_snapTex, x0, y0, x1, y1, rad, A(255), true);
         if (tex) glassBackdrop(d, x0, y0, x1, y1, rad, A(0x30));
     } else if (tex) {
         glassBackdrop(d, x0, y0, x1, y1, rad, A(blurA));
@@ -1023,17 +1274,71 @@ static void glassSurface(ImDrawList* d, float x0, float y0, float x1, float y1, 
     }
 }
 
-static void glassCircle(ImDrawList* d, float cx, float cy, float r, GK k, bool blur) {
-    glassSurface(d, cx - r, cy - r, cx + r, cy + r, r, k, blur);
+// "A theme draws the surfaces" (Liquid Glass or M3E) as opposed to Plain's flat colours. Every themed
+// surface goes through themedSurface(), which hands it to the active look; the screens above that
+// only say WHAT the surface is (GK) and where it sits.
+static bool themed() { return g_glass || g_m3e; }
+static void m3eSurface(ImDrawList* d, float x0, float y0, float x1, float y1, float rad, GK k, bool blur, float alpha);
+static void m3eBackdropShapes();
+static void m3eButton(const Rect& r, ImU32 fill, bool focus, ImDrawList* onList = nullptr);
+static void drawFabs(const BrowserModel& m);
+static void drawSortMenu(const BrowserModel& m);
+static void drawRowAdd(const Rect& row, bool hot);
+static void m3eTransportButton(ImDrawList* d, float cx, float cy, float halfW, float halfH, float sw, float sh, ImU32 fill, bool pressed, float radFrac, int slot, int shape);
+static void m3eFillShape(ImDrawList* d, float cx, float cy, float hw, float hh, int shape, float R, float press, ImU32 fill,
+                         float sw = 1.0f, float sh = 1.0f);
+static float shapeCorner(int shape);
+static void m3eCookie(ImDrawList* d, float cx, float cy, float r, int lobes, float amp, float rot, ImU32 col);
+static void m3eLoader(ImDrawList* d, float cx, float cy, float r, ImU32 col, double time);
+struct M3eFxScope { // icon animation scope; begin() before drawing an icon, end() after (m3e_draw.inc)
+    ImDrawList* d = nullptr;
+    int v0 = 0;
+    float cx = 0, cy = 0;
+    m3e::IconFx fx;
+    bool on = false;
+    void begin(uint32_t key, bool active, const m3e::IconFxStyle& st, float size, float x, float y, uint32_t tag = 0);
+    void end();
+};
+static void m3eGroupMotion(int idx, int rank, int pressedRank, float& push, float& grow);
+static float m3eDt();
+static double g_pulseTime = -10.0;
+// Moves every vertex drawn since construction by dy: one row's worth of geometry (a few hundred vertices at
+// most), only while the press bounce is running.
+struct M3eRowShift {
+    ImDrawList* d = dl();
+    int v0 = d->VtxBuffer.Size;
+    void end(float dy) {
+        if (std::fabs(dy) < 0.05f) return;
+        for (int i = v0; i < d->VtxBuffer.Size; i++) d->VtxBuffer.Data[i].pos.y += dy;
+    }
+};
+static float m3eRowPress();
+static float m3eRowPush(int rank, float p);
+static uint32_t g_pulseCount = 0;
+void pulse() { g_pulseTime = ImGui::GetTime(); g_pulseCount++; }
+static void m3eCookieImage(ImDrawList* d, ImTextureID tex, float cx, float cy, float r, int lobes, float amp, float rot, ImVec2 uv0, ImVec2 uv1, ImU32 tint);
+static void m3eProgressLine(ImDrawList* d, float x, float y, float w, float h, float frac, bool moving);
+static void m3eEntranceBegin(ImDrawList* d, uint32_t key, int& vtxStart, float& s);
+static void m3eEntranceEnd(ImDrawList* d, int vtxStart, float s, float cx, float cy);
+static void m3eDialogScrim(ImDrawList* d, float amt, int& vtxStart);
+static void m3eMessageBadge(float x, float y, bool busy, bool error);
+static void themedSurface(ImDrawList* d, float x0, float y0, float x1, float y1, float rad, GK k, bool blur,
+                          float alpha = 1.0f) {
+    if (g_m3e) m3eSurface(d, x0, y0, x1, y1, rad, k, blur, alpha);
+    else glassSurface(d, x0, y0, x1, y1, rad, k, blur, alpha);
 }
 
-// A panel-ish rounded rectangle: the flat colour it always was, or glass.
+static void glassCircle(ImDrawList* d, float cx, float cy, float r, GK k, bool blur) {
+    themedSurface(d, cx - r, cy - r, cx + r, cy + r, r, k, blur);
+}
+
+// A panel-ish rounded rectangle: the flat colour it always was, or the active theme's surface.
 static void surfaceRect(const Rect& r, ImU32 flat, float rounding, GK kind, bool blur = true) {
-    if (!g_glass) {
+    if (!themed()) {
         rect(r, flat, rounding);
         return;
     }
-    glassSurface(dl(), r.x, r.y, r.right(), r.bottom(), gr(rounding), kind, blur);
+    themedSurface(dl(), r.x, r.y, r.right(), r.bottom(), gr(rounding), kind, blur);
 }
 
 // The screen's base: theme background, then (glass) the soft light field the
@@ -1094,7 +1399,7 @@ static void drawScreenBackdrop() {
         drawBackdropLayers();
         return;
     }
-    if (g_glass) {
+    if (g_glass) { // (M3E keeps a flat near-black / near-white surface: no accent-coloured glass field)
         const glass::BackdropManager& bd = glass::backdrop();
         const uint64_t tex = bd.texture(), from = bd.textureFrom();
         if (tex) {
@@ -1111,13 +1416,14 @@ static void drawScreenBackdrop() {
             dl()->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H * 0.6f), top, top, clear, clear);
         }
     }
+    if (g_m3e && g_background == Background::Off) m3eBackdropShapes(); // (a chosen effect replaces the decoration)
     drawBackgroundEffect();
     drawBackdropLayers(); // fading in or out over the normal background (no-op without a backdrop)
 }
 
 // --- icons (simple vector shapes, drawn in a size x size box) ---
 
-static void drawIcon(Icon icon, float cx, float cy, float s, ImU32 c) {
+static void drawIconRaw(Icon icon, float cx, float cy, float s, ImU32 c) {
     ImDrawList* d = dl();
     const float h = s * 0.5f;
     const float t = std::max(2.0f, s * 0.08f); // stroke
@@ -1291,18 +1597,44 @@ static void drawIcon(Icon icon, float cx, float cy, float s, ImU32 c) {
     }
 }
 
+// M3E icons play a short animation when they come on (see m3e_draw.inc); `g_iconActive` says whether the icon
+// being drawn is the focused / selected one. Plain and Liquid Glass draw the icon as before.
+static bool g_iconActive = false;
+static bool g_iconHoldless = false;
+static uint32_t g_iconTag = 0; // bumped by the caller for every event (a press) that should replay the icon's animation
+static void m3eIconAnimated(Icon icon, float cx, float cy, float s, ImU32 c, bool active);
+static void drawIcon(Icon icon, float cx, float cy, float s, ImU32 c) {
+    if (g_m3e) m3eIconAnimated(icon, cx, cy, s, c, g_iconActive);
+    else drawIconRaw(icon, cx, cy, s, c);
+}
+
 // --- shared chrome ---
 
 static void drawHints(const std::vector<Hint>& hints, float x, float y) {
-    const float r = 14.0f;
+    const float r = 14.0f, right = layout::SCREEN_W - 20.0f, rowStep = 34.0f;
+    auto widthOf = [&](const Hint& h) {
+        return std::max(2 * r, textSize(TEXT_S, h.button).x + 14.0f) + 8.0f + textSize(TEXT_S, h.label).x + 26.0f;
+    };
+    // Legends that do not fit in one row wrap onto a second one (the first row moves up to make room), instead of
+    // running off the screen.
+    int rows = 1;
+    float probe = x;
+    for (const Hint& hint : hints) {
+        const float w = widthOf(hint);
+        if (probe + w - 26.0f > right && probe > x) { rows++; probe = x; }
+        probe += w;
+    }
+    float rowY = y - (rows - 1) * 18.0f;
+    const float x0 = x;
     for (const Hint& hint : hints) {
         float bw = std::max(2 * r, textSize(TEXT_S, hint.button).x + 14.0f);
-        if (g_glass) glassSurface(dl(), x, y, x + bw, y + 2 * r, r, GK::Button, true);
-        else dl()->AddRectFilled(ImVec2(x, y), ImVec2(x + bw, y + 2 * r), col::PANEL_HI, r);
+        if (x + widthOf(hint) - 26.0f > right && x > x0) { x = x0; rowY += rowStep; }
+        if (themed()) themedSurface(dl(), x, rowY, x + bw, rowY + 2 * r, r, GK::Button, true);
+        else dl()->AddRectFilled(ImVec2(x, rowY), ImVec2(x + bw, rowY + 2 * r), col::PANEL_HI, r);
         ImVec2 bs = textSize(TEXT_S, hint.button);
-        text(TEXT_S, x + (bw - bs.x) * 0.5f, y + r - bs.y * 0.5f, col::TEXT, hint.button);
+        text(TEXT_S, x + (bw - bs.x) * 0.5f, rowY + r - bs.y * 0.5f, col::TEXT, hint.button);
         x += bw + 8.0f;
-        text(TEXT_S, x, y + r - bs.y * 0.5f, col::MUTED, hint.label);
+        text(TEXT_S, x, rowY + r - bs.y * 0.5f, col::MUTED, hint.label);
         x += textSize(TEXT_S, hint.label).x + 26.0f;
     }
 }
@@ -1315,7 +1647,12 @@ static void drawLogo(float x, float y) {
     text(34.0f, x + s + 14.0f, y + 1.0f, col::TEXT, "Ufin");
 }
 
-static void drawProgress(float x, float y, float w, float h, double position, double duration, bool live) {
+static void drawProgress(float x, float y, float w, float h, double position, double duration, bool live,
+                         bool moving = true) {
+    if (g_m3e && duration > 0.0) { // M3E: a wavy played part (it flattens when paused), a handle, a calm track
+        m3eProgressLine(dl(), x, y, w, h, (float)std::min(1.0, std::max(0.0, position / duration)), moving);
+        return;
+    }
     dl()->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), col::TRACK, h * 0.5f);
     if (duration > 0.0) {
         float f = (float)std::min(1.0, std::max(0.0, position / duration));
@@ -1348,12 +1685,12 @@ static void drawArtBadges(const ListEntry& e, const layout::Fit& f) {
         float w = std::max(20.0f, ts.x + 10), h = 20;
         d->AddRectFilled(ImVec2(corner.x - w + 4, corner.y - 6), ImVec2(corner.x + 4, corner.y - 6 + h), accentMain(), h * 0.5f);
         d->AddText(font(), 15.0f, ImVec2(corner.x - w + 4 + (w - ts.x) * 0.5f, corner.y - 6 + (h - ts.y) * 0.5f),
-                   col::WHITE, n.c_str());
+                   onMain(), n.c_str());
     } else if (e.watched) {
         ImVec2 c(corner.x, corner.y + 4);
         d->AddCircleFilled(c, 10.0f, accentMain(), 16);
-        d->AddLine(ImVec2(c.x - 5, c.y), ImVec2(c.x - 1.5f, c.y + 4), col::WHITE, 2.4f);
-        d->AddLine(ImVec2(c.x - 1.5f, c.y + 4), ImVec2(c.x + 5, c.y - 4), col::WHITE, 2.4f);
+        d->AddLine(ImVec2(c.x - 5, c.y), ImVec2(c.x - 1.5f, c.y + 4), onMain(), 2.4f);
+        d->AddLine(ImVec2(c.x - 1.5f, c.y + 4), ImVec2(c.x + 5, c.y - 4), onMain(), 2.4f);
     }
 }
 
@@ -1450,7 +1787,10 @@ static void drawUsageCelebration() {
     const float R = 215.0f * scale;
     const float cx = W * 0.5f, cy = H * 0.5f + (float)std::sin(t * 1.6f) * 5.0f;
     if (R > 1.0f) {
-        if (g_glass) {
+        if (g_m3e) {
+            // M3E: a big slowly turning cookie in the primary container instead of a glass bubble.
+            m3eCookie(fg, cx, cy, R, 12, 0.07f, t * 0.25f, accentDeep());
+        } else if (g_glass) {
             glassCircle(fg, cx, cy, R, GK::Overlay, true);
             // A faint tint inside the glass so the text stays legible over busy rows behind it.
             fg->AddCircleFilled(ImVec2(cx, cy), R * 0.97f, bgTint(col::BG, 0.30f), 72);
@@ -1459,8 +1799,10 @@ static void drawUsageCelebration() {
             fg->AddCircle(ImVec2(cx, cy), R, accentMain(), 72, 3.0f);
         }
         // A soft highlight on the upper left, like light on a soap bubble.
-        fg->AddCircleFilled(ImVec2(cx - R * 0.46f, cy - R * 0.50f), R * 0.10f, bgTint(col::WHITE, 0.16f), 24);
-        fg->AddCircleFilled(ImVec2(cx - R * 0.46f, cy - R * 0.50f), R * 0.05f, bgTint(col::WHITE, 0.30f), 20);
+        if (!g_m3e) { // (the soap-bubble highlight; a cookie is not shiny)
+            fg->AddCircleFilled(ImVec2(cx - R * 0.46f, cy - R * 0.50f), R * 0.10f, bgTint(col::WHITE, 0.16f), 24);
+            fg->AddCircleFilled(ImVec2(cx - R * 0.46f, cy - R * 0.50f), R * 0.05f, bgTint(col::WHITE, 0.30f), 20);
+        }
     }
 
     // Text fades in once the bubble has mostly arrived.
@@ -1470,40 +1812,173 @@ static void drawUsageCelebration() {
             ImVec2 ts = font()->CalcTextSizeA(size, 1e9f, 0.0f, str.c_str());
             fg->AddText(font(), size, ImVec2(cx - ts.x * 0.5f, y), color, str.c_str());
         };
-        centred(TEXT_M, cy - 104.0f, bgTint(col::MUTED, ta), "Time with Ufin");
-        centred(76.0f, cy - 70.0f, bgTint(col::TEXT, ta), g_celebBig);
-        centred(TEXT_S, cy + 44.0f, bgTint(col::MUTED, ta), g_celebSmall);
-        if (t > 1.2f) centred(TEXT_S - 2, cy + 108.0f, bgTint(col::DIM, clamp01((t - 1.2f) / 0.5f)), "Tap or press any button");
+        const ImU32 fgText = g_m3e ? g_m3c.onPrimaryContainer : col::TEXT; // on the cookie
+        const ImU32 fgMuted = g_m3e ? g_m3c.onPrimaryContainer : col::MUTED;
+        centred(TEXT_M, cy - 104.0f, bgTint(fgMuted, ta), "Time with Ufin");
+        centred(76.0f, cy - 70.0f, bgTint(fgText, ta), g_celebBig);
+        centred(TEXT_S, cy + 44.0f, bgTint(fgMuted, ta), g_celebSmall);
+        if (t > 1.2f) centred(TEXT_S - 2, cy + 108.0f, bgTint(g_m3e ? fgMuted : col::DIM, clamp01((t - 1.2f) / 0.5f)), "Tap or press any button");
     }
 
     drawConfetti(fg, t, true); // in front of everything
 }
 
+// --- list-row widgets (Settings > Customization) ---
+
+// Left edge of a widget (the row's name must stay left of it).
+static float rowWidgetLeft(const ListEntry& e, const Rect& r) {
+    switch (e.widget.kind) {
+        case RowWidget::Kind::Swatches:
+        case RowWidget::Kind::Shapes: {
+            const int n = e.widget.count();
+            return r.right() - 12.0f - (float)n * (layout::swatchSize(r, n) + 6.0f) - 8.0f;
+        }
+        case RowWidget::Kind::Slider:  return layout::rowSliderMinus(r).x - 8.0f;
+        case RowWidget::Kind::Preview: return r.x + 330.0f;
+        case RowWidget::Kind::ButtonPreview: return r.x + 290.0f;
+        default:                       return r.right();
+    }
+}
+
+// Pie-slice rainbow disc: the "Rainbow" accent chip.
+static void rainbowDisc(ImDrawList* d, float cx, float cy, float rad, float alpha) {
+    for (int i = 0; i < 6; i++) {
+        const float a0 = (float)i / 6.0f * 6.2831853f, a1 = (float)(i + 1) / 6.0f * 6.2831853f;
+        d->PathLineTo(ImVec2(cx, cy));
+        d->PathArcTo(ImVec2(cx, cy), rad, a0, a1, 4);
+        d->PathFillConvex(bgTint(hsv((float)i / 6.0f, 0.75f, 0.95f), alpha));
+    }
+}
+
+static void drawRowWidget(const ListEntry& e, const Rect& r, bool hot) {
+    const RowWidget& w = e.widget;
+    ImDrawList* d = dl();
+    const float a = e.dimmed ? 0.38f : 1.0f;
+    const ImU32 ring = bgTint(hot ? onFocus() : col::TEXT, a);
+    const float cy = r.y + r.h * 0.5f;
+    if (w.kind == RowWidget::Kind::Swatches) {
+        const int n = (int)w.colours.size();
+        const float sz = layout::swatchSize(r, n);
+        for (int i = 0; i < n; i++) {
+            const Rect c = layout::rowSwatch(r, i, n);
+            const float cx = c.x + c.w * 0.5f;
+            const uint32_t v = w.colours[(size_t)i];
+            if (v & 0x01000000u) rainbowDisc(d, cx, cy, sz * 0.5f, a);
+            else d->AddCircleFilled(ImVec2(cx, cy), sz * 0.5f, bgTint(rgb(v & 0xFFFFFF), a), 24);
+            if (i == w.selected) d->AddCircle(ImVec2(cx, cy), sz * 0.5f + 4.0f, ring, 28, 2.5f);
+            if (w.numbered) {
+                const char label[2] = {(char)('1' + i), 0};
+                const m3e::Rgb8 bg{(uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+                const ImVec2 ts = textSize(TEXT_S, label);
+                text(TEXT_S, cx - ts.x * 0.5f, cy - TEXT_S * 0.5f - 1.0f, bgTint(pack(theme::onColour(bg)), a), label);
+            }
+        }
+    } else if (w.kind == RowWidget::Kind::Shapes) {
+        // One sample of each shape on offer, in the theme colour; the chosen one is ringed.
+        const int n = w.count();
+        const float sz = layout::swatchSize(r, n);
+        for (int i = 0; i < n; i++) {
+            const Rect c = layout::rowSwatch(r, i, n);
+            const float cx = c.x + c.w * 0.5f;
+            const int sh = w.shapes[(size_t)i];
+            const float R = sh == SH_DEFAULT ? sz * 0.34f : std::min(sz * 0.5f, shapeCorner(sh) * sz);
+            m3eFillShape(d, cx, cy, sz * 0.5f, sz * 0.5f, sh, R, 0.0f, bgTint(accentMain(), a));
+            if (i == w.selected) d->AddCircle(ImVec2(cx, cy), sz * 0.5f + 4.0f, ring, 28, 2.5f);
+        }
+    } else if (w.kind == RowWidget::Kind::ButtonPreview && w.shapes.size() >= 4 && w.sizes.size() >= 8) {
+        // The four kinds of button as the player and the dialogs draw them: the chosen shape at the chosen size.
+        // (Same fills; the corners are the shapes' resting ones.)
+        static const float baseHW[4] = {38.0f, 22.0f, 21.0f, 54.0f}, baseHH[4] = {22.0f, 22.0f, 21.0f, 17.0f};
+        const float x0 = r.x + 290.0f + 56.0f;
+        static const float off[4] = {0.0f, 118.0f, 190.0f, 292.0f};
+        for (int k = 0; k < 4; k++) {
+            const float sw = (float)w.sizes[(size_t)k * 2] / 100.0f, sh = (float)w.sizes[(size_t)k * 2 + 1] / 100.0f;
+            const float hw = baseHW[k] * sw, hh = baseHH[k] * sh;
+            const int shp = w.shapes[(size_t)k];
+            const float R = shp == SH_DEFAULT ? (k == 3 ? std::min(hh, 14.0f) : hh * 0.8f) : std::min(hh, shapeCorner(shp) * 2.0f * hh);
+            const ImU32 fill = (k == 0 || k == 3) ? accentMain() : g_m3c.secondaryContainer;
+            m3eFillShape(d, x0 + off[k], cy, hw, hh, shp, R, 0.0f, bgTint(fill, a), sw, sh);
+        }
+    } else if (w.kind == RowWidget::Kind::Slider) {
+        const Rect t = layout::rowSliderTrack(r);
+        const float x0 = t.x + 8.0f, x1 = t.right() - 8.0f, th = 5.0f;
+        if (w.hueTrack) {
+            for (int i = 0; i < 6; i++) {
+                const float fa = (float)i / 6.0f, fb = (float)(i + 1) / 6.0f;
+                const ImU32 ca = bgTint(hsv(fa, 0.8f, 0.95f), a), cb = bgTint(hsv(fb, 0.8f, 0.95f), a);
+                d->AddRectFilledMultiColor(ImVec2(x0 + (x1 - x0) * fa, cy - th), ImVec2(x0 + (x1 - x0) * fb, cy + th), ca, cb, cb, ca);
+            }
+        } else {
+            const ImU32 lo = bgTint(rgb(w.trackLo), a), hi = bgTint(rgb(w.trackHi), a);
+            d->AddRectFilledMultiColor(ImVec2(x0, cy - th), ImVec2(x1, cy + th), lo, hi, hi, lo);
+        }
+        d->AddRect(ImVec2(x0, cy - th), ImVec2(x1, cy + th), bgTint(ring, 0.5f * a), 0.0f, 0, 1.0f);
+        const float hx = x0 + (x1 - x0) * clamp01(w.value);
+        d->AddCircleFilled(ImVec2(hx, cy), 11.0f, bgTint(col::WHITE, a), 20);
+        d->AddCircle(ImVec2(hx, cy), 11.0f, bgTint(IM_COL32(0, 0, 0, 255), 0.55f * a), 20, 2.0f);
+        for (int k = 0; k < 2; k++) {
+            const Rect b = k == 0 ? layout::rowSliderMinus(r) : layout::rowSliderPlus(r);
+            const float bx = b.x + b.w * 0.5f;
+            d->AddCircle(ImVec2(bx, cy), 17.0f, ring, 24, 2.0f);
+            d->AddLine(ImVec2(bx - 7.0f, cy), ImVec2(bx + 7.0f, cy), ring, 2.5f);
+            if (k == 1) d->AddLine(ImVec2(bx, cy - 7.0f), ImVec2(bx, cy + 7.0f), ring, 2.5f);
+        }
+    } else if (w.kind == RowWidget::Kind::Preview) {
+        // The live theme, not a copy of it: the gradient, a button, a focused row and accent text exactly as
+        // every screen draws them right now.
+        const float x = r.x + 340.0f;
+        const float bh = 26.0f, y0 = cy - bh * 0.5f;
+        const ImU32 cm = accentMain(), cd = accentDeep(), cs = accentSecond();
+        d->AddRectFilledMultiColor(ImVec2(x, y0), ImVec2(x + 70.0f, y0 + bh), cm, cd, cd, cm);
+        d->AddRectFilledMultiColor(ImVec2(x + 70.0f, y0), ImVec2(x + 140.0f, y0 + bh), cd, cs, cs, cd);
+        d->AddRect(ImVec2(x, y0), ImVec2(x + 140.0f, y0 + bh), bgTint(ring, 0.4f), 6.0f, 0, 1.0f);
+        const float bx = x + 156.0f;
+        d->AddRectFilled(ImVec2(bx, y0), ImVec2(bx + 92.0f, y0 + bh), cm, bh * 0.5f);
+        const ImVec2 t1 = textSize(TEXT_S, "Button");
+        text(TEXT_S, bx + (92.0f - t1.x) * 0.5f, cy - TEXT_S * 0.5f - 1.0f, onMain(), "Button");
+        const float fx = bx + 104.0f;
+        d->AddRectFilled(ImVec2(fx, y0), ImVec2(fx + 92.0f, y0 + bh), cd, 8.0f);
+        const ImVec2 t2 = textSize(TEXT_S, "Focus");
+        text(TEXT_S, fx + (92.0f - t2.x) * 0.5f, cy - TEXT_S * 0.5f - 1.0f, onFocus(), "Focus");
+        text(TEXT_S, fx + 108.0f, cy - TEXT_S * 0.5f - 1.0f, cm, "Text");
+    }
+}
+
 // --- browser ---
 
 void drawBrowser(const BrowserModel& m) {
+    layout::listInset() = layout::fabInset((int)m.fabs.size()); // rows stop short of the floating buttons
     drawScreenBackdrop();
+    const float press = g_m3e ? m3eRowPress() : 0.0f; // M3E: an activation bounces the neighbouring rows
 
     // Sidebar
-    if (g_glass) {
-        // A floating frosted panel; the items keep their exact positions.
-        glassSurface(dl(), 8.0f, 10.0f, layout::SIDEBAR_W - 8.0f, layout::SCREEN_H - 10.0f, 26.0f, GK::Panel, true);
+    if (themed()) {
+        // A floating panel (frosted glass / M3E navigation rail); the items keep their exact positions.
+        themedSurface(dl(), 8.0f, 10.0f, layout::SIDEBAR_W - 8.0f, layout::SCREEN_H - 10.0f, g_m3e ? 32.0f : 26.0f, GK::Panel, true);
     } else {
         rect({0, 0, layout::SIDEBAR_W, layout::SCREEN_H}, col::SIDEBAR);
     }
     drawLogo(30.0f, 40.0f);
     for (int i = 0; i < (int)m.sidebar.size(); i++) {
+        M3eRowShift shift;
         Rect r = layout::sidebarItem(i);
         bool current = (i == m.sidebarSelected);
         if (current && m.sidebarFocused) {
             surfaceRect(r, accentDeep(), 12.0f, GK::RowFocus);
         } else if (current) {
             surfaceRect(r, col::PANEL, 12.0f, GK::RowFocusDim);
-            if (!g_glass) dl()->AddRectFilled(ImVec2(r.x, r.y + 12), ImVec2(r.x + 4, r.bottom() - 12), accentMain(), 2.0f);
+            if (!themed()) dl()->AddRectFilled(ImVec2(r.x, r.y + 12), ImVec2(r.x + 4, r.bottom() - 12), accentMain(), 2.0f);
         }
-        ImU32 c = (current && m.sidebarFocused) ? col::WHITE : (current ? col::TEXT : col::MUTED);
+        ImU32 c = (current && m.sidebarFocused) ? onFocus() : (current ? (g_m3e ? g_m3c.onSecondaryContainer : col::TEXT) : col::MUTED);
+        g_iconActive = current;
+        g_iconTag = current ? g_pulseCount : 0;
         drawIcon(m.sidebar[i].icon, r.x + 32, r.y + r.h * 0.5f, 26.0f, c);
+        g_iconActive = false;
+        g_iconTag = 0;
+        g_bold = g_m3e && current; // M3E: the current destination is set heavier
         text(TEXT_M, r.x + 58, r.y + (r.h - TEXT_M) * 0.5f - 1, c, m.sidebar[i].label, r.w - 66);
+        g_bold = false;
+        if (g_m3e && m.sidebarFocused) shift.end(m3eRowPush(i - m.sidebarSelected, press));
     }
     if (!m.footnote.empty()) {
         text(TEXT_S - 2, layout::SIDEBAR_PAD + 4, layout::SCREEN_H - 44, col::DIM, m.footnote,
@@ -1521,16 +1996,21 @@ void drawBrowser(const BrowserModel& m) {
     std::string counter;
     if (total > 0) {
         char buf[32];
-        snprintf(buf, sizeof(buf), "%d / %d", m.selected + 1, total);
+        snprintf(buf, sizeof(buf), "%d / %d", m.selected + 1, std::max(total, m.total));
         counter = buf;
     }
     float counterW = counter.empty() ? 0.0f : textSize(TEXT_S, counter).x + 24.0f;
     float clockW = m.clock.empty() ? 0.0f : textSize(TEXT_L, m.clock).x + 24.0f;
     text(TEXT_L + 6, layout::CONTENT_X, layout::HEADER_TITLE_Y, col::TEXT, m.title,
-         layout::CONTENT_W - std::max(clockW, m.clock.empty() ? counterW : 0.0f));
+         layout::CONTENT_W - std::max(clockW, m.clock.empty() ? counterW : 0.0f) - (!m.clock.empty() && !m.tabs.empty() ? counterW : 0.0f));
     if (!m.clock.empty()) {
         textRight(TEXT_L, layout::CONTENT_RIGHT, layout::HEADER_TITLE_Y + 2, col::TEXT, m.clock);
-        if (!counter.empty()) textRight(TEXT_S, layout::CONTENT_RIGHT, layout::HEADER_PATH_Y, col::MUTED, counter);
+        // (with page / view tabs under the title, the counter stays up beside the clock: down there it would run
+        // into the tabs' "R" key)
+        if (!counter.empty()) {
+            if (m.tabs.empty()) textRight(TEXT_S, layout::CONTENT_RIGHT, layout::HEADER_PATH_Y, col::MUTED, counter);
+            else textRight(TEXT_S, layout::CONTENT_RIGHT - (clockW > 0 ? clockW : 0.0f), layout::HEADER_TITLE_Y + 12, col::MUTED, counter);
+        }
     } else if (!counter.empty()) {
         textRight(TEXT_S, layout::CONTENT_RIGHT, layout::HEADER_TITLE_Y + 12, col::MUTED, counter);
     }
@@ -1547,26 +2027,63 @@ void drawBrowser(const BrowserModel& m) {
         text(TEXT_S, layout::CONTENT_X, layout::HEADER_PATH_Y, col::MUTED, p);
     }
 
+    // Settings pages: a tab per page, the current one filled; L and R switch them.
+    if (!m.tabs.empty()) {
+        const Rect first = layout::settingsTab(0);
+        const Rect last = layout::settingsTab((int)m.tabs.size() - 1);
+        auto keyHint = [&](float x, const char* label) {
+            dl()->AddCircle(ImVec2(x, first.y + first.h * 0.5f), 11.0f, col::DIM, 18, 1.5f);
+            const ImVec2 ts = textSize(TEXT_S - 3, label);
+            text(TEXT_S - 3, x - ts.x * 0.5f, first.y + first.h * 0.5f - (TEXT_S - 3) * 0.5f - 1.0f, col::MUTED, label);
+        };
+        keyHint(first.x - 18.0f, "L");
+        keyHint(last.right() + 18.0f, "R");
+        for (int i = 0; i < (int)m.tabs.size(); i++) {
+            M3eRowShift tabShift;
+            const Rect r = layout::settingsTab(i);
+            const bool cur = (i == m.tabSelected);
+            if (cur) surfaceRect(r, accentDeep(), r.h * 0.5f, GK::RowFocus);
+            else surfaceRect(r, col::PANEL, r.h * 0.5f, GK::Row);
+            const ImVec2 ts = textSize(TEXT_S, m.tabs[(size_t)i]);
+            g_bold = g_m3e && cur;
+            text(TEXT_S, r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - TEXT_S) * 0.5f - 1.0f, cur ? onFocus() : col::MUTED, m.tabs[(size_t)i]);
+            g_bold = false;
+        }
+    }
+
     // List
     const int visible = layout::visibleRows();
     if (total == 0) {
         text(TEXT_M, layout::CONTENT_X + 8, layout::LIST_TOP + 20, col::MUTED, m.emptyMessage, layout::CONTENT_W);
     } else {
         ListWindow w = computeListWindow(total, m.selected, visible);
+        // Grouped rows (the palette editor) are ONE long panel, not a button each: the panel is drawn first, and
+        // inside it only the selected row gets a (slightly inset) highlight.
+        for (int i = w.start; i < w.end;) {
+            if (!m.items[(size_t)i].grouped) { i++; continue; }
+            int j = i;
+            while (j + 1 < w.end && m.items[(size_t)(j + 1)].grouped) j++;
+            const Rect a = layout::listRow(i - w.start), b = layout::listRow(j - w.start);
+            surfaceRect({a.x, a.y, a.w, b.bottom() - a.y}, col::PANEL, 12.0f, GK::Row);
+            i = j + 1;
+        }
         for (int i = w.start; i < w.end; i++) {
+            M3eRowShift shift;
             const ListEntry& e = m.items[(size_t)i];
             Rect r = layout::listRow(i - w.start);
             bool sel = (i == m.selected);
             if (sel) glassArtFocus(e.art);
+            const Rect fr = e.grouped ? Rect{r.x + 6.0f, r.y + 2.0f, r.w - 12.0f, r.h - 4.0f} : r;
             if (sel && !m.sidebarFocused) {
-                surfaceRect(r, accentDeep(), 12.0f, GK::RowFocus);
+                surfaceRect(fr, accentDeep(), e.grouped ? 10.0f : 12.0f, GK::RowFocus);
             } else if (sel) {
-                surfaceRect(r, col::PANEL, 12.0f, GK::RowFocusDim);
-                if (!g_glass) dl()->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentDeep(), 12.0f, 0, 2.0f);
-            } else {
+                surfaceRect(fr, e.grouped ? col::PANEL_HI : col::PANEL, e.grouped ? 10.0f : 12.0f, GK::RowFocusDim);
+                if (!themed()) dl()->AddRect(ImVec2(fr.x, fr.y), ImVec2(fr.right(), fr.bottom()), accentDeep(), e.grouped ? 10.0f : 12.0f, 0, 2.0f);
+            } else if (!e.grouped) {
                 surfaceRect(r, col::PANEL, 12.0f, GK::Row);
             }
             bool hot = sel && !m.sidebarFocused;
+            const ImU32 onHot = onFocus(); // text on the focused row ("white" on Plain and glass)
             float x = r.x + 10;
             if (e.art || e.icon != Icon::None) {
                 // Artwork slot: the image fitted inside, or the icon until it loads.
@@ -1577,30 +2094,46 @@ void drawBrowser(const BrowserModel& m) {
                     dl()->AddImageRounded(ImTextureRef((ImTextureID)e.art), ImVec2(f.x, f.y),
                                           ImVec2(f.x + f.w, f.y + f.h), ImVec2(0, 0), ImVec2(1, 1), col::WHITE, 6.0f);
                 } else {
+                    g_iconActive = hot;
+                    g_iconTag = hot ? g_pulseCount : 0;
                     drawIcon(e.icon, x + layout::ROW_ART_W * 0.5f, r.y + r.h * 0.5f, 30.0f,
-                             hot ? col::WHITE : col::MUTED);
+                             hot ? onHot : col::MUTED);
+                    g_iconActive = false;
+                    g_iconTag = 0;
                 }
                 drawArtBadges(e, f);
                 x += layout::ROW_ART_W + 14;
             } else {
                 x += 8;
             }
-            float tagW = (e.tag.empty() ? 0.0f : std::min(textSize(TEXT_S, e.tag).x, r.w * 0.35f) + 24.0f) +
-                         (e.favorite ? 30.0f : 0.0f);
+            // Chip rows keep the chips clear of any text: their tag moves into the name ("Accent colour  -  Teal").
+            const bool chipRow = e.widget.kind == RowWidget::Kind::Swatches || e.widget.kind == RowWidget::Kind::Shapes;
+            const std::string shownName = (chipRow && !e.tag.empty()) ? e.name + "  -  " + e.tag : e.name;
+            float tagW = (chipRow || e.tag.empty() ? 0.0f : std::min(textSize(TEXT_S, e.tag).x, r.w * 0.35f) + 24.0f) +
+                         (e.favorite ? 30.0f : 0.0f) + (e.addable ? 50.0f : 0.0f);
             float nameW = r.right() - 18 - tagW - x;
+            if (e.widget.kind != RowWidget::Kind::None) nameW = std::min(nameW, rowWidgetLeft(e, r) - x);
             bool twoLines = !e.detail.empty();
             float nameY = twoLines ? r.y + 9 : r.y + (r.h - TEXT_M) * 0.5f;
-            text(TEXT_M, x, nameY, hot ? col::WHITE : col::TEXT, e.name, nameW);
-            if (twoLines) text(TEXT_S, x, r.y + 39, hot ? IM_COL32(0xDD, 0xEE, 0xF7, 0xFF) : col::MUTED, e.detail, nameW);
+            // A greyed row (an option that does not apply right now) keeps its place but fades.
+            auto fade = [&](ImU32 c) { return e.dimmed ? bgTint(c, 0.4f) : c; };
+            g_bold = g_m3e && hot;
+            text(TEXT_M, x, nameY, fade(hot ? onHot : col::TEXT), shownName, nameW);
+            g_bold = false;
+            // (the old fixed pale blue is only right on the plain accent fills; a custom palette can be anything)
+            if (twoLines) text(TEXT_S, x, r.y + 39, fade(hot ? ((g_m3e || g_custom) ? onHot : IM_COL32(0xDD, 0xEE, 0xF7, 0xFF)) : col::MUTED), e.detail, nameW);
+            if (e.widget.kind != RowWidget::Kind::None) drawRowWidget(e, r, hot);
             float tagRight = r.right() - 18;
+            if (e.addable) { drawRowAdd(r, hot); tagRight -= 50; }
             if (e.favorite) {
                 drawIcon(Icon::Heart, tagRight - 10, r.y + r.h * 0.5f, 18.0f, rgb(0xFF5C8A));
                 tagRight -= 30;
             }
-            if (!e.tag.empty()) {
+            if (!e.tag.empty() && !chipRow) {
                 std::string tag = fitText(font(), TEXT_S, e.tag, r.w * 0.35f);
-                textRight(TEXT_S, tagRight, r.y + (r.h - TEXT_S) * 0.5f, hot ? col::WHITE : col::MUTED, tag);
+                textRight(TEXT_S, tagRight, r.y + (r.h - TEXT_S) * 0.5f, fade(hot ? onHot : col::MUTED), tag);
             }
+            if (g_m3e && !m.sidebarFocused) shift.end(m3eRowPush(i - m.selected, press));
         }
         if (total > visible) {
             Rect track = layout::scrollTrack();
@@ -1611,14 +2144,20 @@ void drawBrowser(const BrowserModel& m) {
         }
     }
 
+    drawFabs(m);
     drawHints(m.hints, layout::CONTENT_X, layout::FOOTER_Y);
+    drawSortMenu(m);
     drawUsageCelebration(); // hidden easter egg: over everything, only while it is running
 }
 
 // --- message card ---
 
 void drawMessage(const MessageModel& m) {
-    if (m.overlay) {
+    if (m.overlay && g_m3e) {
+        int v = 0; float sc = 1.0f; // (the card of a message does not spring; only its backdrop fades in)
+        m3eEntranceBegin(dl(), m3e::hashRect(0, 0, 1, 1), v, sc);
+        m3eDialogScrim(dl(), m3e::entranceAlpha(sc), v);
+    } else if (m.overlay) {
         dl()->AddRectFilled(ImVec2(0, 0), ImVec2(layout::SCREEN_W, layout::SCREEN_H), IM_COL32(0, 0, 0, 150));
     } else {
         drawScreenBackdrop();
@@ -1639,8 +2178,12 @@ void drawMessage(const MessageModel& m) {
     float cardH = std::min(560.0f, pad * 2 + TEXT_L + 26.0f + bodyH);
     float y = (layout::SCREEN_H - cardH) * 0.5f - 10.0f;
 
-    surfaceRect({x, y, cardW, cardH}, col::PANEL, 18.0f, GK::Panel);
-    if (g_glass) {
+    // A card over the plain screen is an opaque tonal container; over a dimmed screen (overlay) it is the frosted dialog.
+    surfaceRect({x, y, cardW, cardH}, col::PANEL, 18.0f, (g_m3e && m.overlay) ? GK::Dialog : GK::Panel);
+    if (g_m3e) {
+        // M3E has no accent strip: a busy card shows the loading indicator, an error card an alert cookie.
+        if (m.busy || m.isError) m3eMessageBadge(x + cardW - pad - 28.0f, y + pad + 16.0f, m.busy, m.isError);
+    } else if (g_glass) {
         // Cut from the card's own rounded outline, so the corners follow it.
         glassBand(dl(), x, y, x + cardW, y + cardH, gr(18.0f), y, y + 6.0f, m.isError ? col::ERROR_RED : accentMain());
     } else {
@@ -1653,7 +2196,8 @@ void drawMessage(const MessageModel& m) {
         int dots = (int)(ImGui::GetTime() * 3.0) % 4;
         title += std::string((size_t)dots, '.');
     }
-    text(TEXT_L, x + pad, y + pad, m.isError ? col::ERROR_RED : col::TEXT, title, wrap);
+    text(TEXT_L, x + pad, y + pad, m.isError ? (g_m3e ? g_m3c.onErrorContainer : col::ERROR_RED) : col::TEXT, title,
+         (g_m3e && (m.busy || m.isError)) ? wrap - 72.0f : wrap); // (room for the badge)
 
     float ty = y + pad + TEXT_L + 26.0f;
     const float maxY = y + cardH - pad;
@@ -1677,47 +2221,246 @@ void drawMessage(const MessageModel& m) {
 
 // --- now playing ---
 
+// --- lyrics (Now Playing) ---------------------------------------------------------------------
+
+static ImU32 scaleAlpha(ImU32 c, float f) {
+    const int a = (int)((float)(c >> 24) * std::max(0.0f, std::min(1.0f, f)) + 0.5f);
+    return (c & 0x00FFFFFFu) | ((ImU32)a << 24);
+}
+
+// Multiplies the alpha of every vertex drawn since `v0` -- how a whole group (the lyrics panel, the sync
+// switch) fades in and out with one pass over a few hundred vertices, whatever the style drew it with.
+static void fadeVertices(ImDrawList* d, int v0, float f) {
+    if (f >= 0.999f) return;
+    f = std::max(0.0f, f);
+    const unsigned mul = (unsigned)(f * 256.0f);
+    for (int i = v0; i < d->VtxBuffer.Size; i++) {
+        ImU32& c = d->VtxBuffer[i].col;
+        const unsigned a = ((c >> 24) * mul) >> 8;
+        c = (c & 0x00FFFFFFu) | (a << 24);
+    }
+}
+
+// The lyrics panel: the lines scroll so the one being sung sits in the middle, which grows and brightens
+// while the rest dim towards the panel's edges. Synced lyrics follow the song; plain ones (or with the sync
+// switch off) drift through the whole text as the song plays. Everything is eased by one smoothed position,
+// so a seek or a new line glides instead of jumping. No allocation: a few CalcTextSize calls per frame.
+static void drawLyricsPanel(const NowPlayingModel& m, float t) {
+    if (t <= 0.004f || !m.lyrics || !m.lyrics->available()) return;
+    const lyrics::Lyrics& ly = *m.lyrics;
+    const int n = (int)ly.lines.size();
+    const Rect P = npLyricsPanel();
+    const float slide = 36.0f * (1.0f - t);
+    const float px = P.x + slide;
+    ImDrawList* d = dl();
+    const int v0 = d->VtxBuffer.Size;
+
+    if (themed()) themedSurface(d, px, P.y, px + P.w, P.y + P.h, gr(24.0f), GK::Panel, true);
+    else d->AddRectFilled(ImVec2(px, P.y), ImVec2(px + P.w, P.y + P.h), scaleAlpha(col::PANEL, 0.88f), 24.0f);
+    text(TEXT_S, px + 34.0f, P.y + 18.0f, accentMain(), m.lyricsSync && ly.synced ? "LYRICS  -  SYNCED" : "LYRICS");
+
+    // Where the song is: the line being sung (synced), or how far through the song we are (plain).
+    const bool sync = ly.synced && m.lyricsSync;
+    const int cur = sync ? lyrics::currentLine(ly, m.positionSeconds) : -1;
+    const float target = sync ? (float)std::max(cur, 0)
+                              : (m.durationSeconds > 0.0 ? (float)std::max(0.0, std::min(1.0, m.positionSeconds / m.durationSeconds)) * (float)(n - 1) : 0.0f);
+    static float s = 0.0f, hl = -1.0f, hlAmt = 0.0f;
+    static float vel = 0.0f, idle = 99.0f; // touch scrolling: momentum (lines / second) and seconds since the last touch
+    static std::string seenTitle;
+    static int seenCount = -1;
+    if (m.title != seenTitle || n != seenCount) { seenTitle = m.title; seenCount = n; s = target; hl = (float)cur; hlAmt = sync ? 1.0f : 0.0f; vel = 0.0f; idle = 99.0f; }
+    const float dt = m3eDt();
+    // Touch scrolling: dragging moves the lyrics with the finger, letting go carries on with a little momentum,
+    // and a few seconds after the last touch the lyrics glide back to following the song.
+    const float avgStep = 26.0f * 1.5f + 20.0f;
+    if (m.lyricsTouching || m.lyricsDragDy != 0.0f) {
+        const float dLines = -m.lyricsDragDy / avgStep;
+        s += dLines;
+        vel += (dLines / std::max(dt, 0.004f) - vel) * 0.5f;
+        idle = 0.0f;
+    } else {
+        idle += dt;
+        s += vel * dt;
+        vel *= std::exp(-dt * 4.0f);
+        if (std::fabs(vel) < 0.02f) vel = 0.0f;
+    }
+    s = std::max(0.0f, std::min((float)(n - 1), s));
+    if (idle > 3.0f) s += (target - s) * (1.0f - std::exp(-dt * (sync ? 6.0f : 2.5f))); // back to following the song
+    if (sync) hl += ((float)cur - hl) * (1.0f - std::exp(-dt * 9.0f));
+    hlAmt += ((sync ? 1.0f : 0.0f) - hlAmt) * (1.0f - std::exp(-dt * 8.0f));
+
+    const float clipTop = P.y + 56.0f, clipBot = P.y + P.h - 18.0f, cy = (clipTop + clipBot) * 0.5f;
+    const float wrapW = P.w - 76.0f, gap = 20.0f, fadeH = 96.0f;
+    auto emph = [&](int i) { return hlAmt * std::max(0.0f, 1.0f - std::fabs((float)i - hl)); };
+    auto sizeOf = [&](int i) { return 26.0f + 9.0f * emph(i); };
+    auto textOf = [&](int i) -> const char* { const std::string& x = ly.lines[(size_t)i].text; return x.empty() ? "..." : x.c_str(); };
+    auto heightOf = [&](int i) { return font()->CalcTextSizeA(sizeOf(i), 1e9f, wrapW, textOf(i)).y; };
+
+    d->PushClipRect(ImVec2(px + 8.0f, clipTop), ImVec2(px + P.w - 8.0f, clipBot), true);
+    const int a = std::max(0, std::min(n - 1, (int)std::floor(s)));
+    const float f = s - (float)a;
+    const float ha = heightOf(a);
+    const float stepA = a + 1 < n ? (ha + heightOf(a + 1)) * 0.5f + gap : ha + gap;
+    auto drawLine = [&](int i, float c, float h) {
+        const float e = emph(i);
+        const float edge = std::min((c - clipTop), (clipBot - c)) / fadeH;
+        const float fade = std::max(0.0f, std::min(1.0f, edge));
+        const float base = sync ? 0.50f + 0.50f * e : 0.82f;
+        ImU32 colr = lerpColor(col::MUTED, col::TEXT, sync ? e : 0.85f);
+        colr = scaleAlpha(colr, base * fade);
+        d->AddText(font(), sizeOf(i), ImVec2(px + 34.0f, c - h * 0.5f), colr, textOf(i), nullptr, wrapW);
+    };
+    float c = cy - f * stepA;
+    drawLine(a, c, ha);
+    float cc = c, hh = ha;
+    for (int i = a + 1; i < n; i++) { // downwards
+        const float hi = heightOf(i);
+        cc += hh * 0.5f + gap + hi * 0.5f;
+        hh = hi;
+        if (cc - hi * 0.5f > clipBot) break;
+        drawLine(i, cc, hi);
+    }
+    cc = c; hh = ha;
+    for (int i = a - 1; i >= 0; i--) { // upwards
+        const float hi = heightOf(i);
+        cc -= hh * 0.5f + gap + hi * 0.5f;
+        hh = hi;
+        if (cc + hi * 0.5f < clipTop) break;
+        drawLine(i, cc, hi);
+    }
+    d->PopClipRect();
+    fadeVertices(d, v0, t);
+}
+
+static void drawQueueButton(const NowPlayingModel& m);
+void drawQueueFlyout(const NowPlayingModel& m);
+void drawQueueBrowser(const NowPlayingModel& m);
+void drawVideoSettings(const NowPlayingModel& m);
+
 void drawNowPlaying(const NowPlayingModel& m) {
     drawScreenBackdrop();
     glassArtFocus(m.art);
     drawLogo(30.0f, 40.0f);
 
+    // Lyrics mode: the player glides into a column on the left and the lyrics open on the right. One eased
+    // value (0 normal .. 1 lyrics) drives every position (see npLayout), and is published for touch hit-testing.
+    // M3E eases it with a soft spring (a hint of settle); the other styles with a smooth ease-in-out.
+    float lyrT;
+    {
+        static m3e::Spring lyrSpring;
+        static float lyrEase = 0.0f;
+        if (!m.lyricsCapable) { lyrEase = 0.0f; lyrSpring.reset(0.0f); } // the movie remote never shows lyrics: no slide
+        const float lyrTarget = (m.lyricsOpen && m.lyrics && m.lyrics->available()) ? 1.0f : 0.0f;
+        if (g_m3e) {
+            lyrSpring.step(m3eDt(), lyrTarget, 210.0f, 24.0f);
+            lyrEase = lyrSpring.x;
+            lyrT = std::max(0.0f, std::min(1.0f, lyrSpring.x));
+        } else {
+            lyrEase += (lyrTarget - lyrEase) * (1.0f - std::exp(-m3eDt() * 9.0f));
+            if (std::fabs(lyrTarget - lyrEase) < 0.0005f) lyrEase = lyrTarget;
+            lyrT = lyrEase * lyrEase * (3.0f - 2.0f * lyrEase);
+            lyrSpring.reset(lyrEase); // keeps the spring in step if the style changes
+        }
+        npLyr() = lyrT;
+    }
+    const NpLayout L = npLayout(lyrT);
+
+    // Events the icons answer with an animation: a jump in the position is a seek (back or forward), a change of
+    // the touched button is a press, a change of volume step is a nudge. (Only used by M3E.)
+    static std::string evTitle;
+    static double evPos = 0.0;
+    static uint32_t evBack = 0, evFwd = 0, evPress[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    static int evLastPressed = -1;
+    if (m.title != evTitle) { evTitle = m.title; evPos = m.positionSeconds; }
+    else {
+        const double dpos = m.positionSeconds - evPos;
+        if (dpos > 2.0) evFwd++; else if (dpos < -2.0) evBack++;
+        evPos = m.positionSeconds;
+    }
+    if (m.pressedButton != evLastPressed) {
+        if (m.pressedButton >= 0 && m.pressedButton < 8) evPress[m.pressedButton]++;
+        evLastPressed = m.pressedButton;
+    }
+    const uint32_t volStep = (uint32_t)(std::max(0.0f, std::min(1.0f, m.volume)) * 12.0f + 0.5f);
+
     // Artwork: the album art, or a gradient tile with a note.
-    const float art = layout::NP_ART;
-    const float ax = layout::NP_ART_X, ay = layout::NP_ART_Y;
-    if (m.art) {
+    const float art = L.art;
+    const float ax = L.artX, ay = L.artY;
+    if (m.art && g_m3e) {
+        // Cover art keeps the signature shape: the picture is clipped to the same slowly turning cookie as the default tile.
+        m3eCookieImage(dl(), (ImTextureID)m.art, ax + art * 0.5f, ay + art * 0.5f, art * 0.5f / 1.085f, 9, 0.085f, (float)ImGui::GetTime() * 0.12f,
+                       ImVec2(0, 0), ImVec2(1, 1), col::WHITE);
+    } else if (m.art) {
         dl()->AddImageRounded(ImTextureRef((ImTextureID)m.art), ImVec2(ax, ay), ImVec2(ax + art, ay + art),
                               ImVec2(0, 0), ImVec2(1, 1), col::WHITE, 22.0f);
+    } else if (g_m3e) {
+        // No cover art: the featured tile is a slowly turning cookie holding the note (M3E's signature shape).
+        m3eCookie(dl(), ax + art * 0.5f, ay + art * 0.5f, art * 0.5f, 9, 0.085f, (float)ImGui::GetTime() * 0.12f, accentDeep());
+        g_iconActive = true;
+        drawIcon(Icon::Music, ax + art * 0.5f, ay + art * 0.5f, 150.0f, g_m3c.onPrimaryContainer);
+        g_iconActive = false;
     } else {
         gradientRoundRect(ax, ay, ax + art, ay + art, 22.0f, accentSecond(), accentDeep());
         drawIcon(Icon::Music, ax + art * 0.5f, ay + art * 0.5f, 150.0f, IM_COL32(0xFF, 0xFF, 0xFF, 0xD0));
     }
     if (m.paused) {
-        dl()->AddRectFilled(ImVec2(ax, ay), ImVec2(ax + art, ay + art), IM_COL32(0, 0, 0, 0x70), 22.0f);
+        if (g_m3e) m3eCookie(dl(), ax + art * 0.5f, ay + art * 0.5f, art * 0.5f / 1.085f, 9, 0.085f, (float)ImGui::GetTime() * 0.12f, IM_COL32(0, 0, 0, 0x70));
+        else dl()->AddRectFilled(ImVec2(ax, ay), ImVec2(ax + art, ay + art), IM_COL32(0, 0, 0, 0x70), 22.0f);
         float cx = ax + art * 0.5f, cy = ay + art * 0.5f;
         dl()->AddRectFilled(ImVec2(cx - 34, cy - 44), ImVec2(cx - 10, cy + 44), col::WHITE, 5.0f);
         dl()->AddRectFilled(ImVec2(cx + 10, cy - 44), ImVec2(cx + 34, cy + 44), col::WHITE, 5.0f);
     }
 
-    const float tx = layout::NP_TEXT_X;
-    const float tw = layout::NP_TEXT_W;
-    text(TEXT_S, tx, layout::NP_LABEL_Y, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
-    dl()->AddText(font(), 40.0f, ImVec2(tx, layout::NP_LABEL_Y + 36.0f), col::TEXT, m.title.c_str(), nullptr, tw);
-    text(TEXT_M, tx, layout::NP_SUBTITLE_Y, col::MUTED, m.subtitle, tw);
+    const float tx = L.textX, tw = L.textW;     // label, title, subtitle
+    const float cx0 = L.ctlX, cw = L.ctlW;      // progress bar, buttons, volume, queue lines
+    text(TEXT_S, tx, L.labelY, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
+    dl()->PushClipRect(ImVec2(tx - 4.0f, L.labelY + 30.0f), ImVec2(tx + tw + 4.0f, L.subtitleY - 2.0f), true);
+    dl()->AddText(font(), L.titleSize, ImVec2(tx, L.labelY + 36.0f), col::TEXT, m.title.c_str(), nullptr, tw);
+    dl()->PopClipRect();
+    text(TEXT_M, tx, L.subtitleY, col::MUTED, m.subtitle, tw);
 
-    drawProgress(tx, layout::NP_PROGRESS_Y, tw, 8.0f, m.positionSeconds, m.durationSeconds, false);
-    text(TEXT_S, tx, layout::NP_TIME_Y, col::MUTED, formatTime(m.positionSeconds));
+    const double shownPos = m.scrubbing ? m.scrubSeconds : m.positionSeconds; // a finger on the bar: the time it would seek to
+    drawProgress(cx0, L.progressY, cw, 8.0f, shownPos, m.durationSeconds, false, !m.paused && !m.scrubbing);
+    text(TEXT_S, cx0, L.timeY, m.scrubbing ? accentMain() : col::MUTED, formatTime(shownPos));
+    if (m.scrubbing && m.durationSeconds > 0.0) { // a bubble over the knob says where lifting the finger will go
+        const std::string t = formatTime(shownPos);
+        const ImVec2 ts = textSize(TEXT_M, t);
+        const float f = (float)std::max(0.0, std::min(1.0, shownPos / m.durationSeconds));
+        const float bw = ts.x + 28.0f, bh = ts.y + 14.0f;
+        const float bx = std::max(cx0 - 6.0f, std::min(cx0 + cw + 6.0f - bw, cx0 + cw * f - bw * 0.5f)), by = L.progressY - 22.0f - bh;
+        if (g_m3e) dl()->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), accentMain(), bh * 0.5f);
+        else dl()->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), accentDeep(), bh * 0.5f);
+        dl()->AddText(font(), TEXT_M, ImVec2(bx + 14.0f, by + 7.0f), g_m3e ? onMain() : col::WHITE, t.c_str());
+    }
     if (m.durationSeconds > 0.0)
-        textRight(TEXT_S, tx + tw, layout::NP_TIME_Y, col::MUTED, formatTime(m.durationSeconds));
+        textRight(TEXT_S, cx0 + cw, L.timeY, col::MUTED, formatTime(m.durationSeconds));
 
     // Transport buttons: seek back / play-pause / seek forward / stop,
     // touch-tappable (see layout::npButtonRect / hitTestNowPlaying).
     // Slightly transparent so they read as an overlay on the artwork
     // row rather than solid chrome.
     for (int i = 0; i < (int)ui::NpButton::Count; i++) {
-        ui::Rect r = ui::npButtonRect(i);
+        const ui::Rect rr = ui::npButtonRect(i); // (touch rectangle: the user's width / height)
+        ui::Rect r = rr;
         float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
-        if (g_glass) {
+        r.w = r.h = std::min(rr.w, rr.h); // (the icons are sized from the smaller side)
+        const bool isPlay = ((ui::NpButton)i == ui::NpButton::PlayPause);
+        float grow = 0.0f;
+        if (g_m3e) { // connected button group: neighbours of a pressed button are pushed aside, it swells
+            static const int rankOf[6] = {1, 2, 3, 4, 0, 5}; // left-to-right place of each NpButton
+            float push = 0.0f;
+            m3eGroupMotion(i, rankOf[i], m.pressedButton >= 0 && m.pressedButton < 6 ? rankOf[m.pressedButton] : -1, push, grow);
+            cx += push;
+        }
+        if (g_m3e) {
+            // M3E media player: seek buttons are tonal rounded rectangles; play/pause is the wide primary-filled
+            // one (drawn wider than its touch rect, into the gap), a pill when it offers "play" and a rounded
+            // rectangle while playing; pressing squares the corners.
+            const int kind = isPlay ? 0 : 1;
+            const float hw = (isPlay ? rr.w * 0.70f : rr.w * 0.5f) * (1.0f + 0.14f * grow);
+            m3eTransportButton(dl(), cx, cy, hw, rr.h * 0.5f * (1.0f + 0.04f * grow), g_btnSize[kind][0], g_btnSize[kind][1], isPlay ? accentMain() : g_m3c.secondaryContainer,
+                               m.pressedButton == i, isPlay ? (m.paused ? 0.5f : 0.44f) : 0.44f, i, g_btnShape[isPlay ? 0 : 1]);
+        } else if (g_glass) {
             // Normal / pressed (finger down on it, from the existing touch
             // hit-test). Focus on this screen is the touch/remote itself, so
             // "hot" is not used here.
@@ -1726,19 +2469,56 @@ void drawNowPlaying(const NowPlayingModel& m) {
             dl()->AddCircleFilled(ImVec2(cx, cy), r.w * 0.5f, IM_COL32(0x2C, 0x31, 0x3A, 0xB0), 32);
             dl()->AddCircle(ImVec2(cx, cy), r.w * 0.5f, IM_COL32(0x3A, 0x3F, 0x48, 0xA0), 32, 1.5f);
         }
-        const ImU32 ic = IM_COL32(0xEC, 0xEE, 0xF1, 0xE6);
+        const ImU32 ic = g_m3e ? (isPlay ? onMain() : g_m3c.onSecondaryContainer) : IM_COL32(0xEC, 0xEE, 0xF1, 0xE6);
+        M3eFxScope fxs;
         switch ((ui::NpButton)i) {
             case ui::NpButton::SeekBack:
             case ui::NpButton::SeekForward: {
-                const char* label = (ui::NpButton)i == ui::NpButton::SeekBack ? "-10" : "+30";
-                const float fs = r.w * 0.34f;
+                const bool back = (ui::NpButton)i == ui::NpButton::SeekBack;
+                const char* label = back ? "10" : "30";
+                const float fs = r.w * 0.27f;
                 ImVec2 sz = font()->CalcTextSizeA(fs, 1e9f, 0.0f, label);
-                dl()->AddText(font(), fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, label);
+                if (g_m3e) {
+                    // Android's replay-10 / forward-30: a circular arrow round the number. When a seek happens (or the
+                    // button is pressed) the arrow turns one full lap in the direction of the seek.
+                    fxs.begin(3000 + i, true, {0.16f, 0.0f, 0.0f, back ? -6.2832f : 6.2832f, 0.0f, true}, r.w, cx, cy,
+                              (back ? evBack : evFwd) + evPress[i]);
+                    const float rr = r.w * 0.36f, sgn = back ? -1.0f : 1.0f, th = 2.6f;
+                    ImVec2 arc[26];
+                    for (int k = 0; k < 26; k++) {
+                        const float a = (-65.0f + 290.0f * (float)k / 25.0f) * 0.0174533f;
+                        arc[k] = ImVec2(cx + sgn * std::cos(a) * rr, cy + std::sin(a) * rr);
+                    }
+                    dl()->AddPolyline(arc, 26, ic, 0, th);
+                    const float ea = 225.0f * 0.0174533f;
+                    const ImVec2 P = arc[25];
+                    const ImVec2 T(sgn * -std::sin(ea), std::cos(ea)), N(sgn * std::cos(ea), std::sin(ea));
+                    const float hl = r.w * 0.17f, hw = r.w * 0.11f;
+                    dl()->AddTriangleFilled(ImVec2(P.x + T.x * hl, P.y + T.y * hl), ImVec2(P.x + N.x * hw, P.y + N.y * hw),
+                                            ImVec2(P.x - N.x * hw, P.y - N.y * hw), ic);
+                    fxs.end();
+                    dl()->AddText(font(), fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, label);
+                    break;
+                }
+                label = back ? "-10" : "+30";
+                sz = font()->CalcTextSizeA(r.w * 0.34f, 1e9f, 0.0f, label);
+                dl()->AddText(font(), r.w * 0.34f, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, label);
                 break;
             }
             case ui::NpButton::PlayPause: {
                 const float s = r.w * 0.32f;
-                if (m.paused) {
+                if (g_m3e) {
+                    // The play / pause icon morphs (two quads that turn into the triangle and back) on a spring.
+                    static m3e::Spring pp;
+                    pp.step(m3eDt(), m.paused ? 0.0f : 1.0f);
+                    float q[16];
+                    m3e::playPausePoints(std::max(0.0f, std::min(1.15f, pp.x)), q);
+                    for (int k = 0; k < 2; k++) {
+                        const ImVec2 poly[4] = {ImVec2(cx + q[8 * k] * s, cy + q[8 * k + 1] * s), ImVec2(cx + q[8 * k + 2] * s, cy + q[8 * k + 3] * s),
+                                                ImVec2(cx + q[8 * k + 4] * s, cy + q[8 * k + 5] * s), ImVec2(cx + q[8 * k + 6] * s, cy + q[8 * k + 7] * s)};
+                        dl()->AddConvexPolyFilled(poly, 4, ic);
+                    }
+                } else if (m.paused) {
                     dl()->AddTriangleFilled(ImVec2(cx - s * 0.55f, cy - s), ImVec2(cx - s * 0.55f, cy + s),
                                             ImVec2(cx + s * 0.85f, cy), ic);
                 } else {
@@ -1749,11 +2529,13 @@ void drawNowPlaying(const NowPlayingModel& m) {
             }
             case ui::NpButton::Stop: {
                 const float s = r.w * 0.32f;
-                dl()->AddRectFilled(ImVec2(cx - s * 0.75f, cy - s * 0.75f), ImVec2(cx + s * 0.75f, cy + s * 0.75f), ic, 2.0f);
+                if (g_m3e) fxs.begin(3003, true, {0.30f, 0.0f, 0.0f, 0.0f, 0.0f, true}, r.w, cx, cy, evPress[3]);
+                dl()->AddRectFilled(ImVec2(cx - s * 0.75f, cy - s * 0.75f), ImVec2(cx + s * 0.75f, cy + s * 0.75f), ic, g_m3e ? s * 0.3f : 2.0f);
                 break;
             }
             default: break;
         }
+        fxs.end();
     }
 
     // Shuffle / Repeat (music queues only). OFF: a plain dim button, icon grey, caption "off". ON: the button is
@@ -1764,8 +2546,19 @@ void drawNowPlaying(const NowPlayingModel& m) {
             const bool isShuffle = (w == (int)ui::NpButton::Shuffle);
             const bool on = isShuffle ? m.shuffleOn : m.repeatMode != 0;
             const ui::Rect r = ui::npToggleRect((ui::NpButton)w);
-            const float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f, rad = r.w * 0.5f;
-            if (g_glass) {
+            float cx = r.x + r.w * 0.5f;
+            const float cy = r.y + r.h * 0.5f, rad = std::min(r.w, r.h) * 0.5f;
+            float growm = 0.0f;
+            if (g_m3e) {
+                // M3E toggle button: tonal when off, primary when on, and the ON state is a rounded square (selected
+                // toggles change shape, not only colour -- so it reads without relying on colour alone).
+                static const int rankOf[6] = {1, 2, 3, 4, 0, 5};
+                float push = 0.0f;
+                m3eGroupMotion(w, rankOf[w], m.pressedButton >= 0 && m.pressedButton < 6 ? rankOf[m.pressedButton] : -1, push, growm);
+                cx += push;
+                m3eTransportButton(dl(), cx, cy, r.w * 0.5f * (1.0f + 0.14f * growm), r.h * 0.5f * (1.0f + 0.04f * growm), g_btnSize[2][0], g_btnSize[2][1],
+                                   on ? accentMain() : g_m3c.secondaryContainer, m.pressedButton == w, on ? 0.42f : 0.5f, w, g_btnShape[2]);
+            } else if (g_glass) {
                 glassCircle(dl(), cx, cy, rad, m.pressedButton == w ? GK::ButtonPressed : (on ? GK::ButtonHot : GK::Button), true);
                 if (on) dl()->AddCircleFilled(ImVec2(cx, cy), rad * 0.94f, (accentMain() & 0x00FFFFFF) | (0x9Cu << 24), 32);
             } else if (on) {
@@ -1775,7 +2568,14 @@ void drawNowPlaying(const NowPlayingModel& m) {
                 dl()->AddCircleFilled(ImVec2(cx, cy), rad, IM_COL32(0x2C, 0x31, 0x3A, 0x90), 32);
                 dl()->AddCircle(ImVec2(cx, cy), rad, IM_COL32(0x3A, 0x3F, 0x48, 0x90), 32, 1.5f);
             }
-            const ImU32 ic = on ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0xA0, 0xA5, 0xAE, 0xB0);
+            const ImU32 ic = g_m3e ? (on ? onMain() : g_m3c.onSecondaryContainer)
+                                   : (on ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0xA0, 0xA5, 0xAE, 0xB0));
+            M3eFxScope fxs;
+            if (g_m3e) // the icon pops (shuffle wiggles, repeat spins a turn) when its toggle comes on or changes mode
+                // shuffle flips over (the order is swapped), repeat turns a full lap -- on every press, whatever the state
+                fxs.begin(isShuffle ? 3100u : 3200u, true,
+                          isShuffle ? m3e::IconFxStyle{0.14f, 0.0f, 0.0f, 0.0f, 5.2f, true} : m3e::IconFxStyle{0.12f, 0.0f, 0.0f, 6.2832f, 0.0f, true},
+                          rad * 2.0f, cx, cy, isShuffle ? (uint32_t)m.shuffleOn + 2u * evPress[w] : (uint32_t)m.repeatMode + 4u * evPress[w]);
             const float s = rad * 0.52f, th = 2.6f;
             ImDrawList* d = dl();
             auto arrowRight = [&](float x, float y) { d->AddTriangleFilled(ImVec2(x + s * 0.42f, y), ImVec2(x - s * 0.1f, y - s * 0.32f), ImVec2(x - s * 0.1f, y + s * 0.32f), ic); };
@@ -1800,6 +2600,7 @@ void drawNowPlaying(const NowPlayingModel& m) {
                     d->AddText(font(), fs, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), ic, "1");
                 }
             }
+            fxs.end();
             // The state, written under the button.
             const char* name = isShuffle ? (on ? "Shuffle on" : "Shuffle off")
                                          : (m.repeatMode == 0 ? "Repeat off" : (m.repeatMode == 1 ? "Repeat all" : "Repeat one"));
@@ -1820,8 +2621,35 @@ void drawNowPlaying(const NowPlayingModel& m) {
         const float lineH = 6.0f;
         const float iconW = 30.0f;
         float trackX = vr.x + iconW, trackW = vr.w - iconW;
-        drawIcon(Icon::Music, vr.x + iconW * 0.5f, lineY, iconW * 0.8f, IM_COL32(0xB8, 0xBC, 0xC4, 0xFF));
-        if (g_glass) {
+        g_iconActive = true;
+        g_iconTag = volStep + 1u;
+        g_iconHoldless = true;
+        drawIcon(Icon::Music, vr.x + iconW * 0.5f, lineY, iconW * 0.8f, g_m3e ? col::MUTED : IM_COL32(0xB8, 0xBC, 0xC4, 0xFF));
+        g_iconActive = false;
+        g_iconTag = 0;
+        g_iconHoldless = false;
+        if (g_m3e) {
+            // M3E slider: a thick track, a primary fill, and a tall handle with a gap round it. Only the OUTER ends are
+            // rounded (the fill's left end, the track's right end, which also carries the small end dot); the ends
+            // that face the handle are nearly square.
+            const float th = 16.0f, y0 = lineY - th * 0.5f, y1 = lineY + th * 0.5f, hx = trackX + trackW * vol;
+            const float trackEnd = trackX + trackW, gap = 6.0f, small = 3.0f;
+            const float fillEnd = std::max(trackX + th * 0.5f, hx - gap), trackStart = hx + gap; // (at full volume nothing is left: no stub behind the handle)
+            if (vol <= 0.0f) {
+                dl()->AddRectFilled(ImVec2(trackX, y0), ImVec2(trackEnd, y1), col::TRACK, th * 0.5f);
+            } else {
+                // fill: round on the left, a small radius where it meets the handle
+                dl()->AddRectFilled(ImVec2(trackX, y0), ImVec2(fillEnd, y1), accentMain(), th * 0.5f, ImDrawFlags_RoundCornersLeft);
+                dl()->AddRectFilled(ImVec2(std::max(trackX + th * 0.5f, fillEnd - th), y0), ImVec2(fillEnd, y1), accentMain(), small, ImDrawFlags_RoundCornersRight);
+                // track: a small radius where it meets the handle, round on the far right
+                if (trackStart < trackEnd - 2.0f) {
+                    dl()->AddRectFilled(ImVec2(trackStart, y0), ImVec2(trackEnd, y1), col::TRACK, th * 0.5f, ImDrawFlags_RoundCornersRight);
+                    dl()->AddRectFilled(ImVec2(trackStart, y0), ImVec2(std::min(trackEnd - th * 0.5f, trackStart + th), y1), col::TRACK, small, ImDrawFlags_RoundCornersLeft);
+                }
+            }
+            if (trackEnd - trackStart > th) dl()->AddCircleFilled(ImVec2(trackEnd - th * 0.5f, lineY), 2.5f, accentMain(), 10); // the end dot (only when there is track to hold it)
+            dl()->AddRectFilled(ImVec2(hx - 3.0f, lineY - 18.0f), ImVec2(hx + 3.0f, lineY + 18.0f), accentMain(), 3.0f);
+        } else if (g_glass) {
             // A glass groove with an accent fill cut from the groove's own
             // rounded outline, and a glass knob.
             const float gh = 14.0f, gy0 = lineY - gh * 0.5f, gy1 = lineY + gh * 0.5f;
@@ -1844,10 +2672,82 @@ void drawNowPlaying(const NowPlayingModel& m) {
         }
     }
 
-    if (!m.queueText.empty()) text(TEXT_S, tx, layout::NP_QUEUE_Y, col::TEXT, m.queueText, tw);
-    if (!m.nextText.empty()) text(TEXT_S, tx, layout::NP_QUEUE_Y + 30.0f, col::MUTED, m.nextText, tw);
+    if (!m.queueText.empty()) text(TEXT_S, cx0, L.queueY, col::TEXT, m.queueText, cw);
+    if (!m.nextText.empty()) text(TEXT_S, cx0, L.queueY + 30.0f, col::MUTED, m.nextText, cw);
 
+    // Lyrics: the panel on the right, the sync switch beside it, and the Lyrics button at the end of the
+    // volume row (greyed when the song has no lyrics).
+    drawLyricsPanel(m, lyrT);
+    {
+        const bool avail = m.lyrics && m.lyrics->available();
+        const bool hasSync = avail && m.lyrics->synced;
+        // One round button, in the style's own look: off (dim), on (accent), disabled (greyed).
+        auto roundButton = [&](const ui::Rect& r, bool on, bool disabled, bool pressed, int slot) {
+            const float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f, rad = std::min(r.w, r.h) * 0.5f;
+            if (g_m3e) {
+                const ImU32 fill = on ? accentMain() : (disabled ? lerpColor(col::PANEL, g_m3c.secondaryContainer, 0.35f) : g_m3c.secondaryContainer);
+                m3eTransportButton(dl(), cx, cy, r.w * 0.5f, r.h * 0.5f, g_btnSize[2][0], g_btnSize[2][1], fill, pressed && !disabled, on ? 0.42f : 0.5f, slot, g_btnShape[2]);
+            } else if (g_glass) {
+                glassCircle(dl(), cx, cy, rad, disabled ? GK::ButtonDisabled : (pressed ? GK::ButtonPressed : (on ? GK::ButtonHot : GK::Button)), true);
+                if (on && !disabled) dl()->AddCircleFilled(ImVec2(cx, cy), rad * 0.94f, (accentMain() & 0x00FFFFFF) | (0x9Cu << 24), 32);
+            } else if (on && !disabled) {
+                dl()->AddCircleFilled(ImVec2(cx, cy), rad, accentMain(), 32);
+                dl()->AddCircle(ImVec2(cx, cy), rad, IM_COL32(0xFF, 0xFF, 0xFF, 0x70), 32, 1.5f);
+            } else {
+                dl()->AddCircleFilled(ImVec2(cx, cy), rad, IM_COL32(0x2C, 0x31, 0x3A, disabled ? 0x48 : 0x90), 32);
+                dl()->AddCircle(ImVec2(cx, cy), rad, IM_COL32(0x3A, 0x3F, 0x48, disabled ? 0x50 : 0x90), 32, 1.5f);
+            }
+        };
+        auto iconColor = [&](bool on, bool disabled) -> ImU32 {
+            if (disabled) return scaleAlpha(g_m3e ? col::MUTED : IM_COL32(0xA0, 0xA5, 0xAE, 0xFF), 0.40f);
+            return g_m3e ? (on ? onMain() : g_m3c.onSecondaryContainer) : (on ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0xA0, 0xA5, 0xAE, 0xB0));
+        };
+
+        // Lyrics button: a speech bubble with two lines of text.
+        if (m.lyricsCapable) {
+            const ui::Rect r = ui::npLyricsRect();
+            const bool on = m.lyricsOpen && avail, dis = !avail;
+            roundButton(r, on, dis, m.pressedButton == (int)ui::NpButton::Lyrics, 3300);
+            const float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f, s = std::min(r.w, r.h) * 0.27f, th = 2.4f;
+            const ImU32 ic = iconColor(on, dis);
+            M3eFxScope fxs;
+            if (g_m3e && !dis) fxs.begin(3300u, true, {0.16f, 0.0f, 0.0f, 0.0f, 0.0f, true}, r.w, cx, cy, (uint32_t)on + 2u * evPress[(int)ui::NpButton::Lyrics]);
+            ImDrawList* d = dl();
+            d->AddRect(ImVec2(cx - s * 1.1f, cy - s * 0.85f), ImVec2(cx + s * 1.1f, cy + s * 0.6f), ic, s * 0.35f, 0, th);
+            d->AddTriangleFilled(ImVec2(cx - s * 0.6f, cy + s * 0.55f), ImVec2(cx - s * 0.1f, cy + s * 0.55f), ImVec2(cx - s * 0.75f, cy + s * 1.1f), ic);
+            d->AddLine(ImVec2(cx - s * 0.6f, cy - s * 0.35f), ImVec2(cx + s * 0.6f, cy - s * 0.35f), ic, th);
+            d->AddLine(ImVec2(cx - s * 0.6f, cy + s * 0.05f), ImVec2(cx + s * 0.2f, cy + s * 0.05f), ic, th);
+            fxs.end();
+        }
+
+        // Sync switch: left of the lyrics, a clock; lit while the lyrics follow the song, greyed when the lyrics
+        // carry no timing at all.
+        if (lyrT > 0.004f && avail) {
+            const int v0 = dl()->VtxBuffer.Size;
+            const ui::Rect r = ui::npLyricsSyncRect();
+            const bool on = hasSync && m.lyricsSync, dis = !hasSync;
+            roundButton(r, on, dis, m.pressedButton == (int)ui::NpButton::LyricsSync, 3301);
+            const float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f, s = std::min(r.w, r.h) * 0.27f, th = 2.4f;
+            const ImU32 ic = iconColor(on, dis);
+            M3eFxScope fxs;
+            if (g_m3e && !dis) fxs.begin(3301u, true, {0.12f, 0.0f, 0.0f, 6.2832f, 0.0f, true}, r.w, cx, cy, (uint32_t)on + 2u * evPress[(int)ui::NpButton::LyricsSync]);
+            ImDrawList* d = dl();
+            d->AddCircle(ImVec2(cx, cy), s * 1.15f, ic, 28, th);
+            d->AddLine(ImVec2(cx, cy), ImVec2(cx, cy - s * 0.75f), ic, th);
+            d->AddLine(ImVec2(cx, cy), ImVec2(cx + s * 0.5f, cy + s * 0.2f), ic, th);
+            fxs.end();
+            const char* cap = !hasSync ? "Plain only" : (m.lyricsSync ? "Synced" : "Plain");
+            const ImVec2 cs = font()->CalcTextSizeA(15.0f, 1e9f, 0.0f, cap);
+            d->AddText(font(), 15.0f, ImVec2(cx - cs.x * 0.5f, r.y + r.h + 7.0f), on ? accentMain() : col::MUTED, cap);
+            fadeVertices(d, v0, lyrT);
+        }
+    }
+
+    drawQueueButton(m);
     drawHints(m.hints, 110.0f, layout::FOOTER_Y);
+    drawQueueFlyout(m);   // (popups: on the foreground list, above everything)
+    drawQueueBrowser(m);
+    drawVideoSettings(m);
 }
 
 // --- music visualizer ---
@@ -1860,31 +2760,115 @@ void drawMusicVisualizer(const VisualizerModel& m) {
     text(TEXT_S, 60.0f, 108.0f, accentMain(), m.paused ? "PAUSED" : "NOW PLAYING");
     text(TEXT_M, 60.0f, 140.0f, col::TEXT, m.title, W - 120.0f);
 
-    // Bars, centered, leaving room for the title above and hints below.
+    // The picture, centred, leaving room for the title above and hints below.
     const int n = m.bandCount > 0 ? std::min(m.bandCount, VisualizerModel::MAX_BANDS) : 0;
     if (n > 0) {
+        const float left = 60.0f, right = W - 60.0f;
         const float top = 240.0f, bottom = layout::FOOTER_Y - 60.0f;
         const float areaH = bottom - top;
+        auto lvl = [&](int i) {
+            float level = m.bands[std::max(0, std::min(n - 1, i))];
+            return level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
+        };
+        // Low bands lean toward the deep accent, high bands toward the secondary accent: a cheap per-bar
+        // gradient in the same two-colour palette as drawLogo and the Now Playing art.
+        auto bandColor = [&](float t) { return lerpColor(accentDeep(), accentSecond(), std::max(0.0f, std::min(1.0f, t))); };
+        const int style = ((m.style % VisualizerModel::STYLE_COUNT) + VisualizerModel::STYLE_COUNT) % VisualizerModel::STYLE_COUNT;
         const float gap = 18.0f;
-        const float barW = (W - 120.0f - gap * (n - 1)) / (float)n;
-        for (int i = 0; i < n; i++) {
-            float level = m.bands[i];
-            if (level < 0.0f) level = 0.0f;
-            if (level > 1.0f) level = 1.0f;
-            // A small floor so a quiet passage still shows a sliver of
-            // every bar rather than the row looking dead/broken.
-            float h = areaH * (0.03f + 0.97f * level);
-            float x0 = 60.0f + i * (barW + gap);
-            float x1 = x0 + barW;
-            float y1 = bottom;
-            float y0 = bottom - h;
-            // Low bands lean toward the deep accent, high bands toward
-            // the secondary accent -- a cheap per-bar gradient rather
-            // than a full per-pixel one, matching the same two-colour
-            // palette used everywhere else (drawLogo, Now Playing art).
-            float t = (float)i / (float)std::max(1, n - 1);
-            ImU32 bandColor = lerpColor(accentDeep(), accentSecond(), t);
-            gradientRoundRect(x0, y0, x1, y1, std::min(10.0f, barW * 0.3f), accentMain(), bandColor);
+        const float barW = (right - left - gap * (n - 1)) / (float)n;
+        const float midY = (top + bottom) * 0.5f;
+        if (style == 0) { // Bars
+            for (int i = 0; i < n; i++) {
+                // A small floor so a quiet passage still shows a sliver of every bar rather than looking dead.
+                const float h = areaH * (0.03f + 0.97f * lvl(i));
+                const float x0 = left + i * (barW + gap), x1 = x0 + barW;
+                gradientRoundRect(x0, bottom - h, x1, bottom, g_m3e ? std::min(barW * 0.5f, h * 0.5f) : std::min(10.0f, barW * 0.3f),
+                                  accentMain(), bandColor((float)i / (float)std::max(1, n - 1)));
+            }
+        } else if (style == 1) { // Terrain (3D): the spectrum as a ridge landscape, each moment rolling away into the distance
+            static const int ROWS = 11;
+            static float hist[ROWS][VisualizerModel::MAX_BANDS];
+            static double lastPush = -1.0;
+            const double nowT = ImGui::GetTime();
+            if (lastPush < 0.0 || nowT - lastPush > 0.075 || nowT < lastPush) { // a new row about 13 times a second
+                for (int r = ROWS - 1; r > 0; r--) for (int i = 0; i < VisualizerModel::MAX_BANDS; i++) hist[r][i] = hist[r - 1][i];
+                for (int i = 0; i < VisualizerModel::MAX_BANDS; i++) hist[0][i] = i < n ? lvl(i) : 0.0f;
+                lastPush = nowT;
+            }
+            const float cx = (left + right) * 0.5f, halfFront = (right - left) * 0.5f;
+            const float yFront = bottom, yBack = top + areaH * 0.30f;
+            for (int r = ROWS - 1; r >= 0; r--) { // far to near, so nearer rows cover the ones behind
+                const float t = (float)r / (float)(ROWS - 1);
+                const float persp = 1.0f - 0.55f * t;                       // things shrink with distance
+                const float y = yFront + (yBack - yFront) * std::pow(t, 0.85f);
+                const float halfW = halfFront * persp;
+                const float hMax = areaH * 0.46f * persp;
+                ImVec2 ridge[VisualizerModel::MAX_BANDS];
+                for (int i = 0; i < n; i++) {
+                    const float u = n > 1 ? (float)i / (float)(n - 1) : 0.5f;
+                    const float level = std::max(0.0f, std::min(1.0f, hist[r][i]));
+                    ridge[i] = ImVec2(cx + (u - 0.5f) * 2.0f * halfW, y - hMax * (0.03f + 0.97f * level));
+                }
+                for (int i = 0; i + 1 < n; i++) {
+                    const float u = (float)i / (float)std::max(1, n - 1);
+                    const ImU32 body = lerpColor(bandColor(u), col::BG, 0.25f + 0.65f * t); // fades into the backdrop with distance
+                    dl()->AddQuadFilled(ridge[i], ridge[i + 1], ImVec2(ridge[i + 1].x, y), ImVec2(ridge[i].x, y), body);
+                }
+                const float thick = std::max(1.2f, 3.2f * persp);
+                dl()->AddPolyline(ridge, n, lerpColor(accentSecond(), col::TEXT, 0.35f * (1.0f - t)), 0, thick);
+            }
+        } else if (style == 2) { // Segments: stacks of small blocks, like an LED level meter
+            const int segs = 16;
+            const float segGap = 5.0f, segH = (areaH - segGap * (segs - 1)) / (float)segs;
+            for (int i = 0; i < n; i++) {
+                const float x0 = left + i * (barW + gap), x1 = x0 + barW;
+                const int lit = (int)std::ceil(lvl(i) * (float)segs - 0.001f);
+                for (int sI = 0; sI < segs; sI++) {
+                    const float y1 = bottom - sI * (segH + segGap), y0 = y1 - segH;
+                    const bool on = sI < lit;
+                    const ImU32 c = on ? lerpColor(accentDeep(), accentSecond(), (float)sI / (float)(segs - 1)) : col::PANEL;
+                    dl()->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), c, g_m3e ? segH * 0.5f : 3.0f);
+                }
+            }
+        } else if (style == 3) { // Radial: bars around a circle, mirrored left / right so it stays balanced
+            const float cx = W * 0.5f, cy = midY;
+            const float r0 = areaH * 0.20f, rMax = areaH * 0.5f - 6.0f;
+            const int total = n * 2;
+            float avg = 0.0f;
+            for (int i = 0; i < n; i++) avg += lvl(i);
+            avg /= (float)n;
+            // a soft disc that breathes with the overall level
+            dl()->AddCircleFilled(ImVec2(cx, cy), r0 * (0.85f + 0.35f * avg), (accentDeep() & 0x00FFFFFFu) | 0x60000000u, 48);
+            const float th = std::max(4.0f, (6.2831853f * r0) / (float)total * 0.62f);
+            for (int k = 0; k < total; k++) {
+                const int band = k < n ? k : total - 1 - k; // low bands at the top, spreading down both sides
+                const float a = -1.5707963f + (6.2831853f * (float)k) / (float)total;
+                const float len = (rMax - r0) * (0.04f + 0.96f * lvl(band));
+                const float ca = std::cos(a), sa = std::sin(a);
+                dl()->AddLine(ImVec2(cx + ca * r0, cy + sa * r0), ImVec2(cx + ca * (r0 + len), cy + sa * (r0 + len)),
+                              bandColor((float)band / (float)std::max(1, n - 1)), th);
+                dl()->AddCircleFilled(ImVec2(cx + ca * (r0 + len), cy + sa * (r0 + len)), th * 0.5f,
+                                      bandColor((float)band / (float)std::max(1, n - 1)), 10);
+            }
+        } else { // Wave: a smooth curve through the levels, filled underneath
+            const int steps = 96;
+            static ImVec2 pts[97];
+            for (int s2 = 0; s2 <= steps; s2++) {
+                const float u = (float)s2 / (float)steps * (float)(n - 1);
+                const int i1 = (int)std::floor(u), i0 = i1 - 1, i2 = i1 + 1, i3 = i1 + 2;
+                const float t = u - (float)i1;
+                // Catmull-Rom between the four nearest levels
+                const float p0 = lvl(i0), p1 = lvl(i1), p2 = lvl(std::min(i2, n - 1)), p3 = lvl(i3);
+                float v = 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t * t +
+                                  (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t * t * t);
+                v = std::max(0.0f, std::min(1.0f, v));
+                pts[s2] = ImVec2(left + (right - left) * (float)s2 / (float)steps, bottom - areaH * (0.03f + 0.97f * v));
+            }
+            for (int s2 = 0; s2 < steps; s2++) { // fill: one quad per step, tinted along the width
+                const ImU32 c = (bandColor((float)s2 / (float)steps) & 0x00FFFFFFu) | 0x70000000u;
+                dl()->AddQuadFilled(pts[s2], pts[s2 + 1], ImVec2(pts[s2 + 1].x, bottom), ImVec2(pts[s2].x, bottom), c);
+            }
+            dl()->AddPolyline(pts, steps + 1, accentMain(), ImDrawFlags_None, g_m3e ? 6.0f : 4.0f);
         }
     } else {
         // No audio data yet (e.g. right at track start) -- a calm empty
@@ -1903,12 +2887,16 @@ void drawBufferingIndicator(double bufferedSeconds, double targetSeconds) {
 
     // Translucent disc so the wheel reads over any picture, then a dim full
     // ring with a bright ~110 degree arc spinning around it (~1 turn/s).
-    if (g_glass) glassCircle(dl(), cx, cy, 64.0f, GK::Overlay, false);
+    if (themed()) glassCircle(dl(), cx, cy, 64.0f, GK::Overlay, false);
     else dl()->AddCircleFilled(ImVec2(cx, cy), 64.0f, IM_COL32(0, 0, 0, 0x90), 48);
-    dl()->AddCircle(ImVec2(cx, cy), ring, IM_COL32(0xFF, 0xFF, 0xFF, 0x40), 32, thick);
-    const float a0 = (float)std::fmod(ImGui::GetTime() * 6.2, (double)PI2);
-    dl()->PathArcTo(ImVec2(cx, cy), ring, a0, a0 + 1.9f, 20);
-    dl()->PathStroke(col::WHITE, ImDrawFlags_None, thick);
+    if (g_m3e) {
+        m3eLoader(dl(), cx, cy, 34.0f, accentMain(), ImGui::GetTime()); // M3E loading indicator: a morphing cookie
+    } else {
+        dl()->AddCircle(ImVec2(cx, cy), ring, IM_COL32(0xFF, 0xFF, 0xFF, 0x40), 32, thick);
+        const float a0 = (float)std::fmod(ImGui::GetTime() * 6.2, (double)PI2);
+        dl()->PathArcTo(ImVec2(cx, cy), ring, a0, a0 + 1.9f, 20);
+        dl()->PathStroke(col::WHITE, ImDrawFlags_None, thick);
+    }
 
     // "Buffering  4 / 12 s": calm wording, in a pill under the wheel.
     char buf[64];
@@ -1920,9 +2908,9 @@ void drawBufferingIndicator(double bufferedSeconds, double targetSeconds) {
     }
     const ImVec2 s = textSize(TEXT_S, buf);
     const float bx = cx - s.x * 0.5f - 16.0f, by = cy + 64.0f + 12.0f;
-    if (g_glass) glassSurface(dl(), bx, by, bx + s.x + 32.0f, by + s.y + 14.0f, gr(12.0f), GK::Overlay, false);
+    if (themed()) themedSurface(dl(), bx, by, bx + s.x + 32.0f, by + s.y + 14.0f, gr(12.0f), GK::Overlay, false);
     else dl()->AddRectFilled(ImVec2(bx, by), ImVec2(bx + s.x + 32.0f, by + s.y + 14.0f), IM_COL32(0, 0, 0, 0xB0), 12.0f);
-    text(TEXT_S, bx + 16.0f, by + 7.0f, col::WHITE, buf);
+    text(TEXT_S, bx + 16.0f, by + 7.0f, onOverlay(), buf);
 }
 
 void drawVideoHud(const VideoHudModel& m) {
@@ -1932,10 +2920,10 @@ void drawVideoHud(const VideoHudModel& m) {
 
     if (m.paused) {
         float cx = W * 0.5f, cy = H * 0.45f;
-        if (g_glass) glassCircle(dl(), cx, cy, 64.0f, GK::Overlay, false);
+        if (themed()) glassCircle(dl(), cx, cy, 64.0f, GK::Overlay, false);
         else dl()->AddCircleFilled(ImVec2(cx, cy), 64.0f, IM_COL32(0, 0, 0, 0x90), 48);
-        dl()->AddRectFilled(ImVec2(cx - 24, cy - 30), ImVec2(cx - 7, cy + 30), col::WHITE, 4.0f);
-        dl()->AddRectFilled(ImVec2(cx + 7, cy - 30), ImVec2(cx + 24, cy + 30), col::WHITE, 4.0f);
+        dl()->AddRectFilled(ImVec2(cx - 24, cy - 30), ImVec2(cx - 7, cy + 30), onOverlay(), g_m3e ? 8.0f : 4.0f);
+        dl()->AddRectFilled(ImVec2(cx + 7, cy - 30), ImVec2(cx + 24, cy + 30), onOverlay(), g_m3e ? 8.0f : 4.0f);
     }
 
     if (m.seekDelta != 0.0) {
@@ -1944,37 +2932,38 @@ void drawVideoHud(const VideoHudModel& m) {
                  formatTime(m.seekTarget).c_str());
         ImVec2 s = textSize(TEXT_L, buf);
         float bx = (W - s.x) * 0.5f - 28, by = 60.0f;
-        if (g_glass) glassSurface(dl(), bx, by, bx + s.x + 56, by + s.y + 28, gr(16.0f), GK::Overlay, false);
+        if (themed()) themedSurface(dl(), bx, by, bx + s.x + 56, by + s.y + 28, gr(16.0f), GK::Overlay, false);
         else dl()->AddRectFilled(ImVec2(bx, by), ImVec2(bx + s.x + 56, by + s.y + 28), IM_COL32(0, 0, 0, 0xB0), 16.0f);
-        text(TEXT_L, bx + 28, by + 14, col::WHITE, buf);
+        text(TEXT_L, bx + 28, by + 14, onOverlay(), buf);
     }
 
     if (!m.notice.empty()) {
         ImVec2 ns = textSize(TEXT_M, m.notice);
         float bx = (W - ns.x) * 0.5f - 24, by = 60.0f;
         if (m.seekDelta != 0.0) by += 70;
-        if (g_glass) glassSurface(dl(), bx, by, bx + ns.x + 48, by + ns.y + 24, gr(14.0f), GK::Overlay, false);
+        if (themed()) themedSurface(dl(), bx, by, bx + ns.x + 48, by + ns.y + 24, gr(14.0f), GK::Overlay, false);
         else dl()->AddRectFilled(ImVec2(bx, by), ImVec2(bx + ns.x + 48, by + ns.y + 24), IM_COL32(0, 0, 0, 0xB0), 14.0f);
-        text(TEXT_M, bx + 24, by + 12, col::WHITE, m.notice);
+        text(TEXT_M, bx + 24, by + 12, onOverlay(), m.notice);
     }
 
     if (m.trackMenu) {
         // Audio & subtitles panel, right side.
         const float pw = 560, px = W - pw - 50, py = 120, rowH = 74;
-        if (g_glass) glassSurface(dl(), px, py, px + pw, py + 70 + 2 * (rowH + 10) + 20, gr(18.0f), GK::Overlay, false);
+        if (themed()) themedSurface(dl(), px, py, px + pw, py + 70 + 2 * (rowH + 10) + 20, gr(18.0f), GK::Overlay, false);
         else dl()->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + 70 + 2 * (rowH + 10) + 20), IM_COL32(0x14, 0x16, 0x1A, 0xEE), 18.0f);
-        text(TEXT_L, px + 28, py + 22, col::WHITE, "Audio & subtitles");
+        text(TEXT_L, px + 28, py + 22, onOverlay(), "Audio & subtitles");
         const char* labels[2] = {"Audio", "Subtitles"};
         const std::string values[2] = {m.audioLabel, m.subtitleLabel};
         for (int i = 0; i < 2; i++) {
             float ry = py + 76 + i * (rowH + 10);
             bool sel = (i == m.trackRow);
-            if (g_glass) glassSurface(dl(), px + 18, ry, px + pw - 18, ry + rowH, gr(12.0f), sel ? GK::RowFocus : GK::Row, false);
+            if (themed()) themedSurface(dl(), px + 18, ry, px + pw - 18, ry + rowH, gr(12.0f), sel ? GK::RowFocus : GK::Row, false);
             else dl()->AddRectFilled(ImVec2(px + 18, ry), ImVec2(px + pw - 18, ry + rowH), sel ? accentDeep() : col::PANEL, 12.0f);
-            text(TEXT_S, px + 36, ry + 10, sel ? col::WHITE : col::MUTED, labels[i]);
-            text(TEXT_M, px + 60, ry + 36, col::WHITE, values[i], pw - 150);
-            text(TEXT_M, px + 36, ry + 36, col::WHITE, "<");
-            textRight(TEXT_M, px + pw - 36, ry + 36, col::WHITE, ">");
+            const ImU32 rowText = sel ? onFocus() : onOverlay();
+            text(TEXT_S, px + 36, ry + 10, sel ? onFocus() : col::MUTED, labels[i]);
+            text(TEXT_M, px + 60, ry + 36, rowText, values[i], pw - 150);
+            text(TEXT_M, px + 36, ry + 36, rowText, "<");
+            textRight(TEXT_M, px + pw - 36, ry + 36, rowText, ">");
         }
     }
 
@@ -1994,7 +2983,7 @@ void drawVideoHud(const VideoHudModel& m) {
         text(TEXT_L, x, y, col::WHITE, m.title, w);
     }
     y += 50.0f;
-    drawProgress(x, y, w, 6.0f, m.positionSeconds, m.durationSeconds, m.live);
+    drawProgress(x, y, w, 6.0f, m.positionSeconds, m.durationSeconds, m.live, !m.paused);
     y += 18.0f;
     text(TEXT_S, x, y, IM_COL32(0xDD, 0xDD, 0xDD, 0xFF), formatTime(m.positionSeconds));
     if (m.durationSeconds > 0.0) {
@@ -2026,16 +3015,24 @@ void drawLogin(const LoginModel& m) {
         bool focus = (i == m.focused);
         if (f.isButton) {
             ImU32 fill = f.primary ? (focus ? accentMain() : accentDeep()) : (focus ? col::PANEL_HI : col::PANEL);
-            surfaceRect(r, fill, 14.0f, (f.primary || focus) ? GK::ButtonHot : GK::Button);
-            if (!g_glass && focus && !f.primary) {
+            if (g_m3e) {
+                // M3E buttons: the primary one is filled (primary), the others are tonal; focus morphs them to a pill.
+                m3eButton(r, f.primary ? accentMain() : g_m3c.secondaryContainer, focus);
+            } else {
+                surfaceRect(r, fill, 14.0f, (f.primary || focus) ? GK::ButtonHot : GK::Button);
+            }
+            if (!themed() && focus && !f.primary) {
                 dl()->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 14.0f, 0, 2.5f);
             }
             ImVec2 ts = textSize(TEXT_M, f.label);
-            text(TEXT_M, r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - TEXT_M) * 0.5f - 1, col::WHITE, f.label);
+            g_bold = g_m3e;
+            text(TEXT_M, r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - TEXT_M) * 0.5f - 1,
+                 g_m3e ? (f.primary ? onMain() : g_m3c.onSecondaryContainer) : col::WHITE, f.label);
+            g_bold = false;
             continue;
         }
         surfaceRect(r, focus ? col::PANEL_HI : col::PANEL, 14.0f, focus ? GK::ButtonHot : GK::Button);
-        if (!g_glass && focus) dl()->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 14.0f, 0, 2.5f);
+        if (!themed() && focus) dl()->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 14.0f, 0, 2.5f);
         text(TEXT_S, r.x + 20, r.y + 9, focus ? accentMain() : col::MUTED, f.label);
         std::string shown = f.value;
         if (f.password && !shown.empty()) {
@@ -2092,13 +3089,17 @@ void drawToast(const std::string& t, double age, double lifetime) {
     ImVec2 ts = textSize(TEXT_M, t);
     float w = ts.x + 48, h = 50, x = (layout::SCREEN_W - w) * 0.5f, y = 24;
     ImDrawList* fg = ImGui::GetForegroundDrawList();
-    if (g_glass) {
+    if (g_m3e) {
+        // M3E snackbar: a tonal pill, no outline.
+        themedSurface(fg, x, y, x + w, y + h, h * 0.5f, GK::Button, false, alpha);
+    } else if (g_glass) {
         glassSurface(fg, x, y, x + w, y + h, h * 0.5f, GK::Button, true, alpha);
     } else {
         fg->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x2C, 0x31, 0x3A, (int)(245 * alpha)), h * 0.5f);
         fg->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x00, 0xA4, 0xDC, (int)(255 * alpha)), h * 0.5f, 0, 2.0f);
     }
-    fg->AddText(font(), TEXT_M, ImVec2(x + 24, y + (h - ts.y) * 0.5f), IM_COL32(0xEC, 0xEE, 0xF1, (int)(255 * alpha)),
+    fg->AddText(font(), TEXT_M, ImVec2(x + 24, y + (h - ts.y) * 0.5f),
+                g_m3e ? ((col::TEXT & 0x00FFFFFFu) | ((ImU32)(255 * alpha) << 24)) : IM_COL32(0xEC, 0xEE, 0xF1, (int)(255 * alpha)),
                 t.c_str());
 }
 
@@ -2108,13 +3109,13 @@ void drawProgressToast(const std::string& t, float fraction, float y) {
     const float barW = std::max(220.0f, ts.x), barH = 6.0f;
     const float w = barW + 48, h = 68, x = (layout::SCREEN_W - w) * 0.5f;
     ImDrawList* fg = ImGui::GetForegroundDrawList();
-    if (g_glass) {
-        glassSurface(fg, x, y, x + w, y + h, 24.0f, GK::Button, true, 1.0f);
+    if (themed()) {
+        themedSurface(fg, x, y, x + w, y + h, 24.0f, GK::Button, !g_m3e, 1.0f);
     } else {
         fg->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x2C, 0x31, 0x3A, 245), 24.0f);
         fg->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(0x00, 0xA4, 0xDC, 255), 24.0f, 0, 2.0f);
     }
-    fg->AddText(font(), TEXT_M, ImVec2(x + (w - ts.x) * 0.5f, y + 10), IM_COL32(0xEC, 0xEE, 0xF1, 255), t.c_str());
+    fg->AddText(font(), TEXT_M, ImVec2(x + (w - ts.x) * 0.5f, y + 10), g_m3e ? col::TEXT : IM_COL32(0xEC, 0xEE, 0xF1, 255), t.c_str());
     const float bx = x + 24, by = y + h - 18;
     fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + barW, by + barH), col::TRACK, barH * 0.5f);
     if (fraction > 0.0f)
@@ -2151,7 +3152,7 @@ void drawCrtOverlay(double time) {
 
 void drawChoice(const ChoiceModel& m) {
     ImDrawList* fg = ImGui::GetForegroundDrawList();
-    fg->AddRectFilled(ImVec2(0, 0), ImVec2(layout::SCREEN_W, layout::SCREEN_H), IM_COL32(0, 0, 0, 0xB0));
+    if (!g_m3e) fg->AddRectFilled(ImVec2(0, 0), ImVec2(layout::SCREEN_W, layout::SCREEN_H), IM_COL32(0, 0, 0, 0xB0));
     const int n = (int)m.options.size();
     Rect first = choiceRow(0, n), last = choiceRow(n > 0 ? n - 1 : 0, n);
     float cardX = first.x - 40, cardW = first.w + 80;
@@ -2160,9 +3161,13 @@ void drawChoice(const ChoiceModel& m) {
         cardX -= 130;
         cardW += 130;
     }
-    if (g_glass) glassSurface(fg, cardX, cardY, cardX + cardW, cardY + cardH, gr(18.0f), GK::Panel, true);
+    int entV = 0; float entS = 1.0f;
+    if (g_m3e) m3eEntranceBegin(fg, m3e::hashRect(cardX, cardY, cardW, cardH), entV, entS); // the card springs in
+    if (g_m3e) m3eDialogScrim(fg, m3e::entranceAlpha(entS), entV); // the screen behind blurs and takes the accent wash
+    if (themed()) themedSurface(fg, cardX, cardY, cardX + cardW, cardY + cardH, gr(18.0f), g_m3e ? GK::Dialog : GK::Panel, true);
     else fg->AddRectFilled(ImVec2(cardX, cardY), ImVec2(cardX + cardW, cardY + cardH), col::PANEL, 18.0f);
-    if (g_glass) glassBand(fg, cardX, cardY, cardX + cardW, cardY + cardH, gr(18.0f), cardY, cardY + 6.0f, accentMain());
+    if (g_m3e) { /* (no accent strip in M3E) */ }
+    else if (g_glass) glassBand(fg, cardX, cardY, cardX + cardW, cardY + cardH, gr(18.0f), cardY, cardY + 6.0f, accentMain());
     else fg->AddRectFilled(ImVec2(cardX, cardY), ImVec2(cardX + cardW, cardY + 6), accentMain(), gr(18.0f),
                            ImDrawFlags_RoundCornersTop);
     float tx = first.x;
@@ -2176,10 +3181,12 @@ void drawChoice(const ChoiceModel& m) {
     for (int i = 0; i < n; i++) {
         Rect r = choiceRow(i, n);
         bool sel = (i == m.selected);
-        if (g_glass) glassSurface(fg, r.x, r.y, r.right(), r.bottom(), gr(14.0f), sel ? GK::ButtonHot : GK::Button, true);
+        if (themed()) themedSurface(fg, r.x, r.y, r.right(), r.bottom(), gr(14.0f), sel ? GK::ButtonHot : GK::Button, true);
         else fg->AddRectFilled(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), sel ? accentDeep() : col::PANEL_HI, 14.0f);
         ImVec2 ts = textSize(TEXT_M, m.options[(size_t)i]);
-        fg->AddText(font(), TEXT_M, ImVec2(r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - ts.y) * 0.5f), col::WHITE,
+        const ImU32 optText = g_m3e ? (sel ? onFocus() : col::TEXT) : col::WHITE;
+        if (g_m3e && sel) fg->AddText(font(), TEXT_M, ImVec2(r.x + (r.w - ts.x) * 0.5f + 0.7f, r.y + (r.h - ts.y) * 0.5f), optText, m.options[(size_t)i].c_str());
+        fg->AddText(font(), TEXT_M, ImVec2(r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - ts.y) * 0.5f), optText,
                     m.options[(size_t)i].c_str());
     }
     // Hints under the card (drawn on top, like the card).
@@ -2188,7 +3195,7 @@ void drawChoice(const ChoiceModel& m) {
     for (const Hint& hint : m.hints) {
         float bw = std::max(2 * rr, textSize(TEXT_S, hint.button).x + 14.0f);
         float hy = cardY + cardH + 18;
-        if (g_glass) glassSurface(fg, hx, hy, hx + bw, hy + 2 * rr, rr, GK::Button, true);
+        if (themed()) themedSurface(fg, hx, hy, hx + bw, hy + 2 * rr, rr, GK::Button, true);
         else fg->AddRectFilled(ImVec2(hx, hy), ImVec2(hx + bw, hy + 2 * rr), col::PANEL_HI, rr);
         ImVec2 bs = textSize(TEXT_S, hint.button);
         fg->AddText(font(), TEXT_S, ImVec2(hx + (bw - bs.x) * 0.5f, hy + rr - bs.y * 0.5f), col::TEXT, hint.button.c_str());
@@ -2196,6 +3203,54 @@ void drawChoice(const ChoiceModel& m) {
         fg->AddText(font(), TEXT_S, ImVec2(hx, hy + rr - bs.y * 0.5f), col::MUTED, hint.label.c_str());
         hx += textSize(TEXT_S, hint.label).x + 26;
     }
+    if (g_m3e) m3eEntranceEnd(fg, entV, entS, cardX + cardW * 0.5f, cardY + cardH * 0.5f);
+}
+
+void drawTrackPrompt(const TrackPromptModel& m) {
+    drawScreenBackdrop();
+    drawLogo(30.0f, 40.0f);
+    const Rect card = trackPromptCard();
+    surfaceRect(card, col::PANEL, 18.0f, GK::Panel);
+    if (!g_m3e) {
+        if (g_glass) glassBand(dl(), card.x, card.y, card.right(), card.bottom(), gr(18.0f), card.y, card.y + 6.0f, accentMain());
+        else dl()->AddRectFilled(ImVec2(card.x, card.y), ImVec2(card.right(), card.y + 6), accentMain(), gr(18.0f), ImDrawFlags_RoundCornersTop);
+    }
+    text(TEXT_L, card.x + 30.0f, card.y + 28.0f, col::TEXT, m.title, card.w - 60.0f);
+    text(TEXT_S, card.x + 30.0f, card.y + 74.0f, col::MUTED, m.subtitle, card.w - 60.0f);
+
+    const char* labels[2] = {"Audio", "Subtitles"};
+    const std::string values[2] = {m.audioLabel, m.subtitleLabel};
+    for (int i = 0; i < 2; i++) {
+        const Rect r = trackPromptSlot(i);
+        const bool sel = (m.selected == i);
+        surfaceRect(r, sel ? accentDeep() : col::PANEL_HI, 14.0f, sel ? GK::RowFocus : GK::Row);
+        const ImU32 rowText = sel ? onFocus() : col::TEXT;
+        text(TEXT_S, r.x + 22.0f, r.y + 9.0f, sel ? onFocus() : col::MUTED, labels[i]);
+        text(TEXT_M, r.x + 22.0f, r.y + 35.0f, rowText, "<");
+        textRight(TEXT_M, r.right() - 22.0f, r.y + 35.0f, rowText, ">");
+        const float vw = r.w - 130.0f;
+        const ImVec2 vs = textSize(TEXT_M, fitText(font(), TEXT_M, values[i], vw));
+        text(TEXT_M, r.x + (r.w - vs.x) * 0.5f, r.y + 35.0f, rowText, values[i], vw);
+    }
+
+    const char* buttons[2] = {"OK", "Always use default"};
+    for (int i = 0; i < 2; i++) {
+        const Rect r = trackPromptSlot(2 + i);
+        const bool focus = (m.selected == 2 + i), primary = (i == 0);
+        if (g_m3e) {
+            m3eButton(r, primary ? accentMain() : g_m3c.secondaryContainer, focus);
+        } else {
+            const ImU32 fill = primary ? (focus ? accentMain() : accentDeep()) : (focus ? col::PANEL_HI : col::PANEL);
+            surfaceRect(r, fill, 14.0f, (primary || focus) ? GK::ButtonHot : GK::Button);
+            if (!themed() && focus && !primary) dl()->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 14.0f, 0, 2.5f);
+        }
+        const ImVec2 ts = textSize(TEXT_M, buttons[i]);
+        g_bold = g_m3e;
+        text(TEXT_M, r.x + (r.w - ts.x) * 0.5f, r.y + (r.h - TEXT_M) * 0.5f - 1,
+             g_m3e ? (primary ? onMain() : g_m3c.onSecondaryContainer) : col::WHITE, buttons[i]);
+        g_bold = false;
+    }
+    drawHints(m.hints, card.x, card.bottom() + 22.0f);
 }
 
 // --- Help window ----------------------------------------------------------------------------
@@ -2429,35 +3484,43 @@ void drawHelp(const HelpModel& m) {
     const Rect& c = g.card;
 
     // Everything behind is dimmed; in Liquid Glass mode a full-screen sheet frosts it first.
+    int entV = 0; float entS = 1.0f;
     if (g_glass) glassSurface(fg, 0, 0, W, H, 0.0f, GK::Overlay, true, 0.55f);
-    fg->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, g_glass ? 0x90 : 0xC8));
+    if (!g_m3e) fg->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, g_glass ? 0x90 : 0xC8));
+    if (g_m3e) m3eEntranceBegin(fg, m3e::hashRect(c.x, c.y, c.w, c.h), entV, entS); // the card springs in (scale + fade)
+    if (g_m3e) m3eDialogScrim(fg, m3e::entranceAlpha(entS), entV);
 
     // The card.
-    if (g_glass) {
+    if (g_m3e) {
+        themedSurface(fg, c.x, c.y, c.right(), c.bottom(), gr(22.0f), GK::Dialog, true);
+    } else if (g_glass) {
         glassSurface(fg, c.x, c.y, c.right(), c.bottom(), gr(22.0f), GK::Panel, true);
         // A faint tint inside the glass so the text stays readable over whatever is behind it.
         fg->AddRectFilled(ImVec2(c.x + 2, c.y + 2), ImVec2(c.right() - 2, c.bottom() - 2), bgTint(col::BG, 0.40f), gr(22.0f));
     } else {
         fg->AddRectFilled(ImVec2(c.x, c.y), ImVec2(c.right(), c.bottom()), col::PANEL, 22.0f);
     }
-    if (g_glass) glassBand(fg, c.x, c.y, c.right(), c.bottom(), gr(22.0f), c.y, c.y + 6.0f, accentMain());
+    if (g_m3e) { /* (no accent strip in M3E) */ }
+    else if (g_glass) glassBand(fg, c.x, c.y, c.right(), c.bottom(), gr(22.0f), c.y, c.y + 6.0f, accentMain());
     else fg->AddRectFilled(ImVec2(c.x, c.y), ImVec2(c.right(), c.y + 6), accentMain(), 22.0f, ImDrawFlags_RoundCornersTop);
 
     // Header: title, controller tabs.
     fg->AddText(font(), TEXT_L, ImVec2(c.x + 28, c.y + 18), col::TEXT, "Help");
+    if (g_m3e) fg->AddText(font(), TEXT_L, ImVec2(c.x + 28.7f, c.y + 18), col::TEXT, "Help"); // (heavier headline)
     for (size_t i = 0; i < g.tabs.size(); i++) {
         const Rect& t = g.tabs[i];
         const bool sel = ((int)i == m.tab);
-        if (g_glass) glassSurface(fg, t.x, t.y, t.right(), t.bottom(), t.h * 0.5f, sel ? GK::ButtonHot : GK::Button, true);
+        if (themed()) themedSurface(fg, t.x, t.y, t.right(), t.bottom(), t.h * 0.5f, sel ? GK::ButtonHot : GK::Button, true);
         else fg->AddRectFilled(ImVec2(t.x, t.y), ImVec2(t.right(), t.bottom()), sel ? accentDeep() : col::PANEL_HI, t.h * 0.5f);
         const ImVec2 ts = textSize(TEXT_S, m.tabs[i]);
-        fg->AddText(font(), TEXT_S, ImVec2(t.x + (t.w - ts.x) * 0.5f, t.y + (t.h - ts.y) * 0.5f), sel ? col::WHITE : col::MUTED,
+        fg->AddText(font(), TEXT_S, ImVec2(t.x + (t.w - ts.x) * 0.5f, t.y + (t.h - ts.y) * 0.5f), sel ? onFocus() : col::MUTED,
                     m.tabs[i].c_str());
     }
 
     // Stage: the rotating model, then its name and a note.
-    fg->AddRectFilled(ImVec2(g.stage.x, g.stage.y), ImVec2(g.stage.right(), g.stage.bottom()), bgTint(col::BG, 0.45f), 18.0f);
-    fg->AddRect(ImVec2(g.stage.x, g.stage.y), ImVec2(g.stage.right(), g.stage.bottom()), bgTint(col::TEXT, 0.10f), 18.0f, 0, 1.0f);
+    const float stageR = g_m3e ? 28.0f : 18.0f;
+    fg->AddRectFilled(ImVec2(g.stage.x, g.stage.y), ImVec2(g.stage.right(), g.stage.bottom()), bgTint(col::BG, g_m3e ? 0.70f : 0.45f), stageR);
+    if (!g_m3e) fg->AddRect(ImVec2(g.stage.x, g.stage.y), ImVec2(g.stage.right(), g.stage.bottom()), bgTint(col::TEXT, 0.10f), stageR, 0, 1.0f);
     {
         ModelSlot& slot = pollModel(m.tab);
         const float cx = g.stage.x + g.stage.w * 0.5f, cy = g.stage.y + g.stage.h * 0.40f;
@@ -2501,13 +3564,13 @@ void drawHelp(const HelpModel& m) {
         }
         const bool sel = ((int)i == m.cursor);
         if (sel) {
-            if (g_glass) glassSurface(fg, g.list.x, y + 1, g.list.right() - 12.0f, y + h - 1, gr(10.0f), GK::RowFocus, false);
+            if (themed()) themedSurface(fg, g.list.x, y + 1, g.list.right() - 12.0f, y + h - 1, gr(10.0f), GK::RowFocus, false);
             else fg->AddRectFilled(ImVec2(g.list.x, y + 1), ImVec2(g.list.right() - 12.0f, y + h - 1), col::PANEL_HI, 10.0f);
         }
         const float cw = std::max(34.0f, textSize(TEXT_S, r.button).x + 22.0f), ch = 26.0f, cy = y + (h - ch) * 0.5f;
-        fg->AddRectFilled(ImVec2(chipX + 6, cy), ImVec2(chipX + 6 + cw, cy + ch), sel ? accentDeep() : col::PANEL_HI, ch * 0.5f);
+        fg->AddRectFilled(ImVec2(chipX + 6, cy), ImVec2(chipX + 6 + cw, cy + ch), sel ? (g_m3e ? accentMain() : accentDeep()) : col::PANEL_HI, ch * 0.5f);
         const ImVec2 bs = textSize(TEXT_S, r.button);
-        fg->AddText(font(), TEXT_S, ImVec2(chipX + 6 + (cw - bs.x) * 0.5f, cy + (ch - bs.y) * 0.5f), sel ? col::WHITE : col::TEXT,
+        fg->AddText(font(), TEXT_S, ImVec2(chipX + 6 + (cw - bs.x) * 0.5f, cy + (ch - bs.y) * 0.5f), sel ? (g_m3e ? onMain() : onFocus()) : col::TEXT,
                     r.button.c_str());
         fg->AddText(font(), TEXT_S, ImVec2(actionX, y + (h - textSize(TEXT_S, r.action).y) * 0.5f), sel ? col::TEXT : col::MUTED,
                     fitText(font(), TEXT_S, r.action, g.list.right() - actionX - 16.0f).c_str());
@@ -2525,7 +3588,7 @@ void drawHelp(const HelpModel& m) {
     const float rr = 14.0f, hy = c.bottom() - 52.0f;
     for (const Hint& hint : m.hints) {
         const float bw = std::max(2 * rr, textSize(TEXT_S, hint.button).x + 14.0f);
-        if (g_glass) glassSurface(fg, hx, hy, hx + bw, hy + 2 * rr, rr, GK::Button, true);
+        if (themed()) themedSurface(fg, hx, hy, hx + bw, hy + 2 * rr, rr, GK::Button, true);
         else fg->AddRectFilled(ImVec2(hx, hy), ImVec2(hx + bw, hy + 2 * rr), col::PANEL_HI, rr);
         const ImVec2 bs = textSize(TEXT_S, hint.button);
         fg->AddText(font(), TEXT_S, ImVec2(hx + (bw - bs.x) * 0.5f, hy + rr - bs.y * 0.5f), col::TEXT, hint.button.c_str());
@@ -2533,16 +3596,29 @@ void drawHelp(const HelpModel& m) {
         fg->AddText(font(), TEXT_S, ImVec2(hx, hy + rr - bs.y * 0.5f), col::MUTED, hint.label.c_str());
         hx += textSize(TEXT_S, hint.label).x + 26;
     }
+    if (g_m3e) m3eEntranceEnd(fg, entV, entS, c.x + c.w * 0.5f, c.y + c.h * 0.5f);
 }
 
 void drawUpNext(const UpNextModel& m) {
     drawScreenBackdrop();
     drawLogo(30.0f, 40.0f);
     const float artW = 300, artH = 420, ax = 150, ay = 150;
-    if (m.art) {
+    if (m.art && g_m3e) {
+        // Square centre crop of the poster inside the cookie.
+        ImVec2 uv0(0, 0), uv1(1, 1);
+        if (m.artAspect > 0.0f && m.artAspect < 1.0f) { const float v = (1.0f - m.artAspect) * 0.5f; uv0.y = v; uv1.y = 1.0f - v; }
+        else if (m.artAspect > 1.0f) { const float u = (1.0f - 1.0f / m.artAspect) * 0.5f; uv0.x = u; uv1.x = 1.0f - u; }
+        m3eCookieImage(dl(), (ImTextureID)m.art, ax + artW * 0.5f, ay + 60 + artW * 0.375f, artW * 0.48f, 9, 0.085f,
+                       (float)ImGui::GetTime() * 0.12f, uv0, uv1, col::WHITE);
+    } else if (m.art) {
         layout::Fit f = layout::fitInside(ax, ay, artW, artH, m.artAspect);
         dl()->AddImageRounded(ImTextureRef((ImTextureID)m.art), ImVec2(f.x, f.y), ImVec2(f.x + f.w, f.y + f.h),
-                              ImVec2(0, 0), ImVec2(1, 1), col::WHITE, 14.0f);
+                              ImVec2(0, 0), ImVec2(1, 1), col::WHITE, g_m3e ? 28.0f : 14.0f);
+    } else if (g_m3e) {
+        m3eCookie(dl(), ax + artW * 0.5f, ay + 60 + artW * 0.375f, artW * 0.42f, 9, 0.085f, (float)ImGui::GetTime() * 0.12f, accentDeep());
+        g_iconActive = true;
+        drawIcon(Icon::Episode, ax + artW * 0.5f, ay + 60 + artW * 0.375f, 110.0f, g_m3c.onPrimaryContainer);
+        g_iconActive = false;
     } else {
         gradientRoundRect(ax, ay + 60, ax + artW, ay + 60 + artW * 0.75f, 16.0f, accentSecond(), accentDeep());
         drawIcon(Icon::Episode, ax + artW * 0.5f, ay + 60 + artW * 0.375f, 110.0f, IM_COL32(255, 255, 255, 0xD0));
@@ -2582,4 +3658,7 @@ void applyTheme() {
 } // namespace ui
 
 // The "Who's watching?" screen, built from the helpers above (see profiles_ui.h).
+#include "m3e_draw.inc"
 #include "profiles_ui.inc"
+#include "library_ui.inc"
+#include "queue_ui.inc"

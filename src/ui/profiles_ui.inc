@@ -1,7 +1,7 @@
 // profiles_ui.inc -- the "Who's watching?" screen (see profiles_ui.h).
 //
 // Included at the END of app_ui.cpp, after `} // namespace ui`, because it is built from that file's
-// private helpers (dl(), text(), surfaceRect(), drawHints(), col::, g_glass, ...). It is not compiled
+// private helpers (dl(), text(), surfaceRect(), drawHints(), col::, g_glass, g_m3e, ...). It is not compiled
 // on its own.
 #include "profiles_ui.h"
 
@@ -42,6 +42,7 @@ Rect pfLogoutRect(int count, int i) { return {pfColumnX(count, i), PF_LOGOUT_Y, 
 // shape narrows toward the top while it is stretched and bulges at the bottom while it is squashed.
 struct PfBlob {
     float cx = 0, centreY = 0, r = 0, sx = 1, sy = 1, shear = 0, stretch = 0, squash = 0;
+    float cookie = 0, phase = 0; // M3E: depth of the scalloped edge (0 = a plain disc) and its turn
 
     PfBlob(float cx_, float ground, float D, const BounceShape& b) {
         cx = cx_;
@@ -54,6 +55,11 @@ struct PfBlob {
         centreY = ground - b.lift * D - r * b.sy;
     }
     ImVec2 at(float u, float v) const {
+        if (cookie > 0.0f) { // the selected picture becomes a 9-lobed cookie (radial scale, then the same squash/lean)
+            const float f = m3e::cookieRadius(std::atan2(v, u), 9, cookie, phase);
+            u *= f;
+            v *= f;
+        }
         float w = sx * (1.0f - 0.10f * stretch * std::max(0.0f, v) + 0.08f * squash * std::max(0.0f, -v));
         return ImVec2(cx + u * r * w + shear * r * (v + 1.0f) * 0.5f, centreY - v * r * sy);
     }
@@ -83,6 +89,11 @@ void pfFill(ImDrawList* d, const PfBlob& b, uint64_t picture, float aspect, ImU3
     d->PrimReserve(n * 3, n + 1);
     const ImDrawIdx base = (ImDrawIdx)d->_VtxCurrentIdx;
     auto uvOf = [&](float u, float v) {
+        if (b.cookie > 0.0f) { // M3E cookie: texture coordinates follow the scalloped position, so the photo is not stretched
+            const float f = m3e::cookieRadius(std::atan2(v, u), 9, b.cookie, b.phase);
+            u *= f;
+            v *= f;
+        }
         const float a = aspect > 0.01f ? aspect : 1.0f;
         if (a >= 1.0f) return ImVec2(0.5f + u * 0.5f / a, 0.5f - v * 0.5f);
         return ImVec2(0.5f + u * 0.5f, 0.5f - v * 0.5f * a);
@@ -124,7 +135,11 @@ void pfPlus(ImDrawList* d, const PfBlob& b, ImU32 colour) {
 }
 
 void pfAvatar(ImDrawList* d, const ProfileTile& t, float cx, bool hovered) {
-    const PfBlob b(cx, PF_GROUND, PF_D, t.bounce);
+    PfBlob b(cx, PF_GROUND, PF_D, t.bounce);
+    if (g_m3e) { // the picture under the cursor springs from a circle into a cookie; the others stay round
+        b.cookie = m3eAvatarCookie(cx, hovered);
+        b.phase = (float)ImGui::GetTime() * 0.7f;
+    }
     const float r = b.r;
 
     // Shadow on the ground: smaller and fainter the higher the picture is.
@@ -151,9 +166,9 @@ void pfAvatar(ImDrawList* d, const ProfileTile& t, float cx, bool hovered) {
             // A translucent disc (so the screen behind shows through).
             std::vector<ImVec2> disc;
             pfRim(b, 1.0f, disc);
-            d->AddConvexPolyFilled(disc.data(), (int)disc.size(), bgTint(col::TEXT, 0.10f)); // one polygon: no fan seams
+            d->AddConvexPolyFilled(disc.data(), (int)disc.size(), g_m3e ? g_m3c.secondaryContainer : bgTint(col::TEXT, 0.10f)); // one polygon: no fan seams
         }
-        pfPlus(d, b, hovered ? col::TEXT : col::MUTED);
+        pfPlus(d, b, g_m3e ? g_m3c.onSecondaryContainer : (hovered ? col::TEXT : col::MUTED));
     } else if (t.picture) {
         pfFill(d, b, t.picture, t.pictureAspect, 0, 0);
     } else {
@@ -202,13 +217,13 @@ void pfAvatar(ImDrawList* d, const ProfileTile& t, float cx, bool hovered) {
 void pfCheckBox(const ProfileTile& t, const Rect& r, bool focused) {
     ImDrawList* d = dl();
     surfaceRect(r, focused ? col::PANEL_HI : col::PANEL, 18.0f, focused ? GK::ButtonHot : GK::Button);
-    if (!g_glass && focused) d->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 18.0f, 0, 2.5f);
+    if (!themed() && focused) d->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 18.0f, 0, 2.5f);
 
     const float bs = 22.0f, bx = r.x + 14.0f, by = r.y + (r.h - bs) * 0.5f;
     if (t.keep) {
         d->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bs, by + bs), accentMain(), 6.0f);
         const ImVec2 tick[3] = {ImVec2(bx + 5.0f, by + 11.5f), ImVec2(bx + 9.5f, by + 16.0f), ImVec2(bx + 17.0f, by + 6.5f)};
-        d->AddPolyline(tick, 3, col::WHITE, 0, 3.0f);
+        d->AddPolyline(tick, 3, onMain(), 0, 3.0f);
     } else {
         if (g_glass) d->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bs, by + bs), bgTint(col::WHITE, 0.10f), 6.0f);
         d->AddRect(ImVec2(bx, by), ImVec2(bx + bs, by + bs), bgTint(col::TEXT, 0.55f), 6.0f, 0, 2.0f);
@@ -224,7 +239,7 @@ void pfLogoutButton(const ProfileTile& t, const Rect& r, bool focused) {
     // Dimmed when there is nothing to log out of.
     const GK kind = t.loggedOut ? GK::ButtonDisabled : (focused ? GK::ButtonHot : GK::Button);
     surfaceRect(r, focused && !t.loggedOut ? col::PANEL_HI : col::PANEL, 18.0f, kind);
-    if (!g_glass && focused) d->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 18.0f, 0, 2.5f);
+    if (!themed() && focused) d->AddRect(ImVec2(r.x, r.y), ImVec2(r.right(), r.bottom()), accentMain(), 18.0f, 0, 2.5f);
     const float size = TEXT_S - 1.0f;
     const std::string label = t.loggedOut ? "Logged out" : "Log out";
     const ImVec2 ls = textSize(size, label);

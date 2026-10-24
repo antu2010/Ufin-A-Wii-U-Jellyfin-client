@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include "net_conn.h"
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -127,58 +128,44 @@ static std::string dechunk(const std::string& body) {
     return out;
 }
 
+// "Host:" value: the name, plus the port when the server speaks https on something other than 443 (a reverse proxy
+// that routes by name wants it). Plain HTTP servers keep getting the bare name, as they always did.
+static std::string host_header(const std::string& host, int port) {
+    return (net::serverTls(host, port) && port != 443) ? host + ":" + std::to_string(port) : host;
+}
+
 static HttpResponse do_request(const std::string& host, int port, const std::string& request) {
     HttpResponse resp;
 
-    struct in_addr addr;
-    if (!resolve_host(host, &addr)) {
-        resp.body = "could not resolve host: " + host;
+    // Plain TCP, or TCP + TLS when this server was set up for https (net_conn.h).
+    net::Conn conn;
+    std::string openError;
+    if (!conn.open(host, port, REQUEST_TIMEOUT_SECONDS, openError)) {
+        resp.body = openError.rfind("could not resolve", 0) == 0 ? "could not resolve host: " + host
+                    : openError.rfind("connect() failed", 0) == 0
+                          ? "connect() failed or timed out (" + std::to_string(REQUEST_TIMEOUT_SECONDS) + "s) connecting to " + host
+                          : openError;
         return resp;
     }
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        resp.body = "socket() failed";
+    if (!conn.sendAll(request.data(), request.size())) {
+        resp.body = "send() failed";
         return resp;
-    }
-
-    struct sockaddr_in server{};
-    server.sin_family = AF_INET;
-    server.sin_port = htons((uint16_t)port);
-    server.sin_addr = addr;
-
-    if (!connect_with_timeout(sock, server, REQUEST_TIMEOUT_SECONDS)) {
-        resp.body = "connect() failed or timed out (" +
-                    std::to_string(REQUEST_TIMEOUT_SECONDS) + "s) connecting to " + host;
-        close(sock);
-        return resp;
-    }
-
-    size_t sent = 0;
-    while (sent < request.size()) {
-        ssize_t n = send(sock, request.c_str() + sent, request.size() - sent, 0);
-        if (n <= 0) {
-            resp.body = "send() failed";
-            close(sock);
-            return resp;
-        }
-        sent += (size_t)n;
     }
 
     std::string raw;
     char buf[2048];
-    ssize_t n;
     bool timedOut = false;
     while (true) {
-        if (!wait_readable(sock, REQUEST_TIMEOUT_SECONDS)) {
+        const int n = conn.recv(buf, sizeof(buf), REQUEST_TIMEOUT_SECONDS);
+        if (n == net::Conn::TimedOut) {
             timedOut = true;
             break;
         }
-        n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) break; // closed (a TLS peer that drops the line without a goodbye ends up here too)
         raw.append(buf, (size_t)n);
     }
-    close(sock);
+    conn.close();
 
     if (timedOut && raw.empty()) {
         resp.body = "timed out waiting for the server (" +
@@ -225,7 +212,7 @@ HttpResponse http_get(const std::string& host, int port, const std::string& path
         "Connection: close\r\n"
         "%s"
         "\r\n",
-        path.c_str(), host.c_str(), extra_headers.c_str());
+        path.c_str(), host_header(host, port).c_str(), extra_headers.c_str());
     return do_request(host, port, req);
 }
 
@@ -242,7 +229,7 @@ HttpResponse http_post(const std::string& host, int port, const std::string& pat
         "Connection: close\r\n"
         "%s"
         "\r\n",
-        path.c_str(), host.c_str(), content_type.c_str(), body.size(), extra_headers.c_str());
+        path.c_str(), host_header(host, port).c_str(), content_type.c_str(), body.size(), extra_headers.c_str());
     std::string request = std::string(header) + body;
     return do_request(host, port, request);
 }
@@ -258,12 +245,16 @@ HttpResponse http_delete(const std::string& host, int port, const std::string& p
         "Connection: close\r\n"
         "%s"
         "\r\n",
-        path.c_str(), host.c_str(), extra_headers.c_str());
+        path.c_str(), host_header(host, port).c_str(), extra_headers.c_str());
     return do_request(host, port, header);
 }
 
 bool http_open_stream(const std::string& host, int port, const std::string& path,
                        const std::string& extra_headers, HttpStreamHandle& out) {
+    if (net::serverTls(host, port)) { // (hands out a raw socket: plain HTTP only; streaming uses HttpStreamReader)
+        out.error = "http_open_stream does not support https servers";
+        return false;
+    }
     struct in_addr addr;
     if (!resolve_host(host, &addr)) {
         out.error = "could not resolve host: " + host;

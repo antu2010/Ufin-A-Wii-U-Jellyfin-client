@@ -56,20 +56,24 @@ CXXFLAGS="$CXXFLAGS -I$IMGUI" LIBS="$OUT/libimgui.a" \
     run test_ui "$HERE/test_ui.cpp" "$SRC/ui/app_ui.cpp" "$SRC/ui/format.cpp" "$SRC/ui/glass_core.cpp" \
     "$SRC/ui/model3d.cpp" "$SRC/image_cache.cpp" "$SRC/vendor/cJSON.c"
 RUN_ARGS=""
+run test_m3e_core "$HERE/test_m3e_core.cpp"
+run test_theme_core "$HERE/test_theme_core.cpp"
+run test_customize_logic "$HERE/test_customize_logic.cpp"
 run test_config    "$HERE/test_config.cpp" "$SRC/config_loader.cpp" "$SRC/vendor/cJSON.c"
-run test_jellyfin  "$HERE/test_jellyfin.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c"
+run test_jellyfin  "$HERE/test_jellyfin.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" "$SRC/vendor/cJSON.c"
+run test_library  "$HERE/test_library.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" "$SRC/vendor/cJSON.c"
 run test_image_cache "$HERE/test_image_cache.cpp" "$SRC/image_cache.cpp"
 run test_input_map "$HERE/test_input_map.cpp"
 RUN_ARGS="$HERE/../../patches/ffmpeg-wiiu-fixes.patch" run test_h264_geometry "$HERE/test_h264_geometry.cpp"
 run test_playback_logic "$HERE/test_playback_logic.cpp"
 # HttpStreamReader: failure causes, longer / cancellable startup wait (no FFmpeg needed).
-run test_http_stream_reader "$HERE/test_http_stream_reader.cpp" "$SRC/http_stream_reader.cpp"
+run test_http_stream_reader "$HERE/test_http_stream_reader.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp"
 run test_h264_diag "$HERE/test_h264_diag.cpp"
 # Startup update check: the decisions (no network), the HTTPS client's core against scripted servers, and
 # the glue to the console's system TLS (NSSL) against a fake NSSL (the real TLS cannot run on a PC).
 run test_update_check "$HERE/test_update_check.cpp" "$SRC/update_check.cpp" "$SRC/vendor/cJSON.c"
-run test_https_client "$HERE/test_https_client.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp"
-CXXFLAGS="$CXXFLAGS -DUFIN_TLS_NSSL" run test_https_nssl "$HERE/test_https_nssl.cpp" "$HERE/stubs/fake_nssl.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp"
+run test_https_client "$HERE/test_https_client.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp"
+CXXFLAGS="$CXXFLAGS -DUFIN_TLS_NSSL" run test_https_nssl "$HERE/test_https_nssl.cpp" "$HERE/stubs/fake_nssl.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp"
 if [ -x "$OUT/test_https_nssl" ]; then "$OUT/test_https_nssl" noroots || status=1; "$OUT/test_https_nssl" emulator || status=1; fi
 # The DNS client (packets + a fake UDP server), and our own TLS client (vendored Mbed TLS, compiled once into a
 # static library here) against a real `openssl s_server` with a throw-away CA.
@@ -86,9 +90,14 @@ if [ ! -f "$OUT/libmbedufin.a" ] || [ "$MBED/include/mbedtls/config.h" -nt "$OUT
 fi
 if command -v openssl >/dev/null 2>&1; then
     CXXFLAGS="$CXXFLAGS -DUFIN_TLS_MBEDTLS -I$MBED/include" LIBS="$OUT/libmbedufin.a" \
-        run test_https_mbedtls "$HERE/test_https_mbedtls.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp" "$SRC/dns_client.cpp" "$SRC/tls_roots.cpp"
+        run test_https_mbedtls "$HERE/test_https_mbedtls.cpp" "$SRC/https_client.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" "$SRC/dns_client.cpp" "$SRC/tls_roots.cpp"
 else
     echo "== test_https_mbedtls skipped (no openssl binary)"
+fi
+# Jellyfin over https: the HTTP client and stream reader through net::Conn + TLS, pinned self-signed certificates
+if command -v openssl >/dev/null 2>&1; then
+    CXXFLAGS="$CXXFLAGS -DUFIN_TLS_MBEDTLS -I$MBED/include" LIBS="$OUT/libmbedufin.a" \
+        run test_net_tls "$HERE/test_net_tls.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" "$SRC/tls_roots.cpp" "$SRC/http_stream_reader.cpp"
 fi
 run test_login_utils "$HERE/test_login_utils.cpp"
 # Who's watching?: the rules, bounce and config round trip; then the screen itself (app_ui.cpp also links
@@ -99,6 +108,8 @@ PUI_EXTRA=""
 CXXFLAGS="$CXXFLAGS -I$IMGUI" LIBS="$OUT/libimgui.a" \
     run test_profiles_ui "$HERE/test_profiles_ui.cpp" "$SRC/ui/app_ui.cpp" "$SRC/ui/format.cpp" "$SRC/ui/glass_core.cpp" $PUI_EXTRA
 run test_play_queue "$HERE/test_play_queue.cpp"
+run test_user_queue "$HERE/test_user_queue.cpp"
+run test_lyrics "$HERE/test_lyrics.cpp" "$SRC/vendor/cJSON.c"
 run test_playback_controls "$HERE/test_playback_controls.cpp"
 run test_item_labels "$HERE/test_item_labels.cpp" "$SRC/item_labels.cpp" "$SRC/ui/format.cpp"
 run test_audio_visualizer "$HERE/test_audio_visualizer.cpp" "$SRC/media/audio_visualizer.cpp"
@@ -131,7 +142,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                   -movflags frag_keyframe+empty_moov+delay_moov "$CLIP" 2>"$OUT/ffmpeg.log"; then
             RUN_ARGS="$CLIP"
             run test_decoder_stream "$HERE/test_decoder_stream.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
-                "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
+                "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp"
             RUN_ARGS=""
             LONG="$OUT/sample_long_frag.mp4"
             # 5 s fragments, like Jellyfin's: video run, then audio run.
@@ -142,7 +153,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                       -movflags frag_keyframe+empty_moov+delay_moov "$LONG" 2>>"$OUT/ffmpeg.log"; then
                 RUN_ARGS="$LONG"
                 run test_playback_schedule "$HERE/test_playback_schedule.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
-                    "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
+                    "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp"
                 RUN_ARGS=""
             fi
             # The real Player against a Jellyfin-like server that transcodes
@@ -158,7 +169,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                 RUN_ARGS="$SRC60"
                 CXXFLAGS="$CXXFLAGS -I$H -I$SRC/media" \
                     run test_player_seek "$HERE/test_player_seek.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
-                    "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
+                    "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" \
                     "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
                 # Subtitles burned in at a start offset: the real URL builder and Player
@@ -167,8 +178,8 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                 RUN_ARGS="$SRC60"
                 CXXFLAGS="$CXXFLAGS -I$H -I$SRC/media" \
                     run test_player_burnin "$HERE/test_player_burnin.cpp" "$H/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
-                    "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
-                    "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c" "$HERE/stubs/fake_sdl.cpp"
+                    "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" \
+                    "$SRC/jellyfin_client.cpp" "$SRC/vendor/cJSON.c" "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
             fi
             # Graceful rebuffering: the real Player against a fake Jellyfin whose
@@ -180,7 +191,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
             cp "$HERE/fake_media/video_output.h" "$H2/video_output.h"
             CXXFLAGS="$CXXFLAGS -I$H2 -I$SRC/media" \
                 run test_player_rebuffer "$HERE/test_player_rebuffer.cpp" "$H2/player.cpp" "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" \
-                "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" \
+                "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" \
                 "$HERE/stubs/fake_sdl.cpp"
             SONG="$OUT/sample_song.m4a"
             # A short, loud tone as fragmented MP4 audio, like Jellyfin's
@@ -191,7 +202,7 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
                 RUN_ARGS="$SONG"
                 run test_menu_music "$HERE/test_menu_music.cpp" "$SRC/media/menu_music.cpp" "$SRC/media/file_stream_io.cpp" \
                     "$SRC/media/decoder.cpp" "$SRC/ufin_log.cpp" "$SRC/media/audio_output.cpp" "$SRC/media/http_stream_io.cpp" \
-                    "$SRC/http_stream_reader.cpp" "$HERE/stubs/fake_sdl.cpp"
+                    "$SRC/http_stream_reader.cpp" "$SRC/http_client.cpp" "$SRC/net_conn.cpp" "$SRC/tls_conn.cpp" "$HERE/stubs/fake_sdl.cpp"
                 RUN_ARGS=""
             fi
         else

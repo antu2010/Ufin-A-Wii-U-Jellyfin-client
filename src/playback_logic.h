@@ -67,6 +67,24 @@ inline bool subtitleTrackIsText(const std::vector<MediaTrack>& tracks, int index
     return false;
 }
 
+// The prompt shown when a video starts has four slots: 0 = audio, 1 = subtitles, 2 = OK,
+// 3 = Always use default (the two buttons share the bottom row). Up / down walk the three rows
+// and wrap; left / right on the button row swap the two buttons.
+inline int trackPromptMove(int slot, int dy) {
+    if (dy > 0) return slot == 0 ? 1 : slot == 1 ? 2 : 0;
+    if (dy < 0) return slot == 0 ? 2 : slot == 1 ? 0 : 1;
+    return slot;
+}
+inline int trackPromptSide(int slot) { return slot == 2 ? 3 : slot == 3 ? 2 : slot; }
+
+// Whether a video that is about to start should ask for its audio / subtitle tracks: only when the
+// user has not chosen "always use default", this is the first start of a viewing (an autoplayed next
+// episode keeps the language already picked) and there is actually something to choose between.
+inline bool shouldAskTracks(bool alwaysDefault, bool alreadyChosen, const VideoInfo& info) {
+    if (alwaysDefault || alreadyChosen) return false;
+    return info.audioTracks.size() > 1 || !info.subtitleTracks.empty();
+}
+
 inline std::string trackLanguage(const std::vector<MediaTrack>& tracks, int index) {
     for (const MediaTrack& t : tracks) if (t.index == index) return t.language;
     return "";

@@ -49,6 +49,13 @@ public:
     // finished images and evicts beyond the limit.
     void pump(int maxUploads = 2);
 
+    // Main thread. The dominant colour of the image at `path` (0xRRGGBB), for the artwork-reactive accent.
+    // It was worked out once, on the worker thread, when the picture was decoded -- asking is a map lookup, so it
+    // is fine to call every frame. Pending: still loading (the image is queued like get() does). None: it failed
+    // to load or has no usable colour (greyscale, nearly black / white) -- the caller keeps its own palette.
+    enum class ColourState { Pending, Ready, None };
+    ColourState dominantColour(const std::string& path, int maxW, int maxH, uint32_t& rgb);
+
     size_t textureCount() const;
     size_t pendingCount() const;
 
@@ -64,6 +71,8 @@ private:
         Handle tex = 0;
         int maxW = 0, maxH = 0;
         int width = 0, height = 0;
+        bool hasColour = false;      // a usable dominant colour was found at decode time
+        uint32_t colour = 0;         // 0xRRGGBB
         std::vector<uint8_t> pixels; // Decoded, waiting for upload
         uint64_t lastUsed = 0;       // frame number
         uint64_t queuedAt = 0;

@@ -25,7 +25,7 @@ int main() {
             if (x.header) { headers++; CHECK(x.button.empty()); CHECK(!x.action.empty()); }
             else { entries++; CHECK(!x.button.empty()); CHECK(!x.action.empty()); CHECK(x.highlight != 0); }
         }
-        CHECK_EQ(headers, 6);                        // Browsing, Settings, Video, Music, Live TV, Anywhere
+        CHECK_EQ(headers, 9);                        // Browsing, Sort menu, Settings, Video, Music, Up Next queue, Add to Queue, Live TV, Anywhere
         CHECK(entries > 20);
     }
     // Pages are distinct controllers, in a stable order.
@@ -51,10 +51,26 @@ int main() {
     CHECK(hasRow(wr, "2", "Audio and subtitles"));
     CHECK(hasRow(wr, "Nunchuk C / Z", "Page up"));
     CHECK(!hasRow(wr, "X", "Search") && !hasRow(wr, "ZL", "watched") && !hasRow(wr, "L / R", "Page up"));
+    // Add to playlist: right stick up on the pads, 1 + 2 on the Wii Remote; the page shows what really works.
+    CHECK(hasRow(gp, "Right stick up", "playlist") && hasRow(pro, "Right stick up", "playlist") && hasRow(cl, "Right stick up", "playlist"));
+    CHECK(hasRow(wr, "1 + 2 together", "playlist") && !hasRow(wr, "Right stick up", "playlist"));
+    CHECK(!hasRow(gp, "1 + 2 together", "playlist"));
+    // The queue (Up Next flyout and Add to Queue browser) is documented for every controller, with its own keys.
+    CHECK(hasRow(gp, "Up", "Up Next") && hasRow(pro, "Up", "Up Next") && hasRow(cl, "Up", "Up Next") && hasRow(wr, "Up", "Up Next"));
+    CHECK(hasRow(gp, "X", "Remove the item") && hasRow(gp, "Y", "Clear the queue"));
+    CHECK(hasRow(wr, "1", "Remove the item") && hasRow(wr, "2", "Clear the queue"));
+    CHECK(!hasRow(wr, "X", "Remove the item"));
+    CHECK(hasRow(gp, "X", "Add the selected item") && hasRow(wr, "1", "Add the selected item"));
+    CHECK(hasRow(gp, "Touch", "Tap an item to play") && !hasRow(pro, "Touch", "Tap an item to play"));
+    CHECK(hasRow(wr, "Nunchuk C / Z", "Move the item"));
+    // Views and the sort menu are documented on every page.
+    CHECK(hasRow(gp, "L / R", "switch view") && hasRow(pro, "L / R", "switch view") && hasRow(cl, "L / R", "switch view"));
+    CHECK(hasRow(wr, "Nunchuk C / Z", "switch view"));
+    for (const auto* page : {&gp, &pro, &cl, &wr}) CHECK(hasRow(*page, "Up / Down", "Pick a sort"));
     // Highlights only name buttons the controller has.
     const uint32_t remoteHas = A | B | DPAD | PLUS | MINUS | HOME | ONE | TWO | NUN_C | NUN_Z | NUN_STICK;
     for (const Row& x : wr) CHECK((x.highlight & ~remoteHas) == 0);
-    const uint32_t padHas = A | B | X | Y | DPAD | STICK_L | L | R | ZL | ZR | PLUS | MINUS | HOME | TOUCH;
+    const uint32_t padHas = A | B | X | Y | DPAD | STICK_L | STICK_R | L | R | ZL | ZR | PLUS | MINUS | HOME | TOUCH;
     for (const Row& x : pro) CHECK((x.highlight & ~padHas) == 0);
 
     // Cursor: starts on the first real row, steps over group titles, wraps both ways.

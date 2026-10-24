@@ -58,6 +58,29 @@ struct SoftRender {
             t.rgba[i * 4 + 2] = (uint8_t)((c >> 16) & 0xFF);
             t.rgba[i * 4 + 3] = 255;
         }
+        // The frost (see ui::setGlassBlurTexture): a blurred copy, under the next texture id, standing in for the GPU's
+        // downsample chain (a box blur of radius 4, twice).
+        SoftUserTexture b = t;
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<uint8_t> tmp = b.rgba;
+            for (int y = 0; y < b.h; y++)
+                for (int x = 0; x < b.w; x++)
+                    for (int c = 0; c < 3; c++) {
+                        int sum = 0, n = 0;
+                        for (int k = -4; k <= 4; k++) { const int xx = std::min(b.w - 1, std::max(0, x + k)); sum += b.rgba[((size_t)y * b.w + xx) * 4 + c]; n++; }
+                        tmp[((size_t)y * b.w + x) * 4 + c] = (uint8_t)(sum / n);
+                    }
+            std::vector<uint8_t> out = tmp;
+            for (int y = 0; y < b.h; y++)
+                for (int x = 0; x < b.w; x++)
+                    for (int c = 0; c < 3; c++) {
+                        int sum = 0, n = 0;
+                        for (int k = -4; k <= 4; k++) { const int yy = std::min(b.h - 1, std::max(0, y + k)); sum += tmp[((size_t)yy * b.w + x) * 4 + c]; n++; }
+                        out[((size_t)y * b.w + x) * 4 + c] = (uint8_t)(sum / n);
+                    }
+            b.rgba = out;
+        }
+        userTextures()[(ImTextureID)(intptr_t)cmd->UserCallbackData + 1] = std::move(b);
         userTextures()[(ImTextureID)(intptr_t)cmd->UserCallbackData] = std::move(t);
     }
 

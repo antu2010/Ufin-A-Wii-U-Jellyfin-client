@@ -6,7 +6,7 @@ WIP jellyfin client for the Nintendo Wii U
 
 A native Jellyfin client for the Nintendo Wii U, because why not XD.
 
-**Beta v1.2.0.** Expect bugs, crashes, and probably the occasional Wii U death beep. (will be released in the following days)
+**Beta v1.2.1.** Expect bugs, crashes, and probably the occasional Wii U death beep. (will be released in the following days)
 
 > ⚠️ **Beta notice:** Music and video playback have been confirmed working on real Wii U hardware, Live TV has also been tested and confirmed working.
 >
@@ -58,6 +58,7 @@ A native Jellyfin client for the Nintendo Wii U, because why not XD.
 * ✅ Help screen with what all the controls do and animated 3d models for each controller
 * ✅ New default BGM, made by me (its not great)
 * ✅ total usage time + easter egg
+* ✅ Automatic Update checker: checks github and lets you know if there is a new release to download manually
 
 ### Implemented, but not yet fully tested on real hardware
 

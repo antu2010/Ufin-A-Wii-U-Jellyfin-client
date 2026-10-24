@@ -51,5 +51,27 @@ int main() {
     CHECK_EQ(trackForLanguage(audio, "", 1), 1);
     CHECK_STR(trackLanguage(subs, 6), "ita");
     CHECK_STR(trackLanguage(subs, -1), "");
+
+    // First-play prompt: slot walking and when it is asked.
+    CHECK_EQ(trackPromptMove(0, 1), 1);
+    CHECK_EQ(trackPromptMove(1, 1), 2);
+    CHECK_EQ(trackPromptMove(2, 1), 0);   // wraps
+    CHECK_EQ(trackPromptMove(3, 1), 0);
+    CHECK_EQ(trackPromptMove(0, -1), 2);
+    CHECK_EQ(trackPromptMove(2, -1), 1);
+    CHECK_EQ(trackPromptMove(3, -1), 1);
+    CHECK_EQ(trackPromptSide(2), 3);
+    CHECK_EQ(trackPromptSide(3), 2);
+    CHECK_EQ(trackPromptSide(0), 0);
+    VideoInfo vi;
+    CHECK(!shouldAskTracks(false, false, vi));        // nothing to choose between
+    vi.audioTracks = audio;
+    CHECK(shouldAskTracks(false, false, vi));         // two audio tracks
+    CHECK(!shouldAskTracks(true, false, vi));         // "always use default"
+    CHECK(!shouldAskTracks(false, true, vi));         // an autoplayed episode keeps its language
+    vi.audioTracks.resize(1);
+    CHECK(!shouldAskTracks(false, false, vi));        // one audio track, no subtitles
+    vi.subtitleTracks = subs;
+    CHECK(shouldAskTracks(false, false, vi));         // subtitles to pick
     return check::finish("test_playback_logic");
 }

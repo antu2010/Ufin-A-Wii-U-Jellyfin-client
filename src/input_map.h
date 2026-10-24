@@ -19,7 +19,14 @@ static const uint32_t STICK_R_UP = 0x01000000, STICK_R_DOWN = 0x00800000;
 static const uint32_t STICK_L_LEFT = 0x40000000, STICK_L_RIGHT = 0x20000000;
 static const uint32_t STICK_L_UP = 0x10000000, STICK_L_DOWN = 0x08000000;
 
+// "Add the selected song to a playlist" while browsing: the right stick pushed up (GamePad, Pro Controller,
+// Classic Controller) or 1 and 2 pressed together (Wii Remote, with or without a Nunchuk). Nothing else in the
+// app reads the right stick, so it collides with no other action; the Wii Remote has no free button, hence the
+// chord.
+static const uint32_t ADD_TO_PLAYLIST = STICK_R_UP;
+
 namespace wiimote {
+static const uint32_t CHORD_ONE_TWO = 0x00010000; // synthetic: made by ChordFilter below, never sent by the remote
 static const uint32_t LEFT = 0x0001, RIGHT = 0x0002, DOWN = 0x0004, UP = 0x0008, PLUS = 0x0010;
 static const uint32_t TWO = 0x0100, ONE = 0x0200, B = 0x0400, A = 0x0800, MINUS = 0x1000;
 static const uint32_t Z = 0x2000, C = 0x4000, HOME = 0x8000;
@@ -67,9 +74,64 @@ inline uint32_t fromWiimote(uint32_t b) {
         {wiimote::UP, UP}, {wiimote::DOWN, DOWN}, {wiimote::LEFT, LEFT}, {wiimote::RIGHT, RIGHT},
         {wiimote::A, A}, {wiimote::B, B}, {wiimote::ONE, X}, {wiimote::TWO, Y},
         {wiimote::PLUS, PLUS}, {wiimote::MINUS, MINUS}, {wiimote::HOME, HOME},
+        {wiimote::CHORD_ONE_TWO, ADD_TO_PLAYLIST},
     };
     return mapBits(b, t);
 }
+
+// Turns "1 and 2 pressed together" into one chord press. A lone press of 1 or 2 is held back for a short
+// grace period (CHORD_WINDOW_MS) in case the other follows; when it does not, the press goes through as usual,
+// a few frames late. Everything else passes untouched. One filter per Wii Remote.
+class ChordFilter {
+public:
+    static const uint32_t CHORD_WINDOW_MS = 40;
+
+    // core: the remote's trigger / hold bits as read; nowMs: any monotonic millisecond clock.
+    void step(uint32_t& trigger, uint32_t& hold, uint32_t nowMs) {
+        const uint32_t both = wiimote::ONE | wiimote::TWO;
+        const uint32_t pressedNow = trigger & both; // (before a held-back press is let through below)
+        // Both newly pressed in one read, or the second arrives while the first is still held back.
+        const bool chord = ((trigger & both) == both) ||
+                           (pending_ && (trigger & (both & ~pending_)) && (hold & pending_));
+        if (chord) {
+            trigger &= ~both;
+            hold &= ~both;
+            trigger |= wiimote::CHORD_ONE_TWO;
+            hold |= wiimote::CHORD_ONE_TWO;
+            pending_ = 0;
+            held_ = both; // both stay quiet until released
+            return;
+        }
+        if (held_) { // part of a chord (or a chord that has not been let go of yet): swallow until released
+            held_ &= hold & both;
+            trigger &= ~both;
+            hold &= ~both;
+            if (held_) hold |= wiimote::CHORD_ONE_TWO;
+            return;
+        }
+        if (pending_) {
+            if (nowMs - since_ >= CHORD_WINDOW_MS || !(hold & pending_)) {
+                // Waited long enough (or it was let go): the press is a real one.
+                trigger |= pending_;
+                pending_ = 0;
+            } else {
+                hold &= ~pending_;
+            }
+        }
+        const uint32_t lone = pressedNow;
+        if (lone && !pending_ && !(hold & both & ~lone)) {
+            pending_ = lone; // exactly one of them, the other not down: wait a moment
+            since_ = nowMs;
+            trigger &= ~lone;
+            hold &= ~lone;
+        }
+    }
+
+private:
+    uint32_t pending_ = 0; // ONE or TWO, held back
+    uint32_t held_ = 0;    // the chord's buttons, still down
+    uint32_t since_ = 0;
+};
 
 // Nunchuk: stick moves like the left stick; C and Z are L and R (page up
 // / down in lists, previous / next track in music).

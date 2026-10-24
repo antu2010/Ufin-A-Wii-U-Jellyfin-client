@@ -51,6 +51,9 @@ int main() {
     FakeRoute versioned; // MediaSources[0].Id is picked up
     versioned.body = "{\"Id\":\"m4\",\"MediaSources\":[{\"Id\":\"src-4k\",\"MediaStreams\":[{\"Type\":\"Video\",\"Width\":3840,\"Height\":2160}]}]}";
     server.addRoute("/Users/user1/Items/m4", versioned);
+    FakeRoute lyr;
+    lyr.body = "{\"Metadata\":{\"IsSynced\":true},\"Lyrics\":[{\"Text\":\"Hello\",\"Start\":10000000},{\"Text\":\"World\",\"Start\":30000000}]}";
+    server.addRoute("/Audio/s1/Lyrics", lyr);
 
     FakeRoute viewsLive;
     viewsLive.body = "{\"Items\":[{\"Id\":\"tv\",\"Name\":\"Live TV\",\"Type\":\"UserView\",\"CollectionType\":\"livetv\"}]}";
@@ -126,6 +129,15 @@ int main() {
     {
         auto reqs = server.requests();
         CHECK(contains(reqs.back().path, "ParentId=lib1"));
+    }
+
+    {
+        lyrics::Lyrics ly;
+        CHECK(client.getLyrics("s1", ly));
+        CHECK_EQ((int)ly.lines.size(), 2);
+        CHECK(ly.synced);
+        CHECK(!client.getLyrics("nope", ly)); // no route: 404 -> simply "no lyrics"
+        CHECK(!ly.available());
     }
 
     VideoInfo info;

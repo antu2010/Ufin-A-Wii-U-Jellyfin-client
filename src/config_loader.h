@@ -11,8 +11,19 @@
 #include "h264_profile.h"
 #include "profiles.h"
 #include "video_size.h"
+#include <cctype>
+#include <cstdint>
 #include <string>
 #include <vector>
+
+// A Jellyfin server reached over https (see net_conn.h). `pin` = the SHA-256 fingerprint (64 hex digits) of the one
+// certificate the user chose to trust for it (a self-signed certificate); "" = it must have a certificate a public
+// authority signed.
+struct TlsServer {
+    std::string host;
+    int port = 0;
+    std::string pin;
+};
 
 struct UfinConfig {
     std::string host;
@@ -25,6 +36,7 @@ struct UfinConfig {
     std::string userId;
     std::string accessToken;
     std::string deviceId;    // generated once, so Jellyfin sees one device
+    std::vector<TlsServer> tlsServers; // the servers (host + port) that speak https; any other is plain http
 
     // "Who's watching?" profiles: every saved sign-in (see profiles.h). host / user_id / access_token
     // above always mirror the profile used last, so an older Ufin still finds a sign-in.
@@ -43,6 +55,16 @@ struct UfinConfig {
     // Look & feel (Settings)
     bool crt = false;              // scanlines + vignette over everything
     int accent = 0;                // ui::Accent index
+    // Settings > Customization: "Custom Palette" replaces the premade accent with three colours of the user's
+    // own (0xRRGGBB, defaults = Jellyfin blue) and an arrangement (0..5) saying which one is main / deep / second.
+    bool customPalette = false;
+    uint32_t customColor[3] = {0x00A4DC, 0x0B7FB0, 0xAA5CC3};
+    int customArrange = 0;
+    bool paletteEdited = false;    // (not saved) the colours were touched this session: do not re-seed them from the accent
+    bool customShapes = false;     // Material 3 Expressive: "Customize shapes" is on
+    int buttonSize[8] = {100, 100, 100, 100, 100, 100, 100, 100}; // width, height per button kind, in percent (60..130; dialog height 60..112)
+    int buttonShape[4] = {0, 0, 0, 0}; // per button kind (play/pause, seek & skip, toggles, dialog); 0 = default look
+    bool artworkAccent = false;    // Material 3 Expressive only: the accent follows the playing item's artwork
     bool lightMode = false;        // light palette instead of the dark default
     // Animated background effect. ui::Background index: 0=Off, 1=Circles
     // (the original drifting glow), 2=Wii U-style bubbles, 3=Animated
@@ -52,6 +74,9 @@ struct UfinConfig {
     int backgroundEffect = 0;
     bool snow = false;             // falling snow over the menus
     bool liquidGlass = false;      // Liquid Glass UI: frosted, rounded, softly lit panels (default off)
+    // Material 3 Expressive UI (default off). Mutually exclusive with liquidGlass (the UI style is exactly one
+    // of Plain / Liquid Glass / M3E); if a hand-edited config.json sets both, loadConfig keeps Liquid Glass.
+    bool m3Expressive = false;
     // Liquid Glass bends the real picture behind it (needs a GPU copy of the frame per glass
     // layer). On by default; "glass_refraction": false falls back to the soft blurred glass.
     bool glassRefraction = true;
@@ -67,6 +92,12 @@ struct UfinConfig {
     // so a console that misbehaves can be bisected. Each stage includes the ones before it,
     // except that 7 also changes how the textures are created.
     int glassRefractionStage = 6;
+    // Liquid Glass while the music visualizer is on (the TV shows the visualizer, the GamePad Now Playing: two render
+    // passes in one frame). config.json only. 0 = the GamePad refracts, the TV's glass is flat (default: a snapshot copy
+    // in the TV pass made the visualizer vanish from the TV and show under the GamePad's UI in a Cemu test);
+    // 1 = flat glass on both displays in those frames; 2 = both refract (the old behaviour, for comparison).
+    int visualizerGlass = 0;
+    int glassBlur = 1;             // Liquid Glass frost: 0 = sharp refraction, 1 light, 2 medium, 3 strong (a shrunk, smoothed copy of the picture is what the glass bends); config.json only
     bool glassDebug = false;       // log the glass blur's cost every few seconds (config.json only)
     bool clock = false;            // time in the header
     bool rainbowEasterEgg = false; // found the hidden About easter egg -- reveals the toggle below
@@ -75,6 +106,7 @@ struct UfinConfig {
     // Playback
     bool autoplayNext = true;      // next episode after a countdown
     bool gamepadOffInVideo = false; // turn the GamePad screen off during TV playback
+    bool alwaysDefaultTracks = false; // true: start videos with the default audio / subtitles instead of asking first
 
     // Diagnostic/testing escape hatch for the h264_wiiu macroblock-alignment
     // safety check in Decoder::open() (see decoder.cpp): that check refuses
@@ -136,3 +168,21 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
 // it came from the file in the first place.
 bool saveConfigToSD(const UfinConfig& config, std::string& outError);
 bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& outError);
+
+// The https entry for host:port, or nullptr (host compared without regard to case).
+inline const TlsServer* findTlsServer(const std::vector<TlsServer>& list, const std::string& host, int port) {
+    auto lower = [](std::string t) { for (char& c : t) c = (char)tolower((unsigned char)c); return t; };
+    const std::string h = lower(host);
+    for (const TlsServer& s : list) if (s.port == port && lower(s.host) == h) return &s;
+    return nullptr;
+}
+// Adds or updates the entry for host:port (https = false removes it).
+inline void setTlsServer(std::vector<TlsServer>& list, const std::string& host, int port, bool https, const std::string& pin) {
+    for (size_t i = 0; i < list.size(); i++) {
+        if (list[i].port == port && findTlsServer({list[i]}, host, port)) {
+            if (https) list[i].pin = pin; else list.erase(list.begin() + (long)i);
+            return;
+        }
+    }
+    if (https && list.size() < 16) list.push_back(TlsServer{host, port, pin});
+}

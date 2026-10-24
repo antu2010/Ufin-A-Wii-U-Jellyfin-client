@@ -21,6 +21,8 @@
 // FFmpeg already has for e.g. live broadcasts).
 
 #pragma once
+#include "net_conn.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -71,7 +73,7 @@ private:
     std::string host_;
     int port_;
     std::string path_;
-    int sock_ = -1;
+    net::Conn conn_; // plain TCP, or TLS when the server is set up for https (net_conn.h)
     std::string last_error_;
 
     bool is_chunked_ = false;

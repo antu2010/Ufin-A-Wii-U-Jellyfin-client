@@ -1,4 +1,5 @@
 #include "config_loader.h"
+#include "ui/theme_core.h"
 #include "vendor/cJSON.h"
 
 #include <cstdio>
@@ -96,6 +97,25 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
             outConfig.lastProfile = last->valueint;
         profiles::normalizeAutoLogin(outConfig.profiles, outConfig.lastProfile); // only one auto log in
     }
+    outConfig.tlsServers.clear();
+    if (cJSON* list = cJSON_GetObjectItem(json, "tls_servers"); cJSON_IsArray(list)) {
+        cJSON* entry = nullptr;
+        cJSON_ArrayForEach(entry, list) {
+            if (!cJSON_IsObject(entry) || outConfig.tlsServers.size() >= 16) continue;
+            cJSON* h = cJSON_GetObjectItem(entry, "host");
+            cJSON* p = cJSON_GetObjectItem(entry, "port");
+            cJSON* pin = cJSON_GetObjectItem(entry, "pin");
+            if (!cJSON_IsString(h) || !h->valuestring[0] || !cJSON_IsNumber(p) || p->valueint <= 0 || p->valueint > 65535) continue;
+            // A pin is 64 hex digits (any case, colons allowed); anything else is a damaged entry: no pin, so the
+            // server would need a real certificate and the user is asked again rather than trusting garbage.
+            std::string fp = cJSON_IsString(pin) ? std::string(pin->valuestring) : std::string();
+            std::string clean;
+            for (char c : fp) if (c != ':' && c != ' ') clean.push_back((char)tolower((unsigned char)c));
+            bool hex = clean.size() == 64;
+            for (char c : clean) hex = hex && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+            outConfig.tlsServers.push_back(TlsServer{h->valuestring, p->valueint, hex ? clean : std::string()});
+        }
+    }
     outConfig.logging = boolean("logging", false);
     outConfig.jellyfinBackdrops = boolean("jellyfin_backdrops", false);
     outConfig.menuMusicEnabled = boolean("menu_music", true);
@@ -116,16 +136,62 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
             // true becomes Circles (1), the effect it used to mean.
             outConfig.backgroundEffect = boolean("ambient_background", false) ? 1 : 0;
         }
-        if (outConfig.backgroundEffect < 0 || outConfig.backgroundEffect > 5) outConfig.backgroundEffect = 0;
+        if (outConfig.backgroundEffect < 0 || outConfig.backgroundEffect > 11) outConfig.backgroundEffect = 0; // ui::Background (Waves = 11)
+    }
+    // Custom palette (all optional: an older config.json has none of these and gets the premade accent).
+    outConfig.customPalette = boolean("custom_palette", false);
+    {
+        cJSON* colours = cJSON_GetObjectItem(json, "custom_colors");
+        for (int i = 0; i < 3; i++) {
+            cJSON* item = cJSON_IsArray(colours) ? cJSON_GetArrayItem(colours, i) : nullptr;
+            ui::theme::Rgb8 c;
+            if (cJSON_IsString(item) && item->valuestring && ui::theme::parseHex(item->valuestring, c))
+                outConfig.customColor[i] = ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | c.b;
+        }
+        // Colours that differ from the defaults were chosen by the user (so the editor must not re-seed them).
+        outConfig.paletteEdited = outConfig.customColor[0] != 0x00A4DC || outConfig.customColor[1] != 0x0B7FB0 ||
+                                  outConfig.customColor[2] != 0xAA5CC3;
+        cJSON* arrange = cJSON_GetObjectItem(json, "custom_arrange");
+        const int a = cJSON_IsNumber(arrange) ? arrange->valueint : 0;
+        outConfig.customArrange = (a >= 0 && a < ui::theme::kArrangeCount) ? a : 0;
+    }
+    outConfig.artworkAccent = boolean("artwork_accent", false);
+    outConfig.customShapes = boolean("custom_shapes", false);
+    {
+        cJSON* shapes = cJSON_GetObjectItem(json, "button_shapes");
+        for (int i = 0; i < 4; i++) {
+            cJSON* item = cJSON_IsArray(shapes) ? cJSON_GetArrayItem(shapes, i) : nullptr;
+            const int v = cJSON_IsNumber(item) ? item->valueint : 0;
+            outConfig.buttonShape[i] = (v >= 0 && v <= 6 && !(i == 3 && v > 3)) ? v : 0; // (dialog buttons: no scalloped shapes)
+        }
+    }
+    {
+        cJSON* sizes = cJSON_GetObjectItem(json, "button_sizes");
+        for (int i = 0; i < 8; i++) {
+            cJSON* item = cJSON_IsArray(sizes) ? cJSON_GetArrayItem(sizes, i) : nullptr;
+            const int v = cJSON_IsNumber(item) ? item->valueint : 100;
+            outConfig.buttonSize[i] = (v >= 60 && v <= (i == 7 ? 112 : 130)) ? v : 100; // (damaged values: the default size)
+        }
     }
     outConfig.lightMode = boolean("light_mode", false);
     outConfig.snow = boolean("snow", false);
     outConfig.liquidGlass = boolean("liquid_glass", false);
+    outConfig.m3Expressive = boolean("m3_expressive", false) && !outConfig.liquidGlass; // one style at a time
     outConfig.glassRefraction = boolean("glass_refraction", true);
     {
         cJSON* stage = cJSON_GetObjectItem(json, "glass_refraction_stage");
         int v = cJSON_IsNumber(stage) ? stage->valueint : 6;
         outConfig.glassRefractionStage = v < 1 ? 1 : (v > 7 ? 7 : v);
+    }
+    {
+        cJSON* vg = cJSON_GetObjectItem(json, "visualizer_glass");
+        int v = cJSON_IsNumber(vg) ? vg->valueint : 0;
+        outConfig.visualizerGlass = (v < 0 || v > 2) ? 0 : v;
+    }
+    {
+        cJSON* gb = cJSON_GetObjectItem(json, "glass_blur");
+        int v = cJSON_IsNumber(gb) ? gb->valueint : 1;
+        outConfig.glassBlur = v < 0 ? 0 : (v > 3 ? 3 : v);
     }
     outConfig.glassDebug = boolean("glass_debug", false);
     outConfig.clock = boolean("clock", false);
@@ -133,6 +199,7 @@ bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& ou
     outConfig.rainbowUnlocked = boolean("rainbow_unlocked", false);
     outConfig.autoplayNext = boolean("autoplay_next", true);
     outConfig.gamepadOffInVideo = boolean("gamepad_off_in_video", false);
+    outConfig.alwaysDefaultTracks = boolean("always_default_tracks", false);
     outConfig.allowUnalignedVideoGeometry = boolean("allow_unaligned_video_geometry", true);
     outConfig.checkForUpdates = boolean("check_for_updates", true);
     outConfig.skippedUpdateVersion = str("skipped_update_version");
@@ -215,6 +282,17 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setStr("user_id", config.userId);
     setStr("access_token", config.accessToken);
     setStr("device_id", config.deviceId);
+    cJSON_DeleteItemFromObject(json, "tls_servers");
+    if (!config.tlsServers.empty()) {
+        cJSON* list = cJSON_AddArrayToObject(json, "tls_servers");
+        for (const TlsServer& s : config.tlsServers) {
+            cJSON* e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "host", s.host.c_str());
+            cJSON_AddNumberToObject(e, "port", s.port);
+            cJSON_AddStringToObject(e, "pin", s.pin.c_str());
+            cJSON_AddItemToArray(list, e);
+        }
+    }
     cJSON_DeleteItemFromObject(json, "profiles");
     if (!config.profiles.empty()) {
         cJSON* list = cJSON_AddArrayToObject(json, "profiles");
@@ -242,19 +320,46 @@ bool saveConfigToFile(const char* path, const UfinConfig& config, std::string& o
     setStr("menu_music_name", config.menuMusicName);
     setBool("crt", config.crt);
     setNum("accent", config.accent);
+    setBool("custom_palette", config.customPalette);
+    cJSON_DeleteItemFromObject(json, "custom_colors");
+    {
+        cJSON* colours = cJSON_AddArrayToObject(json, "custom_colors");
+        for (int i = 0; i < 3; i++) {
+            const uint32_t v = config.customColor[i] & 0xFFFFFF;
+            cJSON_AddItemToArray(colours, cJSON_CreateString(
+                ui::theme::toHex({(uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v}).c_str()));
+        }
+    }
+    setNum("custom_arrange", config.customArrange);
+    setBool("artwork_accent", config.artworkAccent);
+    setBool("custom_shapes", config.customShapes);
+    cJSON_DeleteItemFromObject(json, "button_shapes");
+    {
+        cJSON* shapes = cJSON_AddArrayToObject(json, "button_shapes");
+        for (int i = 0; i < 4; i++) cJSON_AddItemToArray(shapes, cJSON_CreateNumber(config.buttonShape[i]));
+    }
+    cJSON_DeleteItemFromObject(json, "button_sizes");
+    {
+        cJSON* sizes = cJSON_AddArrayToObject(json, "button_sizes");
+        for (int i = 0; i < 8; i++) cJSON_AddItemToArray(sizes, cJSON_CreateNumber(config.buttonSize[i]));
+    }
     cJSON_DeleteItemFromObject(json, "ambient_background"); // superseded by background_effect
     setNum("background_effect", config.backgroundEffect);
     setBool("light_mode", config.lightMode);
     setBool("snow", config.snow);
     setBool("liquid_glass", config.liquidGlass);
+    setBool("m3_expressive", config.m3Expressive && !config.liquidGlass);
     setBool("glass_refraction", config.glassRefraction);
     setNum("glass_refraction_stage", config.glassRefractionStage);
+    setNum("visualizer_glass", config.visualizerGlass);
+    setNum("glass_blur", config.glassBlur);
     setBool("glass_debug", config.glassDebug);
     setBool("clock", config.clock);
     setBool("rainbow_easter_egg", config.rainbowEasterEgg);
     setBool("rainbow_unlocked", config.rainbowUnlocked);
     setBool("autoplay_next", config.autoplayNext);
     setBool("gamepad_off_in_video", config.gamepadOffInVideo);
+    setBool("always_default_tracks", config.alwaysDefaultTracks);
     setBool("allow_unaligned_video_geometry", config.allowUnalignedVideoGeometry);
     setBool("check_for_updates", config.checkForUpdates);
     setStr("skipped_update_version", config.skippedUpdateVersion);

@@ -7,7 +7,7 @@
 
 namespace ufin {
 
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.3.0";
 
 // Where releases are published (the startup update check asks GitHub for the
 // latest one) and where people can read about / download them.

@@ -14,6 +14,7 @@
 #include <gx2/mem.h>
 #include <gx2/registers.h>
 #include <gx2/sampler.h>
+#include <gx2/surface.h>
 #include <gx2/texture.h>
 #include <gx2/utils.h>
 #include <gx2r/surface.h>
@@ -295,6 +296,57 @@ void ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
         global_idx_offset += cmd_list->IdxBuffer.Size;
         global_vtx_offset += cmd_list->VtxBuffer.Size;
     }
+}
+
+void ImGui_ImplGX2_DrawTextureToTarget(const GX2Texture* tex, const GX2Sampler* sampler, GX2ColorBuffer* dst, float uShift, float vShift, float alpha)
+{
+    ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
+    if (!bd || !bd->ShaderGroup || !tex || !sampler || !dst)
+        return;
+    const float w = (float)dst->surface.width, h = (float)dst->surface.height;
+    if (w < 1.0f || h < 1.0f)
+        return;
+
+    // One quad per call out of a ring, so a draw still waiting in the GPU's queue is never overwritten.
+    static const int RING = 64;
+    static ImDrawVert* verts = NULL;
+    static ImDrawIdx* idxs = NULL;
+    static int slot = 0;
+    if (!verts)
+    {
+        verts = (ImDrawVert*)memalign(GX2_VERTEX_BUFFER_ALIGNMENT, RING * 4 * sizeof(ImDrawVert));
+        idxs = (ImDrawIdx*)memalign(GX2_INDEX_BUFFER_ALIGNMENT, RING * 6 * sizeof(ImDrawIdx));
+        if (!verts || !idxs)
+        {
+            free(verts); free(idxs);
+            verts = NULL; idxs = NULL;
+            return;
+        }
+    }
+    slot = (slot + 1) % RING;
+    ImDrawVert* v = verts + slot * 4;
+    ImDrawIdx* ix = idxs + slot * 6;
+    const bool blend = alpha < 0.999f;
+    const ImU32 col = blend ? (((ImU32)(alpha < 0.0f ? 0.0f : alpha * 255.0f + 0.5f) << 24) | 0x00FFFFFFu) : 0xFFFFFFFFu;
+    v[0].pos = ImVec2(0.0f, 0.0f); v[0].uv = ImVec2(uShift, vShift);               v[0].col = col;
+    v[1].pos = ImVec2(w, 0.0f);    v[1].uv = ImVec2(1.0f + uShift, vShift);        v[1].col = col;
+    v[2].pos = ImVec2(w, h);       v[2].uv = ImVec2(1.0f + uShift, 1.0f + vShift); v[2].col = col;
+    v[3].pos = ImVec2(0.0f, h);    v[3].uv = ImVec2(uShift, 1.0f + vShift);        v[3].col = col;
+    ix[0] = 0; ix[1] = 1; ix[2] = 2; ix[3] = 0; ix[4] = 2; ix[5] = 3;
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v, 4 * sizeof(ImDrawVert));
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU, ix, 6 * sizeof(ImDrawIdx));
+
+    GX2SetColorBuffer(dst, GX2_RENDER_TARGET_0);
+    ImDrawData dd;
+    dd.DisplayPos = ImVec2(0.0f, 0.0f);
+    dd.DisplaySize = ImVec2(w, h);
+    ImGui_ImplGX2_SetupRenderState(&dd, (int)w, (int)h); // (viewport and projection of the small target)
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, blend ? 0xFF : 0x00, FALSE, TRUE); // opaque copy, or (alpha < 1) blended over what is there
+    GX2SetScissor(0, 0, (uint32_t)w, (uint32_t)h);
+    GX2SetAttribBuffer(0, 4 * sizeof(ImDrawVert), sizeof(ImDrawVert), v);
+    GX2SetPixelTexture(tex, 0);
+    GX2SetPixelSampler(sampler, 0);
+    GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, sizeof(ImDrawIdx) == 2 ? GX2_INDEX_TYPE_U16 : GX2_INDEX_TYPE_U32, ix, 0, 1);
 }
 
 static void ImGui_ImplGX2_CreateTexture(ImTextureData* tex)

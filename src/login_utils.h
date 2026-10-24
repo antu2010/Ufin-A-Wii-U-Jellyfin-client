@@ -7,23 +7,26 @@
 
 // What people type as a server address -> host + port.
 // Accepts "192.168.1.100", "192.168.1.100:8096", "http://jelly.local:8096/",
-// "jelly.local/web/index.html" ... Default port 8096 (Jellyfin's). https
-// isn't supported (no TLS), so it's rejected with a clear reason.
-inline bool parseServerAddress(const std::string& text, std::string& host, int& port, std::string& error) {
+// "https://jelly.example.com", "jelly.local/web/index.html" ... Default port 8096 (Jellyfin's own http port); for an
+// https:// address 443 (what a reverse proxy listens on -- Jellyfin's own https port, 8920, has to be typed:
+// https://192.168.1.100:8920). `https` says which scheme was typed.
+inline bool parseServerAddress(const std::string& text, std::string& host, int& port, bool& https, std::string& error) {
     std::string s = text;
     // trim
     size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
     s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
     std::string lower;
     for (char c : s) lower += (char)tolower((unsigned char)c);
+    https = false;
     if (lower.rfind("https://", 0) == 0) {
-        error = "https isn't supported -- use the server's http address (usually port 8096)";
-        return false;
+        https = true;
+        s = s.substr(8);
+    } else if (lower.rfind("http://", 0) == 0) {
+        s = s.substr(7);
     }
-    if (lower.rfind("http://", 0) == 0) s = s.substr(7);
     size_t slash = s.find('/');
     if (slash != std::string::npos) s = s.substr(0, slash);
-    port = 8096;
+    port = https ? 443 : 8096;
     size_t colon = s.rfind(':');
     if (colon != std::string::npos) {
         std::string p = s.substr(colon + 1);
@@ -52,7 +55,21 @@ inline bool parseServerAddress(const std::string& text, std::string& host, int& 
     return true;
 }
 
-inline std::string formatServerAddress(const std::string& host, int port) {
+// The address as it is shown, and as it parses back to the same server: plain http omits the default port 8096,
+// https keeps its scheme and omits 443.
+// The old form: plain http only (an https:// address is refused, as before).
+inline bool parseServerAddress(const std::string& text, std::string& host, int& port, std::string& error) {
+    bool https = false;
+    if (!parseServerAddress(text, host, port, https, error)) return false;
+    if (https) {
+        error = "this needs the https-aware parser";
+        return false;
+    }
+    return true;
+}
+
+inline std::string formatServerAddress(const std::string& host, int port, bool https = false) {
     if (host.empty()) return "";
+    if (https) return "https://" + (port == 443 || port <= 0 ? host : host + ":" + std::to_string(port));
     return port == 8096 || port <= 0 ? host : host + ":" + std::to_string(port);
 }

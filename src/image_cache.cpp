@@ -13,6 +13,8 @@
 #define STBI_NO_LINEAR
 #include <stb/stb_image.h>
 
+#include "ui/theme_core.h"
+
 #include <algorithm>
 
 // Frames a queued request may wait without being asked for again before
@@ -55,6 +57,29 @@ ImageCache::Handle ImageCache::get(const std::string& path, int maxW, int maxH, 
         return e.tex;
     }
     return 0;
+}
+
+ImageCache::ColourState ImageCache::dominantColour(const std::string& path, int maxW, int maxH, uint32_t& rgb) {
+    if (path.empty()) return ColourState::None;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = entries_.find(path);
+    if (it == entries_.end()) {
+        Entry e;
+        e.maxW = maxW;
+        e.maxH = maxH;
+        e.lastUsed = frame_;
+        e.queuedAt = frame_;
+        entries_.emplace(path, std::move(e));
+        wake_.notify_one();
+        return ColourState::Pending;
+    }
+    Entry& e = it->second;
+    e.lastUsed = frame_;
+    if (e.state == State::Failed) return ColourState::None;
+    if (e.state == State::Queued || e.state == State::Loading) return ColourState::Pending;
+    if (!e.hasColour) return ColourState::None;
+    rgb = e.colour;
+    return ColourState::Ready;
 }
 
 void ImageCache::pump(int maxUploads) {
@@ -162,11 +187,24 @@ void ImageCache::workerLoop() {
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
         bool ok = backend_.fetch && backend_.fetch(path, bytes) && decode(bytes, maxW, maxH, rgba, w, h, maxSide_);
+        // The dominant colour, from the pixels we already have (a coarse grid: a few thousand samples), here on
+        // the worker so the render loop never pays for it.
+        bool hasColour = false;
+        uint32_t colour = 0;
+        if (ok) {
+            ui::theme::Rgb8 dom{};
+            if (ui::theme::dominantColour(rgba.data(), w, h, dom)) {
+                hasColour = true;
+                colour = ((uint32_t)dom.r << 16) | ((uint32_t)dom.g << 8) | dom.b;
+            }
+        }
 
         lock.lock();
         auto it = entries_.find(path);
         if (it == entries_.end()) continue;
         if (ok) {
+            it->second.hasColour = hasColour;
+            it->second.colour = colour;
             it->second.pixels.swap(rgba);
             it->second.width = w;
             it->second.height = h;

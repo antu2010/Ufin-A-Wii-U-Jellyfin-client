@@ -13,6 +13,7 @@
 #include <whb/gfx.h>
 
 #include <imgui.h>
+#include <imgui_internal.h> // (ImGuiContext::Time, to keep two passes from running the clock twice)
 #include <backends/imgui_impl_gx2.h>
 
 namespace ui {
@@ -35,9 +36,15 @@ namespace {
 struct SnapshotTarget {
     GX2ColorBuffer* buffer = nullptr; // what is being rendered to
     uint64_t texture = 0;             // where the copy goes (0 = no refraction for this display)
+    uint64_t blur[2] = {0, 0};        // the Liquid Glass frost: the snapshot at 1/2 and 1/4 size (blurLevels of them)
+    uint64_t blurScratch = 0;         // same size as the last one: the smoothing passes ping-pong with it
+    int blurLevels = 0;               // shrink steps
+    int blurPasses = 0;               // smoothing passes at the small size
 };
 SnapshotTarget g_tvSnap, g_drcSnap;
 int g_snapStage = 6; // see UfinConfig::glassRefractionStage
+int g_blurLevel = 1;       // UfinConfig::glassBlur
+int g_visualizerGlass = 0; // see UfinConfig::visualizerGlass
 int g_snapLogged = 0;
 int g_snapRefusedLogged = 0;
 
@@ -53,6 +60,7 @@ void snapshotCallback(const ImDrawList*, const ImDrawCmd* cmd) {
     }
     if (g_snapStage >= 3) {
         const bool copied = copyColorBufferToSnapshot(t->texture, t->buffer, g_snapStage);
+        if (copied && t->blurLevels > 0) blurSnapshot(t->texture, t->blur, t->blurLevels, t->blurScratch, t->blurPasses, t->buffer); // the frost: downsampled copies
         if (trace) OSReport("Ufin: glass snapshot copy %s\n", copied ? "issued" : "REFUSED (size/format mismatch)");
         else if (!copied && g_snapRefusedLogged < 4) {
             g_snapRefusedLogged++;
@@ -73,8 +81,11 @@ void snapshotCallback(const ImDrawList*, const ImDrawCmd* cmd) {
 
 void releaseSnapshots() {
     setGlassSnapshot(0, nullptr, nullptr); // nothing may draw from them any more
-    if (g_tvSnap.texture) releaseTexture(g_tvSnap.texture);
-    if (g_drcSnap.texture) releaseTexture(g_drcSnap.texture);
+    for (SnapshotTarget* t : {&g_tvSnap, &g_drcSnap}) {
+        for (uint64_t b : t->blur) if (b) releaseTexture(b);
+        if (t->blurScratch) releaseTexture(t->blurScratch);
+        if (t->texture) releaseTexture(t->texture);
+    }
     g_tvSnap = SnapshotTarget();
     g_drcSnap = SnapshotTarget();
 }
@@ -85,6 +96,7 @@ void useSnapshot(SnapshotTarget& t, GX2ColorBuffer* buffer) {
     t.buffer = buffer;
     if (g_snapStage >= 2 && t.texture && t.buffer) setGlassSnapshot(t.texture, snapshotCallback, &t);
     else setGlassSnapshot(0, nullptr, nullptr);
+    setGlassBlurTexture((g_snapStage >= 3 && t.blurLevels > 0) ? t.blur[t.blurLevels - 1] : 0);
 }
 
 } // namespace
@@ -133,6 +145,13 @@ bool Gfx::init() {
     return true;
 }
 
+void Gfx::setGlassBlur(int level) {
+    g_blurLevel = level < 0 ? 0 : (level > 3 ? 3 : level);
+    ui::setGlassBlur(g_blurLevel);
+}
+
+void Gfx::setVisualizerGlass(int mode) { g_visualizerGlass = (mode < 0 || mode > 2) ? 0 : mode; }
+
 bool Gfx::setGlass(bool on, bool debugLog, bool refraction, int refractionStage) {
     glass::BackdropManager& bd = glass::backdrop();
     releaseSnapshots(); // (re)built below if wanted; always gone when glass is off
@@ -150,6 +169,27 @@ bool Gfx::setGlass(bool on, bool debugLog, bool refraction, int refractionStage)
         const bool asRenderTarget = g_snapStage < 7;
         g_tvSnap.texture = tv ? createSnapshotTexture(tv, asRenderTarget) : 0;
         g_drcSnap.texture = drc ? createSnapshotTexture(drc, asRenderTarget) : 0;
+        // The frost (Liquid Glass): the snapshot downsampled on the GPU, 1/2 then 1/4 then 1/8. Needs the snapshot to be a
+        // render-target-capable texture and the copy to run (stage 6+ is the default, so this is the normal case).
+        if (g_blurLevel > 0 && asRenderTarget && g_snapStage >= 3) {
+            // level 1: half size, 2 smoothing passes (a light frost); 2: quarter size, 2 passes; 3: quarter size, 4 passes
+            const int steps = g_blurLevel == 1 ? 1 : 2, passes = g_blurLevel == 3 ? 4 : 2;
+            auto build = [steps, passes](SnapshotTarget& t, const GX2ColorBuffer* like) {
+                t.blurLevels = 0;
+                t.blurPasses = 0;
+                if (!t.texture || !like) return;
+                for (int i = 0; i < steps; i++) {
+                    t.blur[i] = createBlurTarget(like, i + 1);
+                    if (!t.blur[i]) break;
+                    t.blurLevels = i + 1;
+                }
+                if (t.blurLevels < steps) { OSReport("Ufin: glass frost: only %d of %d blur targets could be created\n", t.blurLevels, steps); return; }
+                t.blurScratch = createBlurTarget(like, steps);
+                t.blurPasses = t.blurScratch ? passes : 0; // (no scratch target: the plain shrink, still a blur of sorts)
+            };
+            build(g_tvSnap, tv);
+            build(g_drcSnap, drc);
+        }
         OSReport("Ufin: glass refraction %s, stage %d (TV %s, GamePad %s)\n", (g_tvSnap.texture || g_drcSnap.texture) ? "on" : "unavailable",
                  g_snapStage, g_tvSnap.texture ? "ok" : "off", g_drcSnap.texture ? "ok" : "off");
     }
@@ -245,12 +285,22 @@ void Gfx::frameTvDrc(const std::function<void()>& tvBuild,
     io.DisplaySize = ImVec2(layout::SCREEN_W, layout::SCREEN_H);
     io.DisplayFramebufferScale = ImVec2(tvW / layout::SCREEN_W, tvH / layout::SCREEN_H);
     io.DeltaTime = dt;
-    useSnapshot(g_tvSnap, tv);
+    // visualizer_glass (UfinConfig): the TV pass of the visualizer frame draws the visualizer, with no picture to bend.
+    // A snapshot copy in the middle of THAT pass (some glass shape of the logo or title row, then the bars after it)
+    // sent everything drawn after the copy to the GamePad on a test run in Cemu -- the TV showed no bars and the
+    // GamePad showed them under Now Playing -- while the movie remote, whose TV pass has no UI draws at all, was fine.
+    // So by default (0) only the GamePad pass refracts (its own buffer); the TV's glass uses the blurred backdrop.
+    // 1 = flat glass on both displays in this frame; 2 = the old behaviour (both refract), for comparison.
+    const bool tvRefract = (bool)tvUnderlay || g_visualizerGlass == 2;
+    const bool refract = (bool)tvUnderlay || g_visualizerGlass != 1;
+    if (tvRefract) useSnapshot(g_tvSnap, tv);
+    else setGlassSnapshot(0, nullptr, nullptr);
     ImGui_ImplGX2_NewFrame();
     ImGui::NewFrame();
     if (tvBuild) tvBuild();
     if (crt_) drawCrtOverlay(ImGui::GetTime());
     ImGui::Render();
+    noteExtraPass(); // the GamePad pass below is the same tick (keeps the animations' frame counting right)
 
     WHBGfxBeginRenderTV();
     if (tvUnderlay) {
@@ -294,7 +344,11 @@ void Gfx::frameTvDrc(const std::function<void()>& tvBuild,
     io.DeltaTime = dt;
     ImGui_ImplGX2_NewFrame();
     ImGui::NewFrame();
-    useSnapshot(g_drcSnap, drc); // the GamePad frame refracts its own (differently sized) buffer
+    // Two NewFrame() calls in one tick would advance ImGui's clock twice, running every time-driven animation
+    // (the progress wave, the visualizer, the Rainbow accent) at double speed. Take the first pass's step back.
+    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) ctx->Time -= (double)dt;
+    if (refract) useSnapshot(g_drcSnap, drc); // the GamePad frame refracts its own (differently sized) buffer
+    else setGlassSnapshot(0, nullptr, nullptr);
     if (drcBuild) drcBuild();
     if (crt_) drawCrtOverlay(ImGui::GetTime());
     ImGui::Render();

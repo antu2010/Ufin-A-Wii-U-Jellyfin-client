@@ -25,3 +25,10 @@ config.json
 tests/host/build/
 tools/glslcompiler.elf
 run.sh
+README.md.rej
+*.old
+*.rej
+ufin-*.patch
+bgm.mp3
+build/
+config.json

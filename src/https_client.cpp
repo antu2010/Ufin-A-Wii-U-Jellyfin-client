@@ -15,18 +15,8 @@
 
 #if defined(UFIN_TLS_MBEDTLS)
 #include "dns_client.h"
-#include "tls_roots.h"
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/error.h>
-#include <mbedtls/sha256.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/x509_crt.h>
-#include <fcntl.h>
+#include "tls_conn.h"
 #include <memory>
-#include <mutex>
-#include <string.h>
-#include <time.h>
 #elif defined(UFIN_TLS_NSSL)
 #include <nsysnet/nssl.h>
 #include <mutex>
@@ -261,110 +251,17 @@ Response get(const std::string& host, const std::string& path, const std::string
 
 #if defined(UFIN_TLS_MBEDTLS)
 
-// ---- our own TLS (Mbed TLS, vendored in src/vendor/mbedtls) ---------------------------------------
+// ---- our own TLS (Mbed TLS, vendored in src/vendor/mbedtls; the session itself is tls_conn.h) -------------------
 //
 // The console's system TLS (NSSL) cannot be relied on: it is not emulated by Cemu at all and, on a real
 // console, its old protocol / cipher set is refused by modern servers. So this is a plain TLS 1.2 client:
 // our own DNS lookup (dns_client.h), a bounded TCP connect (http_client.h), the handshake over that socket,
-// and the server certificate checked against the roots in tls_roots.cpp. The configuration is
-// src/vendor/mbedtls/include/mbedtls/config.h.
+// and the server certificate checked against the roots in tls_roots.cpp.
 
-namespace {
-
-std::string g_extraRoots; // tests: an additional root, as PEM
-
-// There is no /dev/urandom here. The pool is fed with the clocks, address-space layout and a counter,
-// hashed; that is thin, but this client only ever sends a public GET and checks a public certificate --
-// nothing secret is protected by it. Do not reuse this for anything that carries credentials.
-int ufinEntropy(void*, unsigned char* out, size_t len, size_t* olen) {
-    static unsigned long counter = 0;
-    static std::mutex m;
-    unsigned long c;
-    { std::lock_guard<std::mutex> l(m); c = ++counter; }
-    int stackProbe = 0;
-    void* heapProbe = malloc(24);
-    unsigned long long mix[8];
-    mix[0] = (unsigned long long)std::chrono::steady_clock::now().time_since_epoch().count();
-    mix[1] = (unsigned long long)std::chrono::system_clock::now().time_since_epoch().count();
-    mix[2] = (unsigned long long)(size_t)&stackProbe;
-    mix[3] = (unsigned long long)(size_t)heapProbe;
-    mix[4] = c;
-    mix[5] = (unsigned long long)clock();
-    mix[6] = (unsigned long long)time(nullptr);
-    mix[7] = (unsigned long long)(size_t)&mix;
-    free(heapProbe);
-    unsigned char digest[32];
-    size_t done = 0;
-    for (unsigned char block = 0; done < len; block++) {
-        mbedtls_sha256_context sha;
-        mbedtls_sha256_init(&sha);
-        mbedtls_sha256_starts_ret(&sha, 0);
-        mbedtls_sha256_update_ret(&sha, (const unsigned char*)mix, sizeof(mix));
-        mbedtls_sha256_update_ret(&sha, &block, 1);
-        mbedtls_sha256_finish_ret(&sha, digest);
-        mbedtls_sha256_free(&sha);
-        const size_t n = len - done < sizeof(digest) ? len - done : sizeof(digest);
-        memcpy(out + done, digest, n);
-        done += n;
-    }
-    *olen = len;
-    return 0;
-}
-
-struct Tls {
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context drbg;
-    mbedtls_ssl_config conf;
-    mbedtls_ssl_context ssl;
-    mbedtls_x509_crt roots;
-    int fd = -1;
-    bool established = false;
-    Tls() {
-        mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init(&drbg);
-        mbedtls_ssl_config_init(&conf);
-        mbedtls_ssl_init(&ssl);
-        mbedtls_x509_crt_init(&roots);
-    }
-    ~Tls() {
-        mbedtls_ssl_free(&ssl);
-        mbedtls_ssl_config_free(&conf);
-        mbedtls_x509_crt_free(&roots);
-        mbedtls_ctr_drbg_free(&drbg);
-        mbedtls_entropy_free(&entropy);
-        if (fd >= 0) close(fd);
-    }
-};
-
-std::string tlsError(const char* what, int code) {
-    char buf[128];
-    mbedtls_strerror(code, buf, sizeof(buf));
-    char num[24];
-    snprintf(num, sizeof(num), " (-0x%04X)", (unsigned)-code);
-    return std::string(what) + ": " + buf + num;
-}
-
-int sendCb(void* ctx, const unsigned char* buf, size_t len) {
-    const int fd = *(int*)ctx;
-    const ssize_t n = send(fd, buf, len, 0);
-    if (n >= 0) return (int)n;
-    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) ? MBEDTLS_ERR_SSL_WANT_WRITE : -0x004E;
-}
-int recvCb(void* ctx, unsigned char* buf, size_t len) {
-    const int fd = *(int*)ctx;
-    const ssize_t n = recv(fd, buf, len, 0);
-    if (n > 0) return (int)n;
-    if (n == 0) return 0; // closed
-    return (errno == EAGAIN || errno == EWOULDBLOCK) ? MBEDTLS_ERR_SSL_WANT_READ : -0x004C;
-}
-
-} // namespace
-
-void setExtraRootsForTests(const std::string& pem) { g_extraRoots = pem; }
+void setExtraRootsForTests(const std::string& pem) { tlsconn::setExtraRootsForTests(pem); }
 
 Opener systemOpener() {
     return [](const std::string& host, int port, int timeoutSeconds, Connection& out, std::string& error) {
-        const Deadline deadline = nettime::nowMs() + (int64_t)(timeoutSeconds > 0 ? timeoutSeconds : 8) * 1000;
         trace("DNS");
         std::string ip;
         std::string dnsError;
@@ -383,86 +280,14 @@ Opener systemOpener() {
             error = ip == host && !dnsError.empty() ? dnsError + "; " + tcpError : tcpError;
             return false;
         }
-        auto tls = std::make_shared<Tls>();
-        tls->fd = fd;
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-
-        trace("TLS setup");
-        int rc = mbedtls_entropy_add_source(&tls->entropy, ufinEntropy, nullptr, 32, MBEDTLS_ENTROPY_SOURCE_STRONG);
-        if (rc == 0) rc = mbedtls_ctr_drbg_seed(&tls->drbg, mbedtls_entropy_func, &tls->entropy, (const unsigned char*)"ufin", 4);
-        if (rc != 0) { error = tlsError("TLS random generator", rc); return false; }
-        const char* pem = ufinTlsRootsPem();
-        rc = mbedtls_x509_crt_parse(&tls->roots, (const unsigned char*)pem, strlen(pem) + 1);
-        if (rc < 0) { error = tlsError("TLS root certificates", rc); return false; }
-        if (!g_extraRoots.empty()) mbedtls_x509_crt_parse(&tls->roots, (const unsigned char*)g_extraRoots.c_str(), g_extraRoots.size() + 1);
-        if (mbedtls_ssl_config_defaults(&tls->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
-            error = "TLS configuration failed";
-            return false;
-        }
-        mbedtls_ssl_conf_min_version(&tls->conf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3); // TLS 1.2
-        mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_OPTIONAL); // verified by hand below, so a wrong clock can be told apart
-        mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->roots, nullptr);
-        mbedtls_ssl_conf_rng(&tls->conf, mbedtls_ctr_drbg_random, &tls->drbg);
-        if (mbedtls_ssl_setup(&tls->ssl, &tls->conf) != 0 || mbedtls_ssl_set_hostname(&tls->ssl, host.c_str()) != 0) {
-            error = "TLS setup failed";
-            return false;
-        }
-        mbedtls_ssl_set_bio(&tls->ssl, &tls->fd, sendCb, recvCb, nullptr);
-
         trace("TLS handshake");
-        while ((rc = mbedtls_ssl_handshake(&tls->ssl)) != 0) {
-            if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                error = tlsError("TLS handshake failed", rc);
-                return false;
-            }
-            if (nettime::nowMs() > deadline) { error = "TLS handshake timed out"; return false; }
-            nettime::sleepMs(5);
-        }
-        // The certificate: it must chain to one of our roots and match the host name. Only "expired" /
-        // "not yet valid" is forgiven, and only when the console's own clock is obviously unset.
-        uint32_t flags = mbedtls_ssl_get_verify_result(&tls->ssl);
-        const uint32_t timeFlags = MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE;
-        if (flags & timeFlags) {
-            const time_t now = time(nullptr);
-            if (now < 1735689600) { // before 2025-01-01: the clock is wrong, not the certificate
-                trace("certificate dates ignored: the console clock looks unset");
-                flags &= ~timeFlags;
-            }
-        }
-        if (flags != 0) {
-            char info[160];
-            mbedtls_x509_crt_verify_info(info, sizeof(info), "", flags);
-            std::string text = info;
-            while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
-            error = "the server certificate was refused: " + text;
-            return false;
-        }
-        tls->established = true;
+        std::shared_ptr<tlsconn::Session> tls = tlsconn::connect(fd, host, tlsconn::Policy(), timeoutSeconds, nullptr, error);
+        if (!tls) return false;
         trace("TLS ready");
-
-        out.read = [tls](void* buf, int len) -> int {
-            const int n = mbedtls_ssl_read(&tls->ssl, (unsigned char*)buf, (size_t)len);
-            if (n > 0) return n;
-            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) return -2;
-            if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
-            return -1;
-        };
-        out.write = [tls](const void* buf, int len) -> bool {
-            const unsigned char* p = (const unsigned char*)buf;
-            int left = len, spins = 0;
-            while (left > 0) {
-                const int n = mbedtls_ssl_write(&tls->ssl, p, (size_t)left);
-                if (n > 0) { p += n; left -= n; spins = 0; }
-                else if (n == MBEDTLS_ERR_SSL_WANT_WRITE || n == MBEDTLS_ERR_SSL_WANT_READ) {
-                    if (++spins > 1000) return false;
-                    nettime::sleepMs(5);
-                } else return false;
-            }
-            return true;
-        };
+        out.read = [tls](void* buf, int len) -> int { return tls->read(buf, len); };
+        out.write = [tls](const void* buf, int len) -> bool { return tls->write(buf, len); };
         out.close = [tls]() {
-            if (tls->established) mbedtls_ssl_close_notify(&tls->ssl); // best effort
-            // the Tls object (and with it the socket) goes when the last copy of this closure does
+            tls->close(); // the socket goes when the last copy of this closure does
         };
         return true;
     };

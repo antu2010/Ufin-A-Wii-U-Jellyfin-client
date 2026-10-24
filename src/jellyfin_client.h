@@ -1,6 +1,8 @@
 #pragma once
 #include "h264_profile.h"
 
+#include "lyrics.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,6 +41,16 @@ struct JellyfinItem {
     double playedPercentage = 0.0;
     int unplayedCount = -1;     // Series / Season: unwatched episodes, -1 = unknown
     int childCount = -1;        // folders: items inside, -1 = unknown
+
+    // Metadata the sort options need (library_logic.h); empty / -1 = the server has none.
+    std::string dateCreated;    // when it was added to the library (ISO 8601)
+    std::string premiereDate;   // release / first air date
+    std::string lastPlayedDate; // UserData.LastPlayedDate
+    float communityRating = -1.0f;
+    float criticRating = -1.0f;
+    int playCount = -1;
+    std::string album, artist;  // songs / albums
+    std::string playlistItemId; // an entry of a playlist (needed to remove it from there)
 };
 
 // One audio or subtitle track of a video.
@@ -138,6 +150,16 @@ struct PlaybackIds {
     std::string playSessionId;
 };
 
+namespace library {
+struct Query;
+// A Jellyfin server's version, e.g. 10.10.3 (major 0 = unknown).
+struct Version {
+    int major = 0, minor = 0, patch = 0;
+    bool known() const { return major > 0; }
+    bool atLeast(int ma, int mi) const { return major > ma || (major == ma && minor >= mi); }
+};
+}
+
 class JellyfinClient {
 public:
     JellyfinClient(std::string host, int port);
@@ -157,6 +179,20 @@ public:
     // has data). This is what opening the "Live TV" view shows --
     // browsing it via getItems() doesn't return channels.
     bool getLiveTvChannels(std::vector<JellyfinItem>& out);
+
+    // One page of a library list (library_logic.h): a music view, a folder with a chosen sort, a playlist.
+    // `total` is how many the whole result has (for paging). append = add to `out` instead of replacing it.
+    bool queryItems(const library::Query& q, std::vector<JellyfinItem>& out, int& total, bool append = false);
+
+    // The server's version (GET /System/Info/Public); unknown (major 0) when it could not be read.
+    library::Version serverVersion();
+
+    // Playlists. createPlaylist makes an Audio playlist (visibility only on servers that have it) and
+    // returns its id; firstItemId, if given, is its first track. Entries are removed by their entry id
+    // (JellyfinItem::playlistItemId from the playlist's own listing).
+    bool createPlaylist(const std::string& name, bool isPublic, const std::string& firstItemId, std::string& newId);
+    bool addToPlaylist(const std::string& playlistId, const std::string& itemId);
+    bool removeFromPlaylist(const std::string& playlistId, const std::string& entryId);
 
     // Library-wide search by name (movies, shows, episodes, music).
     bool search(const std::string& term, std::vector<JellyfinItem>& out);
@@ -179,6 +215,10 @@ public:
     // fails; fields that couldn't be determined stay at their zero
     // defaults, so callers should fall back to 16:9.
     bool getVideoInfo(const std::string& itemId, VideoInfo& out);
+
+    // The lyrics of a song (Jellyfin 10.9+). False when it has none -- or the server is older, or the
+    // request failed -- which is not an error worth reporting: the player just greys its Lyrics button.
+    bool getLyrics(const std::string& itemId, lyrics::Lyrics& out);
 
     // Asks Jellyfin to tune a Live TV channel (PlaybackInfo with
     // AutoOpenLiveStream). On success the session's ids must be passed
@@ -272,6 +312,8 @@ private:
     std::string user_name_;
     std::string device_id_;
     std::string last_error_;
+    library::Version version_;
+    bool version_checked_ = false;
 
     bool takeAuthResult(const std::string& body); // AccessToken + User from an auth response
 

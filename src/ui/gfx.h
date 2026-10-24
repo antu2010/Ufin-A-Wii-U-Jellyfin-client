@@ -36,6 +36,10 @@ public:
     // about 5 MB at 720p. If the snapshot cannot be set up, glass quietly keeps
     // using the soft blurred backdrop. `refractionStage` (1..5) is a bring-up aid
     // for real hardware (1..7), see UfinConfig::glassRefractionStage.
+    // Glass in the two-pass visualizer frame (UfinConfig::visualizerGlass): 0 GamePad refracts / TV flat, 1 both flat, 2 both refract.
+    void setVisualizerGlass(int mode);
+    // Liquid Glass frost (UfinConfig::glassBlur: 0 sharp, 1..3 = light..strong). Call before setGlass().
+    void setGlassBlur(int level);
     bool setGlass(bool on, bool debugLog = false, bool refraction = true, int refractionStage = 6);
 
     // Draws one frame. `build` adds this frame's UI (ImGui draw calls);

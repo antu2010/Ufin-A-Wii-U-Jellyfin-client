@@ -191,6 +191,41 @@ int main() {
         CHECK_EQ(fake.fetchCount("/s2"), 0);
     }
 
+    // Dominant colour (artwork-reactive accent): worked out once on the worker; missing / broken / colourless
+    // pictures answer None, never crash; asking is repeatable and fetches nothing extra.
+    {
+        Fake fake;
+        fake.files["/red"] = makeImage(64, 64, 210, 30, 40, true);
+        fake.files["/grey"] = makeImage(64, 64, 120, 120, 120, true);
+        fake.files["/bad"] = "garbage";
+        ImageCache cache(fake.backend(), 8);
+        uint32_t rgb = 0;
+        CHECK(cache.dominantColour("/red", 64, 64, rgb) == ImageCache::ColourState::Pending); // queued
+        ImageCache::ColourState st = ImageCache::ColourState::Pending;
+        for (int i = 0; i < 400 && st == ImageCache::ColourState::Pending; i++) {
+            cache.pump();
+            st = cache.dominantColour("/red", 64, 64, rgb);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(st == ImageCache::ColourState::Ready);
+        CHECK(((rgb >> 16) & 0xFF) > 190 && (rgb & 0xFF) < 70);
+        for (int i = 0; i < 10; i++) CHECK(cache.dominantColour("/red", 64, 64, rgb) == ImageCache::ColourState::Ready);
+        CHECK_EQ(fake.fetchCount("/red"), 1);
+        // The same entry serves the texture: asking for the picture later costs no second fetch.
+        CHECK(waitFor(cache, "/red", 64, 64) != 0);
+        CHECK_EQ(fake.fetchCount("/red"), 1);
+        for (const char* path : {"/grey", "/bad", "/missing"}) {
+            st = ImageCache::ColourState::Pending;
+            for (int i = 0; i < 400 && st == ImageCache::ColourState::Pending; i++) {
+                cache.pump();
+                st = cache.dominantColour(path, 64, 64, rgb);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            CHECK(st == ImageCache::ColourState::None);
+        }
+        CHECK(cache.dominantColour("", 64, 64, rgb) == ImageCache::ColourState::None);
+    }
+
     // Destruction releases every texture.
     {
         Fake fake;

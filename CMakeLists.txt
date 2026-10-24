@@ -32,6 +32,8 @@ add_executable(ufin
     src/config_loader.cpp
     src/http_client.cpp
     src/https_client.cpp
+    src/tls_conn.cpp
+    src/net_conn.cpp
     src/dns_client.cpp
     src/tls_roots.cpp
     src/update_check.cpp

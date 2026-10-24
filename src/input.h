@@ -27,6 +27,10 @@ State read();
 // channel, 4 = GamePad (where the keyboard should appear).
 int lastController();
 
+// True when the controller used last is a Wii Remote (alone or with a Nunchuk): it has no right stick, so
+// "add to playlist" is 1 + 2 there (see pad::ADD_TO_PLAYLIST). False for the GamePad, Pro and Classic Controllers.
+bool lastIsWiiRemote();
+
 // The last raw reading of a Wii Remote channel, or nullptr if nothing is
 // connected there (the software keyboard wants these for pointing).
 const KPADStatus* kpad(int channel);
